@@ -32,7 +32,7 @@ def graph_from_adjmatrix(variable_names, dist_func, adj_matrix, latents=None):
                 Function for generating the probability distribution. It should take as input a 
                 list of the variables names representing the parents, and the name of the variable
                 to model. As output, it is expected to give a ProbDist object.
-    adj_matrix : np.ndarray, shape [num_vars, num_vars], type np.bool
+    adj_matrix : np.ndarray, shape [num_vars, num_vars], type bool
                  Numpy array representing the adjacency matrix between the variable. An entry (i,j)
                  being true represents the edge X_i->X_j.
     latents : None / np.ndarray, shape [num_latents, 3], type np.int32
@@ -184,7 +184,7 @@ def generate_chain(variable_names, dist_func, **kwargs):
     shuffle(variable_names)  # To have a random order
     num_vars = len(variable_names)
 
-    adj_matrix = np.zeros((num_vars, num_vars), dtype=np.bool)
+    adj_matrix = np.zeros((num_vars, num_vars), dtype=bool)
     for v_idx in range(num_vars-1):
         adj_matrix[v_idx, v_idx+1] = True
 
@@ -210,7 +210,7 @@ def generate_bidiag(variable_names, dist_func, **kwargs):
     shuffle(variable_names)
     num_vars = len(variable_names)
 
-    adj_matrix = np.zeros((num_vars, num_vars), dtype=np.bool)
+    adj_matrix = np.zeros((num_vars, num_vars), dtype=bool)
     for v_idx in range(num_vars-1):
         adj_matrix[v_idx, v_idx+1] = True
         if v_idx < num_vars - 2:
@@ -238,7 +238,7 @@ def generate_collider(variable_names, dist_func, **kwargs):
     shuffle(variable_names)
     num_vars = len(variable_names)
 
-    adj_matrix = np.zeros((num_vars, num_vars), dtype=np.bool)
+    adj_matrix = np.zeros((num_vars, num_vars), dtype=bool)
     adj_matrix[:-1, -1] = True
 
     return graph_from_adjmatrix(variable_names, dist_func, adj_matrix)

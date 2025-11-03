@@ -86,6 +86,7 @@ class DistributionFitting(object):
         adj_matrices = adj_matrices.to(device)
         # Transpose for mask because adj[i,j] means that i->j
         mask_adj_matrices = adj_matrices.transpose(1, 2)
+        # breakpoint()
         preds = self.model(inputs, mask=mask_adj_matrices)
 
         if inputs.dtype == torch.long:

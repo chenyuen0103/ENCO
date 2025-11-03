@@ -76,7 +76,7 @@ class CausalDAG(object):
         edges : np.ndarray, shape [num_edges, 2], type np.int32
                 A list of all edges in the graph. The graph structure needs to be described
                 either as edge list or as adjacency matrix.
-        adj_matrix : np.ndarray, shape [num_vars, num_vars], type np.bool
+        adj_matrix : np.ndarray, shape [num_vars, num_vars], type bool
                      A matrix of ones and zeros where an entry (i,j) being one represents
                      an edge from variable i to variable j.
         latents : np.ndarray, shape [num_latents, 3]

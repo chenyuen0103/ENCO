@@ -138,3 +138,9 @@ causal_graphs/synthetic_graphs_partial/
 causal_graphs/confounder_graphs/
 causal_graphs/continuous_graphs/
 causal_graphs/exported_graphs.zip
+
+checkpoints/*
+*.csv
+*.json
+out/
+prompts/

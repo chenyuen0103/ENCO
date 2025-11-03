@@ -117,6 +117,7 @@ class ENCO(object):
         self.num_vars = graph.num_vars
         # Create observational dataset
         obs_dataset = ObservationalCategoricalData(graph, dataset_size=sample_size_obs)
+        # breakpoint()
         obs_data_loader = data.DataLoader(obs_dataset, batch_size=batch_size,
                                           shuffle=True, drop_last=True)
         # Create neural networks for fitting the conditional distributions
