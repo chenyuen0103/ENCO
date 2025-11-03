@@ -20,34 +20,6 @@ try:
 except RuntimeError:
     pass
 
-def _worker_call(model_name: str, prompt: str, temperature: float, api_key: str, out_q) -> None:
-    """
-    Run inside a child process: call the SDK and put a result dict on the queue.
-    Must NEVER raise—always put a dict into out_q.
-    """
-    try:
-        # Ensure the child has the key even if parent set it only in-process.
-        if api_key:
-            os.environ["GOOGLE_API_KEY"] = api_key
-        # New SDK: github.com/googleapis/python-genai
-        from google import genai
-        client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", ""))
-
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config={"temperature": temperature},
-        )
-
-        text = getattr(resp, "text", None)
-        if not text and getattr(resp, "candidates", None):
-            # very defensive fallback
-            cand = resp.candidates[0]
-            parts = getattr(cand, "content", getattr(cand, "contents", None))
-            text = getattr(parts[0], "text", "") if parts else ""
-        out_q.put({"ok": True, "text": text or ""})
-    except Exception as e:
-        out_q.put({"ok": False, "err": f"{type(e).__name__}: {e}"})
 
 
 def call_gemini(
@@ -162,7 +134,7 @@ def build_hf_pipeline(
             model_name,
             trust_remote_code=bool(trust_remote_code),
             device_map=device_map if device_map else None,
-            torch_dtype=dtype_val if dtype_val is not None else None,
+            dtype=dtype_val if dtype_val is not None else None,
         )
 
         pipe = TextGenerationPipeline(model=model, tokenizer=tok)
@@ -193,10 +165,32 @@ def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_toke
         print(tb, file=sys.stderr)
         return f"[ERROR] {type(e).__name__}: {e}"
 
+def extract_adjacency_matrix(text: str):
+    """
+    Try to extract the 'adjacency_matrix' field from a JSON object in `text`.
+    Returns the adjacency_matrix (list of lists) or None.
+    """
+    text = text.strip()
+    # Try simple JSON parse first
+    try:
+        obj = json.loads(text)
+    except Exception:
+        # Try to locate the first '{' and last '}' and parse that substring
+        try:
+            start = text.index("{")
+            end = text.rindex("}") + 1
+            obj = json.loads(text[start:end])
+        except Exception:
+            return None
+
+    if isinstance(obj, dict) and "adjacency_matrix" in obj:
+        return obj["adjacency_matrix"]
+    return None
+
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Append LLM responses to CSV as a new column named by the model (Gemini or Hugging Face)."
+        description="Append LLM responses to CSV with raw_response and prediction columns (Gemini or Hugging Face)."
     )
     ap.add_argument(
         "--csv",
@@ -223,7 +217,7 @@ def main():
     ap.add_argument(
         "--max-new-tokens",
         type=int,
-        default=512,
+        default=4096,
         help="Maximum new tokens for Hugging Face text generation."
     )
     ap.add_argument(
@@ -242,6 +236,13 @@ def main():
         action="store_true",
         help="Allow loading custom modeling code from the repo (recommended for Qwen)."
     )
+    ap.add_argument(
+        "--hf-batch-size",
+        type=int,
+        default=8,
+        help="Batch size for Hugging Face generation (number of prompts per forward pass).",
+    )
+
     ap.set_defaults(hf_trust_remote_code=True)
     ap.add_argument(
         "--prompt-col",
@@ -251,7 +252,7 @@ def main():
     ap.add_argument(
         "--overwrite",
         action="store_true",
-        help="Re-query and overwrite existing responses in the model column."
+        help="Re-query and overwrite existing responses in raw_response."
     )
     ap.add_argument(
         "--max-rows",
@@ -262,19 +263,24 @@ def main():
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="Don't call the model; just copy and add column if missing."
+        help="Don't call the model; just parse existing raw_response into prediction."
     )
     ap.add_argument(
         "--timeout-s",
         type=float,
         default=40.0,
-        help="Per-row hard timeout (seconds)."
+        help="(Unused) Per-row hard timeout (seconds)."
     )
     ap.add_argument(
         "--retries",
         type=int,
         default=5,
-        help="Max retries per row after timeout/error."
+        help="(Unused) Max retries per row after timeout/error."
+    )
+    ap.add_argument(
+        "--out-csv",
+        default=None,
+        help="Optional output CSV path. If not given, appends model name to input filename."
     )
     args = ap.parse_args()
 
@@ -285,7 +291,6 @@ def main():
 
     # Require API key only for Gemini provider and not dry-run
     if provider == "gemini" and not args.dry_run:
-        # Prefer GOOGLE_API_KEY; fall back to GEMINI_API_KEY
         if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
             sys.exit("Missing API key: set GOOGLE_API_KEY or GEMINI_API_KEY for Gemini provider.")
 
@@ -297,36 +302,48 @@ def main():
     with in_path.open("r", encoding="utf-8", newline="") as fin:
         reader = csv.DictReader(fin)
         orig_fieldnames = list(reader.fieldnames or [])
-        rows_in = [row for row in reader if any(v.strip() for v in row.values())]
-        # ^ filter out rows that are "all-empty" (only commas / blanks),
-        #   so tqdm reflects real usable rows.
+        # Filter out completely empty rows
+        rows_in = [row for row in reader if any((v or "").strip() for v in row.values())]
 
-    # Add/ensure model column
-    model_col = args.model
+    # Ensure output columns
     fieldnames = orig_fieldnames[:]
-    if model_col not in fieldnames:
-        fieldnames.append(model_col)
+    for extra in ["raw_response", "prediction"]:
+        if extra not in fieldnames:
+            fieldnames.append(extra)
 
-    # Respect max_rows limit for how many we'll *call* the API on
-    # (We'll still output all rows.)
+    # Decide output path: either user-specified or input + model suffix
+    if args.out_csv is not None:
+        out_path = Path(args.out_csv)
+    else:
+        # Derive a short tag for filenames (e.g. "Qwen3-4B-Thinking-2507" from "Qwen/Qwen3-4B-Thinking-2507")
+        safe_model_tag = args.model.split("/")[-1]
+        # Sanitize a couple of characters
+        for ch in [":", " "]:
+            safe_model_tag = safe_model_tag.replace(ch, "_")
+        if safe_model_tag not in in_path.stem:
+            out_path = in_path.with_name(f"{in_path.stem}_{safe_model_tag}{in_path.suffix}") 
+        else:
+            out_path = in_path
+
     max_to_process = args.max_rows if args.max_rows is not None else float("inf")
 
-    # --------- 2. Prepare temp output for atomic replace ---------
-    tmp_fh = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", newline="",
-        dir=str(in_path.parent),
-        delete=False,
-        prefix=in_path.stem + ".",
-        suffix=".tmp"
-    )
-    tmp_path = Path(tmp_fh.name)
+    # --------- 2. Pre-pass: parse prediction from existing raw_response ---------
+    for row in rows_in:
+        raw = row.get("raw_response", "") or ""
+        pred = row.get("prediction", "") or ""
+        if raw.strip() and not pred.strip():
+            adj = extract_adjacency_matrix(raw)
+            if adj is not None:
+                row["prediction"] = json.dumps(adj, ensure_ascii=False)
 
     processed = 0
     skipped = 0
 
-    # Build HF pipeline once if needed
-    hf_pipe = None
+    # --------- 3. Provider-specific generation ---------
+
+    # HF provider: batch prompts to avoid "sequential" GPU warning
     if provider == "hf" and not args.dry_run:
+        # Build HF pipeline once
         try:
             dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
             hf_pipe = build_hf_pipeline(
@@ -338,99 +355,127 @@ def main():
         except Exception as e:
             sys.exit(str(e))
 
-    try:
-        with tmp_fh as fout:
-            writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-
-            # tqdm total is actual # of data rows after filtering empties
-            with tqdm(total=len(rows_in),
-                      desc="Rows",
-                      unit="row") as pbar:
-
-                for i, row in enumerate(rows_in):
-
-                    prompt = row.get(args.prompt_col, "")
-                    # If we've already filled this cell and !overwrite -> skip
-                    already = row.get(model_col, "")
-                    existing = already.strip()
-                    need_call = (
-                        (processed < max_to_process) and
-                        (prompt != "") and
-                        (args.overwrite or not already) and 
-                        (existing == "")
-                    )
-
-                    if args.dry_run:
-                        # dry run never calls model
-                        need_call = False
-
-                    if need_call:
-                        # Call the selected provider
-                        if provider == "gemini":
-                            response_text = call_gemini(
-                                args.model,
-                                prompt,
-                                temperature=args.temperature,
-                            )
-                        else:
-                            # Hugging Face
-                            response_text = call_hf_textgen(
-                                hf_pipe,
-                                prompt,
-                                temperature=args.temperature,
-                                max_new_tokens=args.max_new_tokens,
-                            )
-                        row[model_col] = response_text
-                        processed += 1
-                    else:
-                        # We didn't generate a new answer
-                        if not prompt:
-                            skipped += 1
-                        elif already and not args.overwrite:
-                            skipped += 1
-                        else:
-                            # hit max_rows limit
-                            skipped += 1
-
-                    writer.writerow(row)
-
-                    # Progress bar housekeeping
-                    pbar.update(1)
-                    pbar.set_postfix(processed=processed, skipped=skipped)
-
-                    # Periodic flush
-                    if (i + 1) % 50 == 0:
-                        fout.flush()
-
-        # --------- 3. Atomic replace original file ---------
-        os.replace(tmp_path, in_path)
-
-        print(
-            f"Updated '{in_path}'. "
-            f"Column='{model_col}'. "
-            f"Processed={processed}, Skipped={skipped}"
-        )
-
-    except Exception:
-        # On any error, best-effort cleanup the temp
+        # Optional: set generation_config.temperature instead of passing as flag
         try:
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-        finally:
-            raise
+            gen_cfg = hf_pipe.model.generation_config
+            gen_cfg.temperature = float(args.temperature)
+        except Exception:
+            pass  # not all models expose this cleanly
+
+        # Collect rows that actually need a model call
+        to_call_indices = []
+        to_call_prompts = []
+        for idx, row in enumerate(rows_in):
+            prompt = row.get(args.prompt_col, "") or ""
+            raw = row.get("raw_response", "") or ""
+            if not prompt:
+                continue
+            need_call = (args.overwrite or not raw.strip()) and (len(to_call_indices) < max_to_process)
+            if need_call:
+                to_call_indices.append(idx)
+                to_call_prompts.append(prompt)
+
+        batch_size = max(1, int(args.hf_batch_size))
+        total_calls = len(to_call_indices)
+
+        with tqdm(total=total_calls, desc="HF batched generation", unit="prompt") as pbar:
+            for b_start in range(0, total_calls, batch_size):
+                b_end = min(total_calls, b_start + batch_size)
+                batch_prompts = to_call_prompts[b_start:b_end]
+                batch_indices = to_call_indices[b_start:b_end]
+
+                # Build kwargs without unsupported flags
+                gen_kwargs = {
+                    "max_new_tokens": args.max_new_tokens,
+                    "return_full_text": False,
+                }
+                if args.temperature > 0.0:
+                    gen_kwargs["do_sample"] = True
+                    # (top_p/top_k can be added here if the model supports them)
+
+                outputs = hf_pipe(batch_prompts, **gen_kwargs)
+
+                # Normalize outputs to a list of dicts
+                norm_outputs = []
+                if isinstance(outputs, list):
+                    for item in outputs:
+                        if isinstance(item, list):
+                            norm_outputs.append(item[0] if item else {})
+                        else:
+                            norm_outputs.append(item)
+                else:
+                    norm_outputs = [outputs]
+
+                for j, out in enumerate(norm_outputs):
+                    row_idx = batch_indices[j]
+                    row = rows_in[row_idx]
+
+                    if isinstance(out, dict):
+                        text = out.get("generated_text", "")
+                    else:
+                        text = str(out)
+
+                    row["raw_response"] = text
+
+                    adj = extract_adjacency_matrix(text)
+                    if adj is not None:
+                        row["prediction"] = json.dumps(adj, ensure_ascii=False)
+                    else:
+                        row["prediction"] = ""
+
+                    processed += 1
+
+                pbar.update(len(batch_prompts))
+
+        skipped = len(rows_in) - processed
+
+    # Gemini provider: row-by-row (API-based, no GPU efficiency warning)
+    elif provider == "gemini" and not args.dry_run:
+        with tqdm(total=len(rows_in), desc="Gemini rows", unit="row") as pbar:
+            for idx, row in enumerate(rows_in):
+                prompt = row.get(args.prompt_col, "") or ""
+                raw = row.get("raw_response", "") or ""
+
+                if not prompt:
+                    skipped += 1
+                    pbar.update(1)
+                    continue
+
+                need_call = (processed < max_to_process) and (args.overwrite or not raw.strip())
+                if need_call:
+                    resp = call_gemini(
+                        args.model,
+                        prompt,
+                        temperature=args.temperature,
+                    )
+                    row["raw_response"] = resp
+                    adj = extract_adjacency_matrix(resp)
+                    if adj is not None:
+                        row["prediction"] = json.dumps(adj, ensure_ascii=False)
+                    else:
+                        row["prediction"] = ""
+                    processed += 1
+                else:
+                    skipped += 1
+
+                pbar.update(1)
+
+    # dry-run or no provider => we only parsed existing raw_response above
+
+    # --------- 4. Write all rows to output CSV ---------
+    with out_path.open("w", encoding="utf-8", newline="") as fout:
+        writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows_in:
+            writer.writerow(row)
+
+    print(
+        f"Wrote '{out_path}'. "
+        f"Columns='raw_response', 'prediction'. "
+        f"Processed={processed}, Skipped={skipped}"
+    )
 
 
-# def main():
-#     os.environ["GOOGLE_API_KEY"] = os.environ.get("GEMINI_API_KEY", "")
-#     assert os.environ["GOOGLE_API_KEY"], "No key found in GEMINI_API_KEY"
-#     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
-
-#     resp = client.models.generate_content(
-#         model="gemini-2.5-flash",
-#         contents="Hello!"
-#     )
-#     print(resp.text)
 
 
 if __name__ == "__main__":
