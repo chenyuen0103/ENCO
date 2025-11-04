@@ -302,8 +302,8 @@ class ENCO(object):
 
         if epoch > 0:
             print("--- [EPOCH %i] ---" % epoch)
-        print("Graph - SHD: %i, Recall: %4.2f%%, Precision: %4.2f%% (TP=%i,FP=%i,FN=%i,TN=%i)" %
-              (m["SHD"], 100.0*m["recall"], 100.0*m["precision"], m["TP"], m["FP"], m["FN"], m["TN"]))
+        print("Graph - SHD: %i, Recall: %4.2f%%, Precision: %4.2f%%, F1: %4.2f%% (TP=%i,FP=%i,FN=%i,TN=%i)" %
+              (m["SHD"], 100.0*m["recall"], 100.0*m["precision"], 100.0*m.get("f1", 0.0), m["TP"], m["FP"], m["FN"], m["TN"]))
         print("      -> FP:", ", ".join(["%s=%i" % (key, m["FP_details"][key]) for key in m["FP_details"]]))
         print("Theta - Orientation accuracy: %4.2f%% (TP=%i,FN=%i)" %
               (m["orient"]["acc"] * 100.0, m["orient"]["TP"], m["orient"]["FN"]))
@@ -338,6 +338,9 @@ class ENCO(object):
         TN = TN - self.gamma.shape[-1]  # Remove diagonal as those are not being predicted
         recall = TP / max(TP + FN, 1e-5)
         precision = TP / max(TP + FP, 1e-5)
+        f1 = 0.0
+        if (recall + precision) > 1e-12:
+            f1 = 2.0 * recall * precision / (recall + precision)
         # Structural Hamming Distance score
         rev = torch.logical_and(binary_matrix, self.true_adj_matrix.T)
         num_revs = rev.float().sum().item()
@@ -373,6 +376,7 @@ class ENCO(object):
             "reverse": int(num_revs),
             "recall": recall,
             "precision": precision,
+            "f1": f1,
             "FP_details": FP_dict,
             "orient": orient_dict
         }

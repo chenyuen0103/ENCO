@@ -126,6 +126,7 @@ class InterventionalDataset(object):
         int_sample = self.graph.sample(interventions=intervention_dict,
                                        batch_size=self.dataset_size*num_vars,
                                        as_array=True)
+        breakpoint()
         int_sample = torch.from_numpy(int_sample).reshape(num_vars, self.dataset_size, int_sample.shape[-1])
         for i, (var_idx, var, values) in enumerate(intervention_list):
             self._add_dataset(int_sample[i], var_idx)

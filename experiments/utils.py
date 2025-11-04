@@ -173,6 +173,12 @@ def test_graph(graph, args, checkpoint_dir, file_id):
     binary_matrix = discovery_module.get_binary_adjmatrix().detach().cpu().numpy()
     np.save(os.path.join(checkpoint_dir, 'binary_matrix_%s.npy' % file_id),
             binary_matrix.astype(np.bool))
+    # Print adjacency matrices in 0/1 representation
+    print('Predicted adjacency (0/1):')
+    print(binary_matrix.astype(np.int32))
+    true_adj = discovery_module.true_adj_matrix.cpu().numpy()
+    print('Ground truth adjacency (0/1):')
+    print(true_adj.astype(np.int32))
     if graph.num_vars < 100:
         acyclic_matrix = discovery_module.get_acyclic_adjmatrix().detach().numpy()
         np.save(os.path.join(checkpoint_dir, 'binary_acyclic_matrix_%s.npy' % file_id),

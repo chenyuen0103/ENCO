@@ -17,6 +17,61 @@ from causal_graphs.graph_real_world import load_graph_file  # type: ignore
 
 # ------------------------ Utility: variable names ------------------------ #
 
+
+def sample_interventional_values_vec(
+    graph: Any,
+    var_idx: int,
+    var_name: str,
+    values_vec: np.ndarray,
+    as_array: bool = True,
+) -> np.ndarray:
+    """
+    ENCO-style helper: sample interventional data where the clamped value
+    can differ per sample.
+
+    values_vec: shape (N,), integers in [0, num_states-1].
+    If graph.sample(interventions={var_name: values_vec}) works, we use that
+    (this is exactly what ENCO does).
+    Otherwise we fall back to grouping by state and calling
+    _try_sample_interventional_api(...) per state.
+    """
+    values_vec = np.asarray(values_vec, dtype=np.int32)
+    batch_size = values_vec.shape[0]
+
+    # 1) ENCO-style path: CausalDAG.sample with vector interventions
+    if hasattr(graph, "sample"):
+        try:
+            return graph.sample(
+                interventions={var_name: values_vec},
+                batch_size=batch_size,
+                as_array=as_array,
+            )
+        except TypeError:
+            # fall through to grouped fallback
+            pass
+
+    # 2) Fallback: group by state and call _try_sample_interventional_api
+    unique_states = np.unique(values_vec)
+    arr_all: np.ndarray | None = None
+
+    for s in unique_states:
+        idxs = np.where(values_vec == s)[0]
+        arr_s = _try_sample_interventional_api(
+            graph,
+            batch_size=len(idxs),
+            var_idx=var_idx,
+            var_name=var_name,
+            state_idx=int(s),
+            as_array=as_array,
+        )
+        if arr_all is None:
+            arr_all = np.zeros((batch_size, arr_s.shape[1]), dtype=arr_s.dtype)
+        arr_all[idxs] = arr_s
+
+    if arr_all is None:
+        raise RuntimeError("sample_interventional_values_vec: no samples generated.")
+    return arr_all
+
 def normalize_variable_names(graph) -> List[str]:
     """
     Returns the list of variable names in the order used by the graph.
@@ -197,48 +252,69 @@ def format_prompt_with_interventions(variables: List[str],
     #              'is 1 if a directed edge exists from `variables[i]` to `variables[j]`, and 0 otherwise.')
 
 
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.append(
-        'Your reply MUST BEGIN with a single valid JSON object and NOTHING before it. '
-    )
-    lines.append(
-        'The JSON must have exactly two keys: "variables" and "adjacency_matrix".'
-    )
-    lines.append(
-        '- "variables": the ordered list of variable names below '
-        '(e.g. ["X1", "X2", "X3", "X4", "X5"]).'
-    )
-    lines.append(
-        '- "adjacency_matrix": an N×N list of lists of integers 0 or 1, where entry (i, j) is 1 '
-        'iff there is a directed edge from variables[i] to variables[j], else 0.'
-    )
-    lines.append(
-        'Write out the FULL matrix explicitly. Do NOT use "...", null, None, empty lists, '
-        'or any values other than 0 or 1 inside "adjacency_matrix".'
-    )
-    lines.append(
-        'The JSON must be syntactically valid and self-contained (starts with "{" and ends with "}").'
-    )
-    lines.append("\n--- OUTPUT INSTRUCTIONS (READ CAREFULLY) ---")
-    lines.append(
-        "Output ONLY a single JSON object and nothing else. "
-        "Do not write any explanation, commentary, or markdown."
-    )
-    lines.append(
-        'Your very first character MUST be "{", and your very last character MUST be "}".'
-    )
-    lines.append(
-        'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
-    )
-    lines.append('- "variables" MUST equal the ordered list of variable names provided above.')
-    lines.append(
-        '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
-        'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
-    )
-    lines.append(
-        "If you want to reason internally, do so silently. "
-        "Never include your reasoning in the output. Only output the JSON."
-    )
+    if not include_give_steps:
+        # STRICT JSON-FIRST MODE (good for eval)
+        lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+        lines.append(
+            'Your reply MUST BEGIN with a single valid JSON object and NOTHING before it.'
+        )
+        lines.append(
+            'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+        )
+        lines.append(
+            '- "variables": the ordered list of variable names below '
+            '(e.g. ["X1", "X2", "X3", "X4", "X5"]).'
+        )
+        lines.append(
+            '- "adjacency_matrix": an N×N list of lists of integers 0 or 1, where entry (i, j) is 1 '
+            'iff there is a directed edge from variables[i] to variables[j], else 0.'
+        )
+        lines.append(
+            'Write out the FULL matrix explicitly. Do NOT use any values other than 0 or 1 inside "adjacency_matrix".'
+        )
+        lines.append(
+            'The JSON must be syntactically valid and self-contained (starts with "{" and ends with "}").'
+        )
+    else:
+        # STEP-BY-STEP MODE (allow visible reasoning, JSON at the end)
+        lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+        lines.append(
+            "First, think step-by-step in natural language to infer the causal graph from the data."
+        )
+        lines.append(
+            "After you have finished reasoning, on a new line output a single JSON object with "
+            'exactly two keys: "variables" and "adjacency_matrix".'
+        )
+        lines.append(
+            '- "variables" MUST equal the ordered list of variable names provided below.'
+        )
+        lines.append(
+            '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
+            'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
+        )
+        lines.append(
+            'The final JSON must be syntactically valid (starts with "{" and ends with "}").'
+        )
+    # lines.append("\n--- OUTPUT INSTRUCTIONS (READ CAREFULLY) ---")
+    # lines.append(
+    #     "Output ONLY a single JSON object and nothing else. "
+    #     "Do not write any explanation, commentary, or markdown."
+    # )
+    # lines.append(
+    #     'Your very first character MUST be "{", and your very last character MUST be "}".'
+    # )
+    # lines.append(
+    #     'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+    # )
+    # lines.append('- "variables" MUST equal the ordered list of variable names provided above.')
+    # lines.append(
+    #     '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
+    #     'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
+    # )
+    # lines.append(
+    #     "If you want to reason internally, do so silently. "
+    #     "Never include your reasoning in the output. Only output the JSON."
+    # )
     # Optional: Causal inference reminders
     if include_causal_rules:
         lines.append("\n--- CAUSAL INFERENCE REMINDERS ---")
@@ -277,14 +353,23 @@ def format_prompt_with_interventions(variables: List[str],
                 lines.append(sentence)
 
     lines.append("\n--- END OF DATA ---")
+
     if include_give_steps:
         lines.append(
-            "\nBased on ALL the data provided (both observational and interventional), think step-by-step: "
-            "1. Compute the conditional probability using the observational data, which gives us the markov equivalent class of possible causal graphs "
-            "2. Compute the interventional probability using the interventional, which gives us the exact graph inside the markov equivalent class."
+            "\nBased on ALL the data provided (both observational and interventional), "
+            "first think step-by-step:\n"
+            "1. Use the observational data to compute conditional probabilities and identify the Markov equivalence class of possible causal graphs.\n"
+            "2. Use the interventional data to distinguish between graphs in that equivalence class and select a single directed graph.\n"
+            "After you finish reasoning, output the JSON object described in the OUTPUT INSTRUCTIONS section."
         )
-    lines.append("\nBased on ALL the data provided (both observational and interventional), generate the JSON response:")
+    else:
+        lines.append(
+            "\nBased on ALL the data provided (both observational and interventional), "
+            "output the JSON object described in the OUTPUT INSTRUCTIONS section."
+        )
+
     return "\n".join(lines)
+
 
 
 def main():
@@ -297,8 +382,6 @@ def main():
                     help="Interventional samples PER (variable,state) combo. 0 disables interventions.")
     ap.add_argument("--intervene-vars", default="all",
                     help='Comma-separated variable names, or "all", or "none".')
-    ap.add_argument("--states-per-var", type=int, default=1,
-                    help="How many distinct intervention values to sample per variable.")
     ap.add_argument("--seed", type=int, default=0, help="Base RNG seed; prompt i uses seed+i.")
     ap.add_argument("--anonymize", action="store_true", help="Replace variable names with X1,X2,... in prompt/answer.")
     ap.add_argument("--causal-rules", action="store_true",
@@ -367,7 +450,6 @@ def main():
     base_name = (
         f"prompts_obs{args.obs_per_prompt}"
         f"_int{args.int_per_combo}"
-        f"_int-stat{args.states_per_var}"
         f"_shuf{args.shuffles_per_graph}{extra_suffix}"
     )
 
@@ -407,45 +489,59 @@ def main():
                 obs_rows_base.append(row_disp)
 
             # Build *base* interventional rows ONCE per data_idx
+            # Build *base* interventional rows ONCE per data_idx
             interventional_rows_base: List[Dict[str, Any]] = []
             if intervene_var_idxs and args.int_per_combo > 0:
-                rng_states = np.random.default_rng(seed_data + 10_000)
+                rng_int = np.random.default_rng(seed_data + 10_000)
 
+                # For fair comparison with ENCO:
+                # - Treat int_per_combo as "dataset_size" per variable.
+                # - For each sample, draw the clamped value uniformly over states.
                 for var_idx, var_name in intervene_var_idxs:
-                    n_states = len(codebook[var_name]) if var_name in codebook else 2
-                    max_states = min(args.states_per_var, n_states)
+                    # Determine number of categories for this variable
+                    prob_dist = getattr(graph.variables[var_idx], "prob_dist", None)
+                    num_categs = getattr(prob_dist, "num_categs", None)
+                    if not isinstance(num_categs, int) or num_categs <= 0:
+                        num_categs = len(codebook.get(var_name, [])) or 2
 
-                    chosen_states = rng_states.choice(
-                        n_states,
-                        size=max_states,
-                        replace=False,
+                    dataset_size = args.int_per_combo  # ENCO-style: #samples per variable
+
+                    # values_vec[t] ~ Uniform({0, ..., num_categs-1})
+                    values_vec = rng_int.integers(
+                        low=0,
+                        high=num_categs,
+                        size=dataset_size,
+                        dtype=np.int32,
                     )
 
-                    for s_idx in chosen_states:
-                        arr_int = _try_sample_interventional_api(
-                            graph,
-                            args.int_per_combo,
-                            var_idx,
-                            var_name,
-                            int(s_idx),
-                            as_array=True,
-                        )
-                        for r in arr_int:
-                            row_orig = {
-                                variables[j]: value_for_display(variables[j], r[j])
-                                for j in range(nvars)
-                            }
-                            row_disp = {vmap.get(k, k): v for k, v in row_orig.items()}
-                            ivar_out = vmap.get(var_name, var_name)
+                    # Sample interventional data with *per-sample* clamped values
+                    arr_int = sample_interventional_values_vec(
+                        graph,
+                        var_idx=var_idx,
+                        var_name=var_name,
+                        values_vec=values_vec,
+                        as_array=True,
+                    )
 
-                            interventional_rows_base.append({
-                                "intervened_variable": ivar_out,
-                                "intervened_value": (
-                                    str(int(s_idx)) if args.anonymize
-                                    else value_for_display(var_name, s_idx)
-                                ),
-                                **row_disp,
-                            })
+                    # Build rows; note each row's "intervened_value" can differ
+                    for sample_idx, r in enumerate(arr_int):
+                        s_idx = int(values_vec[sample_idx])
+
+                        row_orig = {
+                            variables[j]: value_for_display(variables[j], r[j])
+                            for j in range(nvars)
+                        }
+                        row_disp = {vmap.get(k, k): v for k, v in row_orig.items()}
+                        ivar_out = vmap.get(var_name, var_name)
+
+                        interventional_rows_base.append({
+                            "intervened_variable": ivar_out,
+                            "intervened_value": (
+                                str(s_idx) if args.anonymize
+                                else value_for_display(var_name, s_idx)
+                            ),
+                            **row_disp,
+                        })
 
             # ---------- NOW ONLY SHUFFLE FOR EACH shuffle_idx ----------
             for rep in range(args.shuffles_per_graph):
