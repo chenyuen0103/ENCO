@@ -165,6 +165,40 @@ def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_toke
         print(tb, file=sys.stderr)
         return f"[ERROR] {type(e).__name__}: {e}"
 
+def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
+                          max_new_tokens: int = 512, batch_size: int = 1) -> list[str]:
+    """
+    Generate text for a batch of prompts using a HF text-generation pipeline.
+
+    Returns a list of strings (one per prompt).
+    """
+    try:
+        do_sample = temperature and temperature > 0.0
+        outputs = pipe(
+            prompts,
+            max_new_tokens=int(max_new_tokens),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            return_full_text=False,
+            batch_size=int(batch_size),
+        )
+        result: list[str] = []
+        if isinstance(outputs, list):
+            for out in outputs:
+                text = out.get("generated_text", "")
+                result.append(text if isinstance(text, str) else str(text))
+        else:
+            # Just in case some pipeline returns a generator-like object
+            for out in outputs:
+                text = out.get("generated_text", "")
+                result.append(text if isinstance(text, str) else str(text))
+        return result
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        # propagate an explicit error string for each prompt
+        return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
+
 def extract_adjacency_matrix(text: str):
     """
     Try to extract the 'adjacency_matrix' field from a JSON object in `text`.
@@ -217,7 +251,7 @@ def main():
     ap.add_argument(
         "--max-new-tokens",
         type=int,
-        default=4096,
+        default=None,
         help="Maximum new tokens for Hugging Face text generation."
     )
     ap.add_argument(
@@ -239,7 +273,7 @@ def main():
     ap.add_argument(
         "--hf-batch-size",
         type=int,
-        default=8,
+        default=4,
         help="Batch size for Hugging Face generation (number of prompts per forward pass).",
     )
 
@@ -297,6 +331,13 @@ def main():
     in_path = Path(args.csv)
     if not in_path.exists():
         sys.exit(f"CSV not found: {in_path}")
+    # If user did not explicitly set --max-new-tokens, choose based on filename
+    if args.max_new_tokens is None:
+        if "_steps" in in_path.stem:
+            args.max_new_tokens = 4096
+        else:
+            args.max_new_tokens = 128
+        print(f"[info] Using max_new_tokens={args.max_new_tokens} for {in_path.name}")
 
     # --------- 1. Read once, fully, via DictReader ---------
     with in_path.open("r", encoding="utf-8", newline="") as fin:
@@ -324,6 +365,11 @@ def main():
             out_path = in_path.with_name(f"{in_path.stem}_{safe_model_tag}{in_path.suffix}") 
         else:
             out_path = in_path
+
+    if out_path != in_path:
+        fieldnames = [fn for fn in fieldnames if fn != args.prompt_col]
+    else:
+        fieldnames = fieldnames
 
     max_to_process = args.max_rows if args.max_rows is not None else float("inf")
 
@@ -361,7 +407,7 @@ def main():
             gen_cfg.temperature = float(args.temperature)
         except Exception:
             pass  # not all models expose this cleanly
-
+        hf_pipe.batch_size = max(1, int(args.hf_batch_size))
         # Collect rows that actually need a model call
         to_call_indices = []
         to_call_prompts = []
@@ -388,6 +434,7 @@ def main():
                 gen_kwargs = {
                     "max_new_tokens": args.max_new_tokens,
                     "return_full_text": False,
+                    "batch_size": batch_size,  
                 }
                 if args.temperature > 0.0:
                     gen_kwargs["do_sample"] = True
@@ -468,6 +515,19 @@ def main():
         writer.writeheader()
         for row in rows_in:
             writer.writerow(row)
+
+    # --------- 5. Also write JSONL next to the CSV ---------
+    json_out_path = out_path.with_suffix(".jsonl")
+    with json_out_path.open("w", encoding="utf-8") as jf:
+        for row in rows_in:
+            jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(
+        f"Wrote CSV: '{out_path}'\n"
+        f"Wrote JSONL: '{json_out_path}'\n"
+        f"Columns='raw_response', 'prediction'. "
+        f"Processed={processed}, Skipped={skipped}"
+    )
 
     print(
         f"Wrote '{out_path}'. "

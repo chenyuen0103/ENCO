@@ -189,13 +189,56 @@ def format_prompt_with_interventions(variables: List[str],
         "from the mixed observational and interventional data provided."
     )
 
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.append("Your response MUST be a single JSON object. Do NOT include any text before or after the JSON.")
-    lines.append('- The JSON object must have two keys: "variables" and "adjacency_matrix".')
-    lines.append('- "variables" MUST be the ordered list of variable names provided below.')
-    lines.append('- "adjacency_matrix" MUST be an N x N list of lists where an entry at (row i, column j) '
-                 'is 1 if a directed edge exists from `variables[i]` to `variables[j]`, and 0 otherwise.')
+    # lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    # lines.append("Your response MUST be a single JSON object. Do NOT include any text before or after the JSON.")
+    # lines.append('- The JSON object must have two keys: "variables" and "adjacency_matrix".')
+    # lines.append('- "variables" MUST be the ordered list of variable names provided below.')
+    # lines.append('- "adjacency_matrix" MUST be an N x N list of lists where an entry at (row i, column j) '
+    #              'is 1 if a directed edge exists from `variables[i]` to `variables[j]`, and 0 otherwise.')
 
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.append(
+        'Your reply MUST BEGIN with a single valid JSON object and NOTHING before it. '
+    )
+    lines.append(
+        'The JSON must have exactly two keys: "variables" and "adjacency_matrix".'
+    )
+    lines.append(
+        '- "variables": the ordered list of variable names below '
+        '(e.g. ["X1", "X2", "X3", "X4", "X5"]).'
+    )
+    lines.append(
+        '- "adjacency_matrix": an N×N list of lists of integers 0 or 1, where entry (i, j) is 1 '
+        'iff there is a directed edge from variables[i] to variables[j], else 0.'
+    )
+    lines.append(
+        'Write out the FULL matrix explicitly. Do NOT use "...", null, None, empty lists, '
+        'or any values other than 0 or 1 inside "adjacency_matrix".'
+    )
+    lines.append(
+        'The JSON must be syntactically valid and self-contained (starts with "{" and ends with "}").'
+    )
+    lines.append("\n--- OUTPUT INSTRUCTIONS (READ CAREFULLY) ---")
+    lines.append(
+        "Output ONLY a single JSON object and nothing else. "
+        "Do not write any explanation, commentary, or markdown."
+    )
+    lines.append(
+        'Your very first character MUST be "{", and your very last character MUST be "}".'
+    )
+    lines.append(
+        'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+    )
+    lines.append('- "variables" MUST equal the ordered list of variable names provided above.')
+    lines.append(
+        '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
+        'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
+    )
+    lines.append(
+        "If you want to reason internally, do so silently. "
+        "Never include your reasoning in the output. Only output the JSON."
+    )
     # Optional: Causal inference reminders
     if include_causal_rules:
         lines.append("\n--- CAUSAL INFERENCE REMINDERS ---")
