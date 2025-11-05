@@ -341,7 +341,7 @@ def format_prompt_with_interventions(
 
 def main():
     ap = argparse.ArgumentParser(description="Generate N prompt,answer pairs with optional interventional rows.")
-    ap.add_argument("--bif-file", default="/home/yuen_chen/ENCO/causal_graphs/real_data/small_graphs/cancer.bif",
+    ap.add_argument("--bif-file", default="../causal_graphs/real_data/small_graphs/cancer.bif",
                     help="Path to .bif Bayesian network file.")
     ap.add_argument("--num-prompts", type=int, default=10, help="Number of pairs to generate.")
     ap.add_argument("--obs-per-prompt", type=int, default=200, help="Observational samples per prompt.")

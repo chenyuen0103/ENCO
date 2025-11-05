@@ -21,7 +21,7 @@ def main():
     # Common args to forward to generate_prompts.py
     ap.add_argument(
         "--bif-file",
-        default="/home/yuen_chen/ENCO/causal_graphs/real_data/small_graphs/cancer.bif",
+        default="../causal_graphs/real_data/small_graphs/cancer.bif",
         help="Forwarded to generate_prompts.py --bif-file.",
     )
     ap.add_argument(
