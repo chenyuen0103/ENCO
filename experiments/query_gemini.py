@@ -189,25 +189,42 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
     """
     try:
         do_sample = temperature and temperature > 0.0
-        outputs = pipe(
-            prompts,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=bool(do_sample),
-            temperature=float(temperature),
-            return_full_text=False,
-            batch_size=int(batch_size),
-        )
-        result: list[str] = []
+
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": int(max_new_tokens),
+            "return_full_text": False,
+            "batch_size": int(batch_size),
+        }
+        if do_sample:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = float(temperature)
+
+        outputs = pipe(prompts, **gen_kwargs)
+
+        # Normalize outputs:
+        # - HF often returns [[{...}], [{...}], ...]
+        # - Sometimes returns [{...}, {...}, ...]
+        norm_outputs = []
         if isinstance(outputs, list):
-            for out in outputs:
-                text = out.get("generated_text", "")
-                result.append(text if isinstance(text, str) else str(text))
+            for item in outputs:
+                if isinstance(item, list):
+                    # e.g. [{'generated_text': '...'}]
+                    norm_outputs.append(item[0] if item else {})
+                else:
+                    norm_outputs.append(item)
         else:
-            # Just in case some pipeline returns a generator-like object
-            for out in outputs:
+            norm_outputs = [outputs]
+
+        result: list[str] = []
+        for out in norm_outputs:
+            if isinstance(out, dict):
                 text = out.get("generated_text", "")
-                result.append(text if isinstance(text, str) else str(text))
+            else:
+                text = str(out)
+            result.append(text if isinstance(text, str) else str(text))
+
         return result
+
     except Exception as e:
         tb = traceback.format_exc()
         print(tb, file=sys.stderr)
