@@ -641,6 +641,13 @@ def main():
         default=None,
         help="Optional output CSV path. If not given, appends model name to input filename."
     )
+    ap.add_argument(
+        "--hf-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for Hugging Face generation (number of prompts per forward pass)."
+    )
+
     args = ap.parse_args()
 
     # Decide provider
@@ -756,6 +763,36 @@ def main():
     processed_new = 0
     skipped_new = 0
 
+    # HF batching buffers
+    hf_batch_prompts: list[str] = []
+    hf_batch_rows: list[dict] = []
+
+    def flush_hf_batch(writer_obj, jf_obj):
+        nonlocal processed_new
+        if not hf_batch_prompts:
+            return
+        batch_size = len(hf_batch_prompts)
+        outputs = call_hf_textgen_batch(
+            hf_pipe,
+            hf_batch_prompts,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=batch_size,
+        )
+        for row_obj, resp in zip(hf_batch_rows, outputs):
+            row_obj["raw_response"] = resp
+            adj = extract_adjacency_matrix(resp)
+            if adj is not None:
+                row_obj["prediction"] = json.dumps(adj, ensure_ascii=False)
+            else:
+                row_obj["prediction"] = ""
+            processed_new += 1
+            writer_obj.writerow(row_obj)
+            jf_obj.write(json.dumps(row_obj, ensure_ascii=False) + "\n")
+
+        hf_batch_prompts.clear()
+        hf_batch_rows.clear()
+
     try:
         with fout, jf, tqdm(total=total_rows, desc="Rows", unit="row") as pbar:
             for idx, row in enumerate(rows_in):
@@ -795,31 +832,36 @@ def main():
                             prompt,
                             temperature=args.temperature,
                         )
+                        row["raw_response"] = resp
+                        adj = extract_adjacency_matrix(resp)
+                        if adj is not None:
+                            row["prediction"] = json.dumps(adj, ensure_ascii=False)
+                        else:
+                            row["prediction"] = ""
+                        processed_new += 1
+
+                        # Gemini rows are written immediately
+                        writer.writerow(row)
+                        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+
                     elif provider == "hf":
-                        resp = call_hf_textgen(
-                            hf_pipe,
-                            prompt,
-                            temperature=args.temperature,
-                            max_new_tokens=args.max_new_tokens,
-                        )
-                    else:
-                        resp = "[ERROR] Unknown provider"
+                        # Buffer HF rows for batched generation
+                        hf_batch_prompts.append(prompt)
+                        hf_batch_rows.append(row)
+                        if len(hf_batch_prompts) >= int(args.hf_batch_size):
+                            flush_hf_batch(writer, jf)
 
-                    row["raw_response"] = resp
-
-                    adj = extract_adjacency_matrix(resp)
-                    if adj is not None:
-                        row["prediction"] = json.dumps(adj, ensure_ascii=False)
                     else:
+                        row["raw_response"] = "[ERROR] Unknown provider"
                         row["prediction"] = ""
-
-                    processed_new += 1
+                        processed_new += 1
+                        writer.writerow(row)
+                        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
                 else:
                     skipped_new += 1
-
-                # Immediately write this row to CSV & JSONL
-                writer.writerow(row)
-                jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    # No new call; just write the row as-is
+                    writer.writerow(row)
+                    jf.write(json.dumps(row, ensure_ascii=False) + "\n")
 
                 # Flush occasionally so crashes don't lose much
                 if (idx + 1) % 10 == 0:
@@ -827,6 +869,10 @@ def main():
                     jf.flush()
 
                 pbar.set_postfix(processed_new=processed_new, skipped_new=skipped_new)
+
+            # After the loop, flush any remaining HF batch
+            if provider == "hf":
+                flush_hf_batch(writer, jf)
 
     finally:
         try:

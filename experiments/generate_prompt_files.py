@@ -39,7 +39,7 @@ def main():
     ap.add_argument(
         "--int-per-combo",
         type=int,
-        default=3,
+        default=0,
         help="Forwarded to generate_prompts.py --int-per-combo.",
     )
     ap.add_argument(

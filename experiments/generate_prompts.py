@@ -339,6 +339,112 @@ def format_prompt_with_interventions(
 
 
 
+def format_prompt_without_intervention(
+    variables: List[str],
+    obs_rows: List[Dict[str, Any]],
+    include_causal_rules: bool = False,
+    include_give_steps: bool = False,
+) -> str:
+    """
+    Build a prompt that presents purely observational data and asks
+    for a JSON adjacency matrix over `variables`.
+
+    `variables` : ordered list of variable names (as they should appear in JSON).
+    `obs_rows`  : list of rows; each row is a dict mapping each variable name
+                  to its observed value. Extra keys (like 'intervened_variable')
+                  are ignored.
+    """
+    lines: List[str] = []
+
+    # ---------- Task description ----------
+    lines.append(
+        "You are a causal discovery assistant. From the observational data below, "
+        "infer a directed causal graph over the given variables."
+    )
+
+    # ---------- OUTPUT INSTRUCTIONS ----------
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    if not include_give_steps:
+        # STRICT JSON-ONLY MODE (good for eval)
+        lines.append('Your reply MUST be a single valid JSON object and NOTHING else.')
+        lines.append(
+            'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+        )
+        lines.append(
+            '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
+        )
+        lines.append(
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            'iff there is a directed edge from variables[i] to variables[j], else 0.'
+        )
+        lines.append(
+            'Do not include any explanations, text, or markdown outside the JSON. '
+            'Your first character must be "{" and your last character must be "}".'
+        )
+    else:
+        # EXPLANATION + JSON MODE (brief reasoning allowed, JSON at the end)
+        lines.append("You may include a brief explanation of your reasoning.")
+        lines.append(
+            'At the end of your answer, output a single JSON object with exactly two keys: '
+            '"variables" and "adjacency_matrix".'
+        )
+        lines.append(
+            '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
+        )
+        lines.append(
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            'iff there is a directed edge from variables[i] to variables[j], else 0.'
+        )
+        lines.append(
+            'The final JSON must be syntactically valid (starts with "{" and "}"). '
+            'Place it on its own line at the end of your answer.'
+        )
+
+    # ---------- Optional causal reminders ----------
+    if include_causal_rules:
+        lines.append("\n--- CAUSAL INFERENCE REMINDERS (for your internal use) ---")
+        lines.append("- Confounder: a variable that causes two others.")
+        lines.append("- Mediator: lies on a path X -> M -> Y.")
+        lines.append("- Collider: a common effect of two variables; avoid conditioning on colliders.")
+        lines.append("- Use conditional independencies to constrain the possible DAGs.")
+        lines.append("- The final output must be a DAG (no directed cycles).")
+
+    # ---------- System variables ----------
+    lines.append("\n--- SYSTEM VARIABLES (in order) ---")
+    for i, var in enumerate(variables):
+        lines.append(f"{i}: {var}")
+
+    # ---------- Observational data ----------
+    lines.append("\n--- OBSERVATIONAL DATA ---")
+    if obs_rows:
+        lines.append("Cases observed without intervention:")
+        for i, r in enumerate(obs_rows):
+            clauses = [f"{h} = {r[h]}" for h in variables]
+            sentence = f"Case {i+1}: " + ", ".join(clauses) + "."
+            lines.append(sentence)
+    else:
+        lines.append("No observational cases were provided.")
+
+    lines.append("\n--- END OF DATA ---")
+
+    # ---------- High-level reasoning hints (optional) ----------
+    if include_give_steps:
+        lines.append(
+            "\nWhen deciding on the causal graph, you may internally follow these steps "
+            "(you do NOT need to describe them explicitly):\n"
+            "1. Use the observational data to infer conditional (in)dependencies among the variables.\n"
+            "2. Choose a directed acyclic graph (DAG) consistent with these (in)dependencies.\n"
+            "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+        )
+    else:
+        lines.append(
+            "\nBased only on the observational data, "
+            "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+        )
+
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate N prompt,answer pairs with optional interventional rows.")
     ap.add_argument("--bif-file", default="../causal_graphs/real_data/small_graphs/cancer.bif",
@@ -550,13 +656,23 @@ def main():
                 all_rows = interventional_rows + obs_rows
 
                 # ---------- Build prompt ----------
-                prompt_text = format_prompt_with_interventions(
-                    variables_out,
-                    all_rows,
-                    variable_map=vmap,
-                    include_causal_rules=args.causal_rules,
-                    include_give_steps=args.give_steps,
-                )
+                if args.int_per_combo > 0:
+                    prompt_text = format_prompt_with_interventions(
+                        variables_out,
+                        all_rows,
+                        variable_map=vmap,
+                        include_causal_rules=args.causal_rules,
+                        include_give_steps=args.give_steps,
+                    )
+                else:
+                    # obs_rows_base is what you already build (list of dicts with var->value)
+                    prompt_text = format_prompt_without_intervention(
+                        variables_out,
+                        obs_rows_base,
+                        include_causal_rules=args.causal_rules,
+                        include_give_steps=args.give_steps,
+                    )
+
 
                 record = {
                     "data_idx": i,
