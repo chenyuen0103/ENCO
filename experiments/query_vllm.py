@@ -369,7 +369,7 @@ def main():
     )
     ap.add_argument(
         "--csv",
-        default="../out/cancer/prompts_obs200_int3_shuf5_anon.csv",
+        default="./out/cancer/prompts_obs200_int3_shuf5_anon.csv",
         help="Path to the input CSV produced by your generator."
     )
     ap.add_argument(
