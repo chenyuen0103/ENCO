@@ -590,6 +590,7 @@ def main():
                 enforce_eager=bool(args.vllm_enforce_eager),
                 trust_remote_code=True,
             )
+            print("Parallel size:", vllm_engine.llm_engine.parallel_config)
         except Exception as e:
             sys.exit(str(e))
 
