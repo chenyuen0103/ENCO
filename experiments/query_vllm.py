@@ -439,7 +439,7 @@ def main():
     ap.add_argument(
         "--vllm-gpu-mem-util",
         type=float,
-        default=0.9,
+        default=0.6,
         help="vLLM gpu_memory_utilization (0.0–1.0)."
     )
     ap.add_argument(
