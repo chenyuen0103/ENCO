@@ -243,7 +243,7 @@ def extract_adjacency_matrix(text: str):
 #     )
 #     ap.add_argument(
 #         "--csv",
-#         default="/home/yuen_chen/ENCO/experiments/out/cancer/prompts_obs200_int3_shuf5_anon.csv",
+#         default="./experiments/out/cancer/prompts_obs200_int3_shuf5_anon.csv",
 #         help="Path to the input CSV produced by your generator."
 #     )
 #     ap.add_argument(
@@ -559,7 +559,7 @@ def main():
     )
     ap.add_argument(
         "--csv",
-        default="/home/yuen_chen/ENCO/experiments/out/cancer/prompts_obs200_int3_shuf5_anon.csv",
+        default="./experiments/out/cancer/prompts_obs200_int3_shuf5_anon.csv",
         help="Path to the input CSV produced by your generator."
     )
     ap.add_argument(
