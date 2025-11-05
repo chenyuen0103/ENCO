@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 import os, sys, csv, time, json, argparse, tempfile, traceback
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from tqdm import tqdm
 import random
-# ---------- Subprocess wrapper to enforce hard timeouts ----------
-# --- imports you need at module top ---
+
 from multiprocessing import get_context
 from queue import Empty as QueueEmpty  # <-- correct exception
-# --- imports near top ---
-
 
 # OPTIONAL: set the start method once, at module import time.
-# On some clusters, calling set_start_method multiple times raises.
 try:
     import multiprocessing as mp
     if mp.get_start_method(allow_none=True) is None:
@@ -20,6 +16,8 @@ try:
 except RuntimeError:
     pass
 
+
+# ------------------- Gemini -------------------
 
 
 def call_gemini(
@@ -41,7 +39,7 @@ def call_gemini(
         if not api_key:
             return "[ERROR] Missing API key (set GOOGLE_API_KEY or GEMINI_API_KEY)."
 
-        # Lazy import so HF-only use doesn't require google sdk installed
+        # Lazy import so HF-only/vLLM-only use doesn't require google sdk installed
         try:
             from google import genai  # type: ignore
         except Exception as ie:
@@ -49,19 +47,15 @@ def call_gemini(
 
         client = genai.Client(api_key=api_key)
 
-        # NOTE: temperature→0 for deterministic evaluation runs
         resp = client.models.generate_content(
             model=model_name,
             contents=prompt,
-            config={"temperature": temperature},
+            config={"temperature": float(temperature)},
         )
 
-        # If text exists, return it
         if getattr(resp, "text", None):
             return resp.text
 
-        # Otherwise try to explain what happened (finish reason / safety)
-        # SDK schema: resp.candidates[i].finish_reason and .safety_ratings may be present.
         cand = (resp.candidates or [None])[0]
         if cand is not None:
             fr = getattr(cand, "finish_reason", None)
@@ -69,16 +63,17 @@ def call_gemini(
         return "[ERROR] Empty response with no candidates."
 
     except Exception as e:
-        # Print the full traceback once to stderr (so you see the exact error)
         tb = traceback.format_exc()
         print(tb, file=sys.stderr)
-        # Return a short string into the CSV cell
         return f"[ERROR] {type(e).__name__}: {e}"
 
 
 def is_gemini_model(model_name: str) -> bool:
     name = (model_name or "").lower()
     return "gemini" in name
+
+
+# ------------------- Hugging Face (transformers) -------------------
 
 
 def build_hf_pipeline(
@@ -93,7 +88,6 @@ def build_hf_pipeline(
     Requires: transformers (and torch). Returns a callable pipeline.
     """
     try:
-        # Prefer explicit model/tokenizer construction to pass trust_remote_code and device_map
         from transformers import (
             AutoTokenizer,
             AutoModelForCausalLM,
@@ -101,11 +95,10 @@ def build_hf_pipeline(
         )  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "Hugging Face 'transformers' is required for non-Gemini models.\n"
+            "Hugging Face 'transformers' is required for non-Gemini / non-vLLM HF models.\n"
             "Install with: pip install transformers accelerate torch --upgrade"
         ) from e
 
-    # Optional torch dtype handling
     dtype_val = None
     try:
         import torch  # type: ignore
@@ -121,7 +114,6 @@ def build_hf_pipeline(
                 dtype_val = torch.float32
             else:
                 dtype_val = None
-        # If no dtype given, leave None so HF chooses defaults
     except Exception:
         dtype_val = None
 
@@ -130,22 +122,20 @@ def build_hf_pipeline(
             model_name,
             trust_remote_code=bool(trust_remote_code),
         )
-        # For decoder-only models, use left padding to avoid generation issues
         try:
             tok.padding_side = "left"
-            # Ensure a pad token exists; many decoder-only models reuse EOS
             if getattr(tok, "pad_token", None) is None:
                 if getattr(tok, "eos_token", None) is not None:
                     tok.pad_token = tok.eos_token
         except Exception:
             pass
+
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=bool(trust_remote_code),
             device_map=device_map if device_map else None,
             dtype=dtype_val if dtype_val is not None else None,
         )
-        # Align model pad_token_id with tokenizer if missing
         try:
             if getattr(model.config, "pad_token_id", None) is None and getattr(tok, "pad_token_id", None) is not None:
                 model.config.pad_token_id = tok.pad_token_id
@@ -163,11 +153,11 @@ def build_hf_pipeline(
 def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_tokens: int = 512) -> str:
     """Generate text using a HF text-generation pipeline."""
     try:
-        do_sample = temperature and temperature > 0.0
+        do_sample = bool(temperature and temperature > 0.0)
         outputs = pipe(
             prompt,
             max_new_tokens=int(max_new_tokens),
-            do_sample=bool(do_sample),
+            do_sample=do_sample,
             temperature=float(temperature),
             return_full_text=False,
         )
@@ -180,30 +170,35 @@ def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_toke
         print(tb, file=sys.stderr)
         return f"[ERROR] {type(e).__name__}: {e}"
 
-def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
-                          max_new_tokens: int = 512, batch_size: int = 1) -> list[str]:
+
+def call_hf_textgen_batch(
+    pipe,
+    prompts: List[str],
+    *,
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+    batch_size: int = 1,
+) -> List[str]:
     """
     Generate text for a batch of prompts using a HF text-generation pipeline.
-
     Returns a list of strings (one per prompt).
     """
     try:
-        do_sample = temperature and temperature > 0.0
+        do_sample = bool(temperature and temperature > 0.0)
         outputs = pipe(
             prompts,
             max_new_tokens=int(max_new_tokens),
-            do_sample=bool(do_sample),
+            do_sample=do_sample,
             temperature=float(temperature),
             return_full_text=False,
             batch_size=int(batch_size),
         )
-        result: list[str] = []
+        result: List[str] = []
         if isinstance(outputs, list):
             for out in outputs:
                 text = out.get("generated_text", "")
                 result.append(text if isinstance(text, str) else str(text))
         else:
-            # Just in case some pipeline returns a generator-like object
             for out in outputs:
                 text = out.get("generated_text", "")
                 result.append(text if isinstance(text, str) else str(text))
@@ -211,8 +206,138 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
     except Exception as e:
         tb = traceback.format_exc()
         print(tb, file=sys.stderr)
-        # propagate an explicit error string for each prompt
         return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
+
+
+# ------------------- vLLM backend -------------------
+
+
+def build_vllm_engine(
+    model_name: str,
+    *,
+    tensor_parallel_size: int = 1,
+    vllm_dtype: str = "auto",
+    max_model_len: Optional[int] = None,
+    gpu_memory_utilization: float = 0.9,
+    enforce_eager: bool = False,
+    trust_remote_code: bool = True,
+):
+    """
+    Build a vLLM LLM engine for the given model name.
+    Assumes vllm is installed and CUDA / torch are configured.
+    """
+    try:
+        from vllm import LLM  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "vLLM is required for provider 'vllm'. Install with: pip install vllm"
+        ) from e
+
+    kwargs: Dict[str, Any] = {
+        "model": model_name,
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+        "trust_remote_code": bool(trust_remote_code),
+        "enforce_eager": bool(enforce_eager),
+    }
+
+    dt = (vllm_dtype or "auto").lower()
+    if dt not in {"", "auto"}:
+        # vLLM expects strings like "float16", "bfloat16", "float32"
+        # Map a couple of shorthand names.
+        if dt in {"fp16", "half"}:
+            dt = "float16"
+        elif dt in {"bf16"}:
+            dt = "bfloat16"
+        elif dt in {"fp32"}:
+            dt = "float32"
+        kwargs["dtype"] = dt
+
+    if max_model_len is not None:
+        kwargs["max_model_len"] = int(max_model_len)
+
+    llm = LLM(**kwargs)
+    return llm
+
+
+def call_vllm_textgen(
+    llm,
+    prompt: str,
+    *,
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+) -> str:
+    """
+    Generate text using a vLLM LLM engine for a single prompt.
+    """
+    try:
+        from vllm import SamplingParams  # type: ignore
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return f"[ERROR] vLLM SamplingParams unavailable: {type(e).__name__}: {e}"
+
+    try:
+        sp = SamplingParams(
+            temperature=float(temperature),
+            max_tokens=int(max_new_tokens),
+        )
+        # vLLM expects a list of prompts
+        outputs = llm.generate([prompt], sp)
+        if not outputs:
+            return "[ERROR] Empty output list from vLLM."
+        out0 = outputs[0]
+        outs = getattr(out0, "outputs", None)
+        if not outs:
+            return "[ERROR] Empty outputs field in vLLM result."
+        text = outs[0].text
+        return text if isinstance(text, str) else str(text)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return f"[ERROR] {type(e).__name__}: {e}"
+
+
+def call_vllm_textgen_batch(
+    llm,
+    prompts: List[str],
+    *,
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+) -> List[str]:
+    """
+    Generate text using vLLM for a batch of prompts.
+    """
+    try:
+        from vllm import SamplingParams  # type: ignore
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return [f"[ERROR] vLLM SamplingParams unavailable: {type(e).__name__}: {e}"] * len(prompts)
+
+    try:
+        sp = SamplingParams(
+            temperature=float(temperature),
+            max_tokens=int(max_new_tokens),
+        )
+        outputs = llm.generate(prompts, sp)
+        results: List[str] = []
+        for out in outputs:
+            outs = getattr(out, "outputs", None)
+            if not outs:
+                results.append("[ERROR] Empty outputs field in vLLM result.")
+                continue
+            text = outs[0].text
+            results.append(text if isinstance(text, str) else str(text))
+        return results
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
+
+
+# ------------------- JSON parsing helper -------------------
+
 
 def extract_adjacency_matrix(text: str):
     """
@@ -220,11 +345,9 @@ def extract_adjacency_matrix(text: str):
     Returns the adjacency_matrix (list of lists) or None.
     """
     text = text.strip()
-    # Try simple JSON parse first
     try:
         obj = json.loads(text)
     except Exception:
-        # Try to locate the first '{' and last '}' and parse that substring
         try:
             start = text.index("{")
             end = text.rindex("}") + 1
@@ -237,325 +360,12 @@ def extract_adjacency_matrix(text: str):
     return None
 
 
-# def main():
-#     ap = argparse.ArgumentParser(
-#         description="Append LLM responses to CSV with raw_response and prediction columns (Gemini or Hugging Face)."
-#     )
-#     ap.add_argument(
-#         "--csv",
-#         default="/home/yuen_chen/ENCO/experiments/out/cancer/prompts_obs200_int3_shuf5_anon.csv",
-#         help="Path to the input CSV produced by your generator."
-#     )
-#     ap.add_argument(
-#         "--model",
-#         default="gemini-2.5-flash",
-#         help="Model name. If it contains 'gemini', uses Google Gemini; otherwise loads from Hugging Face."
-#     )
-#     ap.add_argument(
-#         "--provider",
-#         choices=["auto", "gemini", "hf"],
-#         default="auto",
-#         help="Force provider. Default 'auto' picks 'gemini' if model name contains 'gemini', else 'hf'."
-#     )
-#     ap.add_argument(
-#         "--temperature",
-#         type=float,
-#         default=0.0,
-#         help="Sampling temperature for the model (both providers)."
-#     )
-#     ap.add_argument(
-#         "--max-new-tokens",
-#         type=int,
-#         default=None,
-#         help="Maximum new tokens for Hugging Face text generation."
-#     )
-#     ap.add_argument(
-#         "--hf-device-map",
-#         default="auto",
-#         help="Device map for HF model loading (e.g., 'auto', 'cuda', 'cpu')."
-#     )
-#     ap.add_argument(
-#         "--hf-dtype",
-#         default="auto",
-#         help="Torch dtype for HF model (auto, float16, bfloat16, float32)."
-#     )
-#     ap.add_argument(
-#         "--hf-trust-remote-code",
-#         dest="hf_trust_remote_code",
-#         action="store_true",
-#         help="Allow loading custom modeling code from the repo (recommended for Qwen)."
-#     )
-#     ap.add_argument(
-#         "--hf-batch-size",
-#         type=int,
-#         default=4,
-#         help="Batch size for Hugging Face generation (number of prompts per forward pass).",
-#     )
+# ------------------- Main -------------------
 
-#     ap.set_defaults(hf_trust_remote_code=True)
-#     ap.add_argument(
-#         "--prompt-col",
-#         default="prompt",
-#         help="Name of the column containing prompts."
-#     )
-#     ap.add_argument(
-#         "--overwrite",
-#         action="store_true",
-#         help="Re-query and overwrite existing responses in raw_response."
-#     )
-#     ap.add_argument(
-#         "--max-rows",
-#         type=int,
-#         default=None,
-#         help="Optional cap on number of rows to process."
-#     )
-#     ap.add_argument(
-#         "--dry-run",
-#         action="store_true",
-#         help="Don't call the model; just parse existing raw_response into prediction."
-#     )
-#     ap.add_argument(
-#         "--timeout-s",
-#         type=float,
-#         default=40.0,
-#         help="(Unused) Per-row hard timeout (seconds)."
-#     )
-#     ap.add_argument(
-#         "--retries",
-#         type=int,
-#         default=5,
-#         help="(Unused) Max retries per row after timeout/error."
-#     )
-#     ap.add_argument(
-#         "--out-csv",
-#         default=None,
-#         help="Optional output CSV path. If not given, appends model name to input filename."
-#     )
-#     args = ap.parse_args()
-
-#     # Decide provider
-#     provider = args.provider
-#     if provider == "auto":
-#         provider = "gemini" if is_gemini_model(args.model) else "hf"
-
-#     # Require API key only for Gemini provider and not dry-run
-#     if provider == "gemini" and not args.dry_run:
-#         if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
-#             sys.exit("Missing API key: set GOOGLE_API_KEY or GEMINI_API_KEY for Gemini provider.")
-
-#     in_path = Path(args.csv)
-#     if not in_path.exists():
-#         sys.exit(f"CSV not found: {in_path}")
-#     # If user did not explicitly set --max-new-tokens, choose based on filename
-#     if args.max_new_tokens is None:
-#         if "_steps" in in_path.stem:
-#             args.max_new_tokens = 4096
-#         else:
-#             args.max_new_tokens = 128
-#         print(f"[info] Using max_new_tokens={args.max_new_tokens} for {in_path.name}")
-
-#     # --------- 1. Read once, fully, via DictReader ---------
-#     with in_path.open("r", encoding="utf-8", newline="") as fin:
-#         reader = csv.DictReader(fin)
-#         orig_fieldnames = list(reader.fieldnames or [])
-#         # Filter out completely empty rows
-#         rows_in = [row for row in reader if any((v or "").strip() for v in row.values())]
-
-#     # Ensure output columns
-#     fieldnames = orig_fieldnames[:]
-#     for extra in ["raw_response", "prediction"]:
-#         if extra not in fieldnames:
-#             fieldnames.append(extra)
-
-#     # Decide output path: either user-specified or input + model suffix
-#     if args.out_csv is not None:
-#         out_path = Path(args.out_csv)
-#     else:
-#         # Derive a short tag for filenames (e.g. "Qwen3-4B-Thinking-2507" from "Qwen/Qwen3-4B-Thinking-2507")
-#         safe_model_tag = args.model.split("/")[-1]
-#         # Sanitize a couple of characters
-#         for ch in [":", " "]:
-#             safe_model_tag = safe_model_tag.replace(ch, "_")
-#         if safe_model_tag not in in_path.stem:
-#             out_path = in_path.with_name(f"{in_path.stem}_{safe_model_tag}{in_path.suffix}") 
-#         else:
-#             out_path = in_path
-
-#     if out_path != in_path:
-#         fieldnames = [fn for fn in fieldnames if fn != args.prompt_col]
-#     else:
-#         fieldnames = fieldnames
-
-#     json_out_path = out_path.with_suffix(".jsonl")
-
-#     max_to_process = args.max_rows if args.max_rows is not None else float("inf")
-
-#     # --------- 2. Pre-pass: parse prediction from existing raw_response ---------
-#     for row in rows_in:
-#         raw = row.get("raw_response", "") or ""
-#         pred = row.get("prediction", "") or ""
-#         if raw.strip() and not pred.strip():
-#             adj = extract_adjacency_matrix(raw)
-#             if adj is not None:
-#                 row["prediction"] = json.dumps(adj, ensure_ascii=False)
-
-#     processed = 0
-#     skipped = 0
-
-#     # --------- 3. Provider-specific generation ---------
-
-#     # HF provider: batch prompts to avoid "sequential" GPU warning
-#     if provider == "hf" and not args.dry_run:
-#         # Build HF pipeline once
-#         try:
-#             dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
-#             hf_pipe = build_hf_pipeline(
-#                 args.model,
-#                 trust_remote_code=bool(args.hf_trust_remote_code),
-#                 device_map=dm,
-#                 torch_dtype=args.hf_dtype,
-#             )
-#         except Exception as e:
-#             sys.exit(str(e))
-
-#         # Optional: set generation_config.temperature instead of passing as flag
-#         try:
-#             gen_cfg = hf_pipe.model.generation_config
-#             gen_cfg.temperature = float(args.temperature)
-#         except Exception:
-#             pass  # not all models expose this cleanly
-#         hf_pipe.batch_size = max(1, int(args.hf_batch_size))
-#         # Collect rows that actually need a model call
-#         to_call_indices = []
-#         to_call_prompts = []
-#         for idx, row in enumerate(rows_in):
-#             prompt = row.get(args.prompt_col, "") or ""
-#             raw = row.get("raw_response", "") or ""
-#             if not prompt:
-#                 continue
-#             need_call = (args.overwrite or not raw.strip()) and (len(to_call_indices) < max_to_process)
-#             if need_call:
-#                 to_call_indices.append(idx)
-#                 to_call_prompts.append(prompt)
-
-#         batch_size = max(1, int(args.hf_batch_size))
-#         total_calls = len(to_call_indices)
-
-#         with tqdm(total=total_calls, desc="HF batched generation", unit="prompt") as pbar:
-#             for b_start in range(0, total_calls, batch_size):
-#                 b_end = min(total_calls, b_start + batch_size)
-#                 batch_prompts = to_call_prompts[b_start:b_end]
-#                 batch_indices = to_call_indices[b_start:b_end]
-
-#                 # Build kwargs without unsupported flags
-#                 gen_kwargs = {
-#                     "max_new_tokens": args.max_new_tokens,
-#                     "return_full_text": False,
-#                     "batch_size": batch_size,  
-#                 }
-#                 if args.temperature > 0.0:
-#                     gen_kwargs["do_sample"] = True
-#                     # (top_p/top_k can be added here if the model supports them)
-
-#                 outputs = hf_pipe(batch_prompts, **gen_kwargs)
-
-#                 # Normalize outputs to a list of dicts
-#                 norm_outputs = []
-#                 if isinstance(outputs, list):
-#                     for item in outputs:
-#                         if isinstance(item, list):
-#                             norm_outputs.append(item[0] if item else {})
-#                         else:
-#                             norm_outputs.append(item)
-#                 else:
-#                     norm_outputs = [outputs]
-
-#                 for j, out in enumerate(norm_outputs):
-#                     row_idx = batch_indices[j]
-#                     row = rows_in[row_idx]
-
-#                     if isinstance(out, dict):
-#                         text = out.get("generated_text", "")
-#                     else:
-#                         text = str(out)
-
-#                     row["raw_response"] = text
-
-#                     adj = extract_adjacency_matrix(text)
-#                     if adj is not None:
-#                         row["prediction"] = json.dumps(adj, ensure_ascii=False)
-#                     else:
-#                         row["prediction"] = ""
-
-#                     processed += 1
-
-#                 pbar.update(len(batch_prompts))
-
-#         skipped = len(rows_in) - processed
-
-#     # Gemini provider: row-by-row (API-based, no GPU efficiency warning)
-#     elif provider == "gemini" and not args.dry_run:
-#         with tqdm(total=len(rows_in), desc="Gemini rows", unit="row") as pbar:
-#             for idx, row in enumerate(rows_in):
-#                 prompt = row.get(args.prompt_col, "") or ""
-#                 raw = row.get("raw_response", "") or ""
-
-#                 if not prompt:
-#                     skipped += 1
-#                     pbar.update(1)
-#                     continue
-
-#                 need_call = (processed < max_to_process) and (args.overwrite or not raw.strip())
-#                 if need_call:
-#                     resp = call_gemini(
-#                         args.model,
-#                         prompt,
-#                         temperature=args.temperature,
-#                     )
-#                     row["raw_response"] = resp
-#                     adj = extract_adjacency_matrix(resp)
-#                     if adj is not None:
-#                         row["prediction"] = json.dumps(adj, ensure_ascii=False)
-#                     else:
-#                         row["prediction"] = ""
-#                     processed += 1
-#                 else:
-#                     skipped += 1
-
-#                 pbar.update(1)
-
-#     # dry-run or no provider => we only parsed existing raw_response above
-
-#     # --------- 4. Write all rows to output CSV ---------
-#     with out_path.open("w", encoding="utf-8", newline="") as fout:
-#         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
-#         writer.writeheader()
-#         for row in rows_in:
-#             writer.writerow(row)
-
-#     # --------- 5. Also write JSONL next to the CSV ---------
-
-#     with json_out_path.open("w", encoding="utf-8") as jf:
-#         for row in rows_in:
-#             jf.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-#     print(
-#         f"Wrote CSV: '{out_path}'\n"
-#         f"Wrote JSONL: '{json_out_path}'\n"
-#         f"Columns='raw_response', 'prediction'. "
-#         f"Processed={processed}, Skipped={skipped}"
-#     )
-
-#     print(
-#         f"Wrote '{out_path}'. "
-#         f"Columns='raw_response', 'prediction'. "
-#         f"Processed={processed}, Skipped={skipped}"
-#     )
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Append LLM responses to CSV with raw_response and prediction columns (Gemini or Hugging Face)."
+        description="Append LLM responses to CSV with raw_response and prediction columns (Gemini, HF, or vLLM)."
     )
     ap.add_argument(
         "--csv",
@@ -565,26 +375,31 @@ def main():
     ap.add_argument(
         "--model",
         default="gemini-2.5-flash",
-        help="Model name. If it contains 'gemini', uses Google Gemini; otherwise loads from Hugging Face."
+        help="Model name. For vLLM/HF, this is a HF model ID or local path."
     )
     ap.add_argument(
         "--provider",
-        choices=["auto", "gemini", "hf"],
+        choices=["auto", "gemini", "hf", "vllm"],
         default="auto",
-        help="Force provider. Default 'auto' picks 'gemini' if model name contains 'gemini', else 'hf'."
+        help=(
+            "Provider backend: 'gemini', 'hf' (transformers), or 'vllm'. "
+            "'auto' picks 'gemini' if model name contains 'gemini', else 'hf'."
+        ),
     )
     ap.add_argument(
         "--temperature",
         type=float,
         default=0.0,
-        help="Sampling temperature for the model (both providers)."
+        help="Sampling temperature for the model (all providers)."
     )
     ap.add_argument(
         "--max-new-tokens",
         type=int,
         default=None,
-        help="Maximum new tokens for Hugging Face text generation."
+        help="Maximum new tokens for generation (HF/vLLM)."
     )
+
+    # HF specific
     ap.add_argument(
         "--hf-device-map",
         default="auto",
@@ -602,6 +417,36 @@ def main():
         help="Allow loading custom modeling code from the repo (recommended for Qwen)."
     )
     ap.set_defaults(hf_trust_remote_code=True)
+
+    # vLLM specific
+    ap.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM (number of GPUs)."
+    )
+    ap.add_argument(
+        "--vllm-dtype",
+        default="auto",
+        help="vLLM dtype string (auto, float16/fp16, bfloat16/bf16, float32/fp32)."
+    )
+    ap.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="Optional max_model_len for vLLM."
+    )
+    ap.add_argument(
+        "--vllm-gpu-mem-util",
+        type=float,
+        default=0.9,
+        help="vLLM gpu_memory_utilization (0.0–1.0)."
+    )
+    ap.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help="If set, pass enforce_eager=True to vLLM (debugging)."
+    )
 
     ap.add_argument(
         "--prompt-col",
@@ -677,7 +522,7 @@ def main():
         if extra not in fieldnames:
             fieldnames.append(extra)
 
-    # Decide output path: either user-specified or input + model suffix
+    # Decide output path
     if args.out_csv is not None:
         out_path = Path(args.out_csv)
     else:
@@ -689,7 +534,6 @@ def main():
         else:
             out_path = in_path
 
-    # JSONL path next to CSV
     json_out_path = out_path.with_suffix(".jsonl")
 
     # --------- 2. Determine resume vs overwrite ---------
@@ -699,7 +543,7 @@ def main():
         already_done = 0
         with out_path.open("r", encoding="utf-8", newline="") as f_existing:
             r_existing = csv.reader(f_existing)
-            next(r_existing, None)  # header
+            next(r_existing, None)
             for _ in r_existing:
                 already_done += 1
         print(f"[info] Resuming: {already_done} rows already present in {out_path.name}")
@@ -711,12 +555,12 @@ def main():
             print(f"[info] No existing output file. Starting from scratch: {out_path.name}")
 
     total_rows = len(rows_in)
-
-    # Respect max_rows only for **new** rows
     max_new = args.max_rows if args.max_rows is not None else float("inf")
 
-    # --------- 3. Build HF pipeline (if needed) ---------
+    # --------- 3. Build backend (HF or vLLM) if needed ---------
     hf_pipe = None
+    vllm_engine = None
+
     if provider == "hf" and not args.dry_run:
         try:
             dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
@@ -729,25 +573,35 @@ def main():
         except Exception as e:
             sys.exit(str(e))
 
-        # Optional: set generation_config.temperature
         try:
             gen_cfg = hf_pipe.model.generation_config
             gen_cfg.temperature = float(args.temperature)
         except Exception:
             pass
 
+    if provider == "vllm" and not args.dry_run:
+        try:
+            vllm_engine = build_vllm_engine(
+                args.model,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                vllm_dtype=args.vllm_dtype,
+                max_model_len=args.vllm_max_model_len,
+                gpu_memory_utilization=args.vllm_gpu_mem_util,
+                enforce_eager=bool(args.vllm_enforce_eager),
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            sys.exit(str(e))
+
     # --------- 4. Open output files in append-or-write mode ---------
-    # CSV
     if resume:
         fout = out_path.open("a", encoding="utf-8", newline="")
         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
-        # header already there
     else:
         fout = out_path.open("w", encoding="utf-8", newline="")
         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-    # JSONL: append only when resuming; otherwise overwrite
     if resume and json_out_path.exists():
         jf = json_out_path.open("a", encoding="utf-8")
     else:
@@ -761,7 +615,6 @@ def main():
             for idx, row in enumerate(rows_in):
                 pbar.update(1)
 
-                # Skip rows already written in previous runs (only if resuming)
                 if resume and idx < already_done:
                     continue
 
@@ -769,14 +622,12 @@ def main():
                 raw = row.get("raw_response", "") or ""
                 pred = row.get("prediction", "") or ""
 
-                # If we've hit max_new, just write the row as-is (no new model calls)
                 if processed_new >= max_new:
                     writer.writerow(row)
                     jf.write(json.dumps(row, ensure_ascii=False) + "\n")
                     skipped_new += 1
                     continue
 
-                # If we already have raw_response and no prediction, try to parse it
                 if raw.strip() and not pred.strip():
                     adj = extract_adjacency_matrix(raw)
                     if adj is not None:
@@ -802,6 +653,13 @@ def main():
                             temperature=args.temperature,
                             max_new_tokens=args.max_new_tokens,
                         )
+                    elif provider == "vllm":
+                        resp = call_vllm_textgen(
+                            vllm_engine,
+                            prompt,
+                            temperature=args.temperature,
+                            max_new_tokens=args.max_new_tokens,
+                        )
                     else:
                         resp = "[ERROR] Unknown provider"
 
@@ -817,11 +675,9 @@ def main():
                 else:
                     skipped_new += 1
 
-                # Immediately write this row to CSV & JSONL
                 writer.writerow(row)
                 jf.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-                # Flush occasionally so crashes don't lose much
                 if (idx + 1) % 10 == 0:
                     fout.flush()
                     jf.flush()

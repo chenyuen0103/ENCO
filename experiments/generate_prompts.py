@@ -207,22 +207,16 @@ def _try_sample_interventional_api(
 
 # ------------------------ Prompt formatter ------------------------ #
 
-def format_prompt_with_interventions(variables: List[str],
-                                     all_rows: List[Dict[str, Any]],
-                                     variable_map: Dict[str, str] | None = None,
-                                     include_causal_rules: bool = False,
-                                     include_give_steps: bool = False) -> str:
+def format_prompt_with_interventions(
+    variables: List[str],
+    all_rows: List[Dict[str, Any]],
+    variable_map: Dict[str, str] | None = None,
+    include_causal_rules: bool = False,
+    include_give_steps: bool = False,
+) -> str:
     """
-    Turns mixed observational and interventional data into a comprehensive prompt
-    asking for a JSON adjacency matrix.
-
-    `variables`     : display variable names in system order.
-    `all_rows`      : each row has keys:
-                        - "intervened_variable": "Observational" or var name (display)
-                        - "intervened_value"   : None or the value used in the do(...)
-                        - plus one entry per variable in `variables`, with the observed value.
-    `variable_map`  : optional mapping from original names to anonymized names; only used
-                      for display in the intervention section.
+    Build a prompt that presents mixed observational + interventional data
+    and asks for a JSON adjacency matrix over `variables`.
     """
     obs_rows: List[Dict[str, Any]] = []
     interventions: Dict[Tuple[str, Any], List[Dict[str, Any]]] = {}
@@ -240,132 +234,105 @@ def format_prompt_with_interventions(variables: List[str],
 
     lines: List[str] = []
     lines.append(
-        "You are a causal discovery assistant. Your task is to infer a directed causal graph "
-        "from the mixed observational and interventional data provided."
+        "You are a causal discovery assistant. From the data below, infer a directed causal graph "
+        "over the given variables."
     )
 
-    # lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    # lines.append("Your response MUST be a single JSON object. Do NOT include any text before or after the JSON.")
-    # lines.append('- The JSON object must have two keys: "variables" and "adjacency_matrix".')
-    # lines.append('- "variables" MUST be the ordered list of variable names provided below.')
-    # lines.append('- "adjacency_matrix" MUST be an N x N list of lists where an entry at (row i, column j) '
-    #              'is 1 if a directed edge exists from `variables[i]` to `variables[j]`, and 0 otherwise.')
-
-
+    # ---------- OUTPUT INSTRUCTIONS ----------
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     if not include_give_steps:
         # STRICT JSON-FIRST MODE (good for eval)
-        lines.append("\n--- OUTPUT INSTRUCTIONS ---")
         lines.append(
-            'Your reply MUST BEGIN with a single valid JSON object and NOTHING before it.'
+            'Your reply MUST be a single valid JSON object and NOTHING else.'
         )
         lines.append(
             'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
         )
         lines.append(
-            '- "variables": the ordered list of variable names below '
-            '(e.g. ["X1", "X2", "X3", "X4", "X5"]).'
+            '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix": an N×N list of lists of integers 0 or 1, where entry (i, j) is 1 '
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
             'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'Write out the FULL matrix explicitly. Do NOT use any values other than 0 or 1 inside "adjacency_matrix".'
-        )
-        lines.append(
-            'The JSON must be syntactically valid and self-contained (starts with "{" and ends with "}").'
+            'Do not include any explanations, text, or markdown outside the JSON. '
+            'Your first character must be "{" and your last character must be "}".'
         )
     else:
-        # STEP-BY-STEP MODE (allow visible reasoning, JSON at the end)
-        lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+        # EXPLANATION + JSON MODE (brief reasoning allowed, JSON at the end)
         lines.append(
-            "First, think step-by-step in natural language to infer the causal graph from the data."
+            "You may include a brief explanation of your reasoning."
         )
         lines.append(
-            "After you have finished reasoning, on a new line output a single JSON object with "
-            'exactly two keys: "variables" and "adjacency_matrix".'
+            'At the end of your answer, output a single JSON object with exactly two keys: '
+            '"variables" and "adjacency_matrix".'
         )
         lines.append(
-            '- "variables" MUST equal the ordered list of variable names provided below.'
+            '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
-            'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'The final JSON must be syntactically valid (starts with "{" and ends with "}").'
+            'The final JSON must be syntactically valid (starts with "{" and ends with "}"). '
+            'Place it on its own line at the end of your answer.'
         )
-    # lines.append("\n--- OUTPUT INSTRUCTIONS (READ CAREFULLY) ---")
-    # lines.append(
-    #     "Output ONLY a single JSON object and nothing else. "
-    #     "Do not write any explanation, commentary, or markdown."
-    # )
-    # lines.append(
-    #     'Your very first character MUST be "{", and your very last character MUST be "}".'
-    # )
-    # lines.append(
-    #     'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
-    # )
-    # lines.append('- "variables" MUST equal the ordered list of variable names provided above.')
-    # lines.append(
-    #     '- "adjacency_matrix" MUST be an N x N list of lists where entry [i][j] is 1 '
-    #     'if there is a directed edge from variables[i] to variables[j], and 0 otherwise.'
-    # )
-    # lines.append(
-    #     "If you want to reason internally, do so silently. "
-    #     "Never include your reasoning in the output. Only output the JSON."
-    # )
-    # Optional: Causal inference reminders
-    if include_causal_rules:
-        lines.append("\n--- CAUSAL INFERENCE REMINDERS ---")
-        lines.append("- Confounder: causes both X and Y. Adjust for confounders that are not effects of X.")
-        lines.append("- Mediator: lies on the path X -> M -> Y. Do not adjust mediators if estimating the total effect of X on Y.")
-        lines.append("- Collider: a common effect of two (or more) variables. Avoid conditioning on colliders or their descendants.")
-        lines.append("- Backdoor adjustment: to estimate effect of X on Y, adjust for a set Z that blocks all backdoor paths into X and excludes descendants of X.")
-        lines.append("- Front-door adjustment: if a mediator M transmits X -> M -> Y, with all backdoor paths from X to M blocked and all backdoor paths from M to Y blocked by X, the effect is identifiable via front-door.")
-        lines.append("- Interventions: when a variable is intervened on, incoming edges to that variable are severed; use resulting changes to orient edges (e.g., if do(X) changes Y but do(Y) does not change X, prefer X -> Y).")
-        lines.append("- Output a DAG consistent with the data (no directed cycles).")
 
+    # ---------- Optional causal reminders ----------
+    if include_causal_rules:
+        lines.append("\n--- CAUSAL INFERENCE REMINDERS (for your internal use) ---")
+        lines.append("- Confounder: a variable that causes two others.")
+        lines.append("- Mediator: lies on a path X -> M -> Y.")
+        lines.append("- Collider: a common effect of two variables; avoid conditioning on colliders.")
+        lines.append("- Backdoor paths: block backdoor paths into a cause when estimating its effect.")
+        lines.append("- Interventions: do(X) cuts all incoming edges into X; use changes in other variables to orient edges.")
+        lines.append("- The final output must be a DAG (no directed cycles).")
+
+    # ---------- System variables ----------
     lines.append("\n--- SYSTEM VARIABLES (in order) ---")
     for i, var in enumerate(variables):
         lines.append(f"{i}: {var}")
 
+    # ---------- Observational data ----------
     if obs_rows:
         lines.append("\n--- OBSERVATIONAL DATA ---")
-        lines.append("The following cases were observed without any intervention:")
+        lines.append("Cases observed without intervention:")
         for i, r in enumerate(obs_rows):
-            clauses = [f"{h} was {r[h]}" for h in variables]
-            sentence = f"Case {i+1}: " + ", and ".join(clauses) + "."
+            clauses = [f"{h} = {r[h]}" for h in variables]
+            sentence = f"Case {i+1}: " + ", ".join(clauses) + "."
             lines.append(sentence)
 
+    # ---------- Interventional data ----------
     if interventions:
         lines.append("\n--- INTERVENTIONAL DATA ---")
-        lines.append("The following cases were observed after specific interventions:")
+        lines.append("Cases observed under specific interventions:")
         for (var, val), inter_rows in interventions.items():
             display_var = variable_map.get(var, var) if variable_map else var
             lines.append(
-                f"\nWhen an intervention was performed to set '{display_var}' to '{val}', "
-                f"the following outcomes were observed:"
+                f"\nWhen an intervention sets {display_var} to {val}, the following cases were observed:"
             )
             for i, r in enumerate(inter_rows):
-                clauses = [f"{h} was {r[h]}" for h in variables]
-                sentence = f"Case {i+1}: " + ", and ".join(clauses) + "."
+                clauses = [f"{h} = {r[h]}" for h in variables]
+                sentence = f"Case {i+1}: " + ", ".join(clauses) + "."
                 lines.append(sentence)
 
     lines.append("\n--- END OF DATA ---")
 
+    # ---------- High-level reasoning hints (optional) ----------
     if include_give_steps:
         lines.append(
-            "\nBased on ALL the data provided (both observational and interventional), "
-            "first think step-by-step:\n"
-            "1. Use the observational data to compute conditional probabilities and identify the Markov equivalence class of possible causal graphs.\n"
-            "2. Use the interventional data to distinguish between graphs in that equivalence class and select a single directed graph.\n"
-            "After you finish reasoning, output the JSON object described in the OUTPUT INSTRUCTIONS section."
+            "\nWhen deciding on the causal graph, you may internally follow these steps "
+            "(you do NOT need to describe them explicitly):\n"
+            "1. Use the observational data to infer conditional (in)dependencies and identify a plausible Markov equivalence class.\n"
+            "2. Use the interventional data to distinguish between graphs in that class and select a single directed graph.\n"
+            "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
         )
     else:
         lines.append(
-            "\nBased on ALL the data provided (both observational and interventional), "
-            "output the JSON object described in the OUTPUT INSTRUCTIONS section."
+            "\nBased on ALL the data (observational and interventional), "
+            "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
         )
 
     return "\n".join(lines)
