@@ -81,11 +81,11 @@ def get_basic_parser():
     parser.add_argument('--stop_early', action='store_true',
                         help='If True, ENCO stops running if it achieved perfect reconstruction in'
                              ' all of the last 5 epochs.')
-    parser.add_argument('--sample_size_obs', type=int, default=5000,
+    parser.add_argument('--sample_size_obs', type=int, default=200,
                         help='Dataset size to use for observational data. If an exported graph is'
                              ' given as input and sample_size_obs is smaller than the exported'
                              ' observational dataset, the first sample_size_obs samples will be taken.')
-    parser.add_argument('--sample_size_inters', type=int, default=200,
+    parser.add_argument('--sample_size_inters', type=int, default=0,
                         help='Number of samples to use per intervention. If an exported graph is'
                              ' given as input and sample_size_inters is smaller than the exported'
                              ' interventional dataset, the first sample_size_inters samples will be taken.')

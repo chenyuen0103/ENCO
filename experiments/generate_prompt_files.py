@@ -33,13 +33,13 @@ def main():
     ap.add_argument(
         "--obs-per-prompt",
         type=int,
-        default=200,
+        default=0,
         help="Forwarded to generate_prompts.py --obs-per-prompt.",
     )
     ap.add_argument(
         "--int-per-combo",
         type=int,
-        default=0,
+        default=3,
         help="Forwarded to generate_prompts.py --int-per-combo.",
     )
     ap.add_argument(
