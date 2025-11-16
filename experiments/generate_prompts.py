@@ -210,10 +210,12 @@ def _try_sample_interventional_api(
 def format_prompt_with_interventions(
     variables: List[str],
     all_rows: List[Dict[str, Any]],
-    variable_map: Dict[str, str] | None = None,
+    variable_map = None,
     include_causal_rules: bool = False,
     include_give_steps: bool = False,
+    given_edges = None,
 ) -> str:
+
     """
     Build a prompt that presents mixed observational + interventional data
     and asks for a JSON adjacency matrix over `variables`.
@@ -241,54 +243,67 @@ def format_prompt_with_interventions(
     # ---------- OUTPUT INSTRUCTIONS ----------
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     if not include_give_steps:
-        # STRICT JSON-FIRST MODE (good for eval)
+        # STRICT JSON-ONLY MODE (good for eval)
         lines.append(
-            'Your reply MUST be a single valid JSON object and NOTHING else.'
+            'Respond with a single valid JSON object and nothing else.'
         )
         lines.append(
-            'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+            'The object must have exactly two keys: "variables" and "adjacency_matrix".'
         )
         lines.append(
             '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
             'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'Do not include any explanations, text, or markdown outside the JSON. '
-            'Your first character must be "{" and your last character must be "}".'
+            'Any text, explanation, or markdown outside this JSON object makes the answer invalid.'
+        )
+        lines.append(
+            'Your first character MUST be "{" and your last character MUST be "}".'
         )
     else:
         # EXPLANATION + JSON MODE (brief reasoning allowed, JSON at the end)
         lines.append(
-            "You may include a brief explanation of your reasoning."
+            'You may optionally include a brief explanation first.'
         )
         lines.append(
-            'At the end of your answer, output a single JSON object with exactly two keys: '
-            '"variables" and "adjacency_matrix".'
+            'At the end, you MUST output a single JSON object with exactly two keys: "variables" and "adjacency_matrix".'
         )
         lines.append(
             '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
             'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'The final JSON must be syntactically valid (starts with "{" and ends with "}"). '
-            'Place it on its own line at the end of your answer.'
+            'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
+            'must appear on its own line at the end of your answer, and nothing may follow it.'
         )
 
     # ---------- Optional causal reminders ----------
     if include_causal_rules:
-        lines.append("\n--- CAUSAL INFERENCE REMINDERS (for your internal use) ---")
+        lines.append("\n--- CAUSAL INFERENCE REMINDERS ---")
         lines.append("- Confounder: a variable that causes two others.")
         lines.append("- Mediator: lies on a path X -> M -> Y.")
         lines.append("- Collider: a common effect of two variables; avoid conditioning on colliders.")
         lines.append("- Backdoor paths: block backdoor paths into a cause when estimating its effect.")
         lines.append("- Interventions: do(X) cuts all incoming edges into X; use changes in other variables to orient edges.")
         lines.append("- The final output must be a DAG (no directed cycles).")
+
+
+    # ---------- Known edges section (optional) ----------
+    if given_edges:
+        lines.append("\n--- KNOWN DIRECT CAUSAL EDGES ---")
+        lines.append(
+            "You are told that the following directed causal relationships "
+            "are definitely present in the true causal graph:"
+        )
+        for src, dst in given_edges:
+            lines.append(f"- {src} -> {dst}")
+
 
     # ---------- System variables ----------
     lines.append("\n--- SYSTEM VARIABLES (in order) ---")
@@ -321,21 +336,62 @@ def format_prompt_with_interventions(
     lines.append("\n--- END OF DATA ---")
 
     # ---------- High-level reasoning hints (optional) ----------
+    has_obs = bool(obs_rows)
+    has_interv = bool(interventions)
+
     if include_give_steps:
-        lines.append(
-            "\nWhen deciding on the causal graph, you may internally follow these steps "
-            "(you do NOT need to describe them explicitly):\n"
-            "1. Use the observational data to infer conditional (in)dependencies and identify a plausible Markov equivalence class.\n"
-            "2. Use the interventional data to distinguish between graphs in that class and select a single directed graph.\n"
-            "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
-        )
+        if has_obs and has_interv:
+            lines.append(
+                "\nWhen deciding on the causal graph, you may follow these steps "
+                "(you do NOT need to describe them explicitly):\n"
+                "1. Use the observational data to infer conditional (in)dependencies and identify a plausible Markov equivalence class.\n"
+                "2. Use the interventional data to distinguish between graphs in that class and select a single directed graph.\n"
+                "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        elif has_obs and not has_interv:
+            lines.append(
+                "\nWhen deciding on the causal graph, you may follow these steps "
+                "(you do NOT need to describe them explicitly):\n"
+                "1. Use the observational data to infer conditional (in)dependencies among the variables.\n"
+                "2. Choose a directed acyclic graph (DAG) consistent with these (in)dependencies.\n"
+                "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        elif has_interv and not has_obs:
+            lines.append(
+                "\nWhen deciding on the causal graph, you may follow these steps "
+                "(you do NOT need to describe them explicitly):\n"
+                "1. For each intervention do(X = x), treat incoming edges into X as cut and use the changes in other variables "
+                "to orient edges into or out of X.\n"
+                "2. Combine information from all interventions into a single DAG.\n"
+                "Then produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        else:
+            lines.append(
+                "\nThen produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
     else:
-        lines.append(
-            "\nBased on ALL the data (observational and interventional), "
-            "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
-        )
+        if has_obs and has_interv:
+            lines.append(
+                "\nBased on ALL the data (observational and interventional), "
+                "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        elif has_obs and not has_interv:
+            lines.append(
+                "\nBased on the observational data, "
+                "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        elif has_interv and not has_obs:
+            lines.append(
+                "\nBased on the interventional data, "
+                "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
+        else:
+            lines.append(
+                "\nProduce the JSON object described in the OUTPUT INSTRUCTIONS section."
+            )
 
     return "\n".join(lines)
+
 
 
 
@@ -344,6 +400,7 @@ def format_prompt_without_intervention(
     obs_rows: List[Dict[str, Any]],
     include_causal_rules: bool = False,
     include_give_steps: bool = False,
+    given_edges = None,
 ) -> str:
     """
     Build a prompt that presents purely observational data and asks
@@ -366,48 +423,67 @@ def format_prompt_without_intervention(
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     if not include_give_steps:
         # STRICT JSON-ONLY MODE (good for eval)
-        lines.append('Your reply MUST be a single valid JSON object and NOTHING else.')
         lines.append(
-            'The JSON object must have exactly two keys: "variables" and "adjacency_matrix".'
+            'Respond with a single valid JSON object and nothing else.'
+        )
+        lines.append(
+            'The object must have exactly two keys: "variables" and "adjacency_matrix".'
         )
         lines.append(
             '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
             'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'Do not include any explanations, text, or markdown outside the JSON. '
-            'Your first character must be "{" and your last character must be "}".'
+            'Any text, explanation, or markdown outside this JSON object makes the answer invalid.'
+        )
+        lines.append(
+            'Your first character MUST be "{" and your last character MUST be "}".'
         )
     else:
         # EXPLANATION + JSON MODE (brief reasoning allowed, JSON at the end)
-        lines.append("You may include a brief explanation of your reasoning.")
         lines.append(
-            'At the end of your answer, output a single JSON object with exactly two keys: '
-            '"variables" and "adjacency_matrix".'
+            'You may optionally include a brief explanation first.'
+        )
+        lines.append(
+            'At the end, you MUST output a single JSON object with exactly two keys: "variables" and "adjacency_matrix".'
         )
         lines.append(
             '- "variables": the ordered list of variable names given in the SYSTEM VARIABLES section below.'
         )
         lines.append(
-            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where entry [i][j] is 1 '
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
             'iff there is a directed edge from variables[i] to variables[j], else 0.'
         )
         lines.append(
-            'The final JSON must be syntactically valid (starts with "{" and "}"). '
-            'Place it on its own line at the end of your answer.'
+            'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
+            'must appear on its own line at the end of your answer, and nothing may follow it.'
         )
 
     # ---------- Optional causal reminders ----------
     if include_causal_rules:
-        lines.append("\n--- CAUSAL INFERENCE REMINDERS (for your internal use) ---")
+        lines.append("\n--- CAUSAL INFERENCE REMINDERS ---")
         lines.append("- Confounder: a variable that causes two others.")
         lines.append("- Mediator: lies on a path X -> M -> Y.")
         lines.append("- Collider: a common effect of two variables; avoid conditioning on colliders.")
         lines.append("- Use conditional independencies to constrain the possible DAGs.")
         lines.append("- The final output must be a DAG (no directed cycles).")
+
+    # ---------- Known edges section (optional) ----------
+    if given_edges:
+        lines.append("\n--- KNOWN DIRECT CAUSAL EDGES ---")
+        lines.append(
+            "You are told that the following directed causal relationships "
+            "are definitely present in the true causal graph:"
+        )
+        for src, dst in given_edges:
+            lines.append(f"- {src} -> {dst}")
+        lines.append(
+            "In your adjacency_matrix output, the entry [i][j] MUST be 1 whenever "
+            "variables[i] = src and variables[j] = dst for one of these edges."
+        )
 
     # ---------- System variables ----------
     lines.append("\n--- SYSTEM VARIABLES (in order) ---")
@@ -430,7 +506,7 @@ def format_prompt_without_intervention(
     # ---------- High-level reasoning hints (optional) ----------
     if include_give_steps:
         lines.append(
-            "\nWhen deciding on the causal graph, you may internally follow these steps "
+            "\nWhen deciding on the causal graph, you may follow these steps "
             "(you do NOT need to describe them explicitly):\n"
             "1. Use the observational data to infer conditional (in)dependencies among the variables.\n"
             "2. Choose a directed acyclic graph (DAG) consistent with these (in)dependencies.\n"
@@ -438,11 +514,65 @@ def format_prompt_without_intervention(
         )
     else:
         lines.append(
-            "\nBased only on the observational data, "
+            "\nBased on the observational data, "
             "produce the JSON object described in the OUTPUT INSTRUCTIONS section."
         )
 
     return "\n".join(lines)
+
+def choose_given_edges(
+    adj_bin: List[List[int]],
+    frac: float,
+    seed: int = 0,
+    max_per_node: int = 2,
+) -> List[Tuple[int, int]]:
+    """
+    Scheme 1: choose a small, roughly uniform subset of true edges.
+
+    adj_bin: binary adjacency matrix (list of list of 0/1)
+    frac:    fraction of *all* edges to reveal (e.g. 0.2 = 20%)
+    seed:    RNG seed
+    max_per_node: optional cap on how many given-edges can touch each node.
+                  If None, don't cap.
+
+    Returns list of (i, j) index pairs where adj_bin[i][j] == 1.
+    """
+    n = len(adj_bin)
+    edges: List[Tuple[int, int]] = [
+        (i, j)
+        for i in range(n)
+        for j in range(n)
+        if adj_bin[i][j] == 1
+    ]
+
+    if frac <= 0.0 or not edges:
+        return []
+
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    edges_arr = _np.array(edges, dtype=int)
+    rng.shuffle(edges_arr)
+    edges = [tuple(map(int, e)) for e in edges_arr]
+
+    k_target = max(1, int(round(len(edges) * frac)))
+
+    if max_per_node is None:
+        # Simple: just take first k_target edges
+        return edges[:k_target]
+
+    node_counts = [0] * n
+    chosen: List[Tuple[int, int]] = []
+
+    for (i, j) in edges:
+        if len(chosen) >= k_target:
+            break
+        if node_counts[i] >= max_per_node and node_counts[j] >= max_per_node:
+            continue
+        chosen.append((i, j))
+        node_counts[i] += 1
+        node_counts[j] += 1
+
+    return chosen
 
 
 def main():
@@ -450,8 +580,8 @@ def main():
     ap.add_argument("--bif-file", default="../causal_graphs/real_data/small_graphs/cancer.bif",
                     help="Path to .bif Bayesian network file.")
     ap.add_argument("--num-prompts", type=int, default=10, help="Number of pairs to generate.")
-    ap.add_argument("--obs-per-prompt", type=int, default=200, help="Observational samples per prompt.")
-    ap.add_argument("--int-per-combo", type=int, default=3,
+    ap.add_argument("--obs-per-prompt", type=int, default=5000, help="Observational samples per prompt.")
+    ap.add_argument("--int-per-combo", type=int, default=200,
                     help="Interventional samples PER (variable,state) combo. 0 disables interventions.")
     ap.add_argument("--intervene-vars", default="all",
                     help='Comma-separated variable names, or "all", or "none".')
@@ -461,12 +591,23 @@ def main():
                     help="Include causal inference reminders in the prompt.")
     ap.add_argument("--give-steps", action="store_true",
                     help="Append step-by-step guidance on using observational and interventional data.")
-    ap.add_argument("--out-dir", default="./out/cancer", help="Output directory.")
-    ap.add_argument("--shuffles-per-graph", type=int, default=5,
+    # ap.add_argument("--out-dir", default="./prompts/cancer", help="Output directory.")
+    ap.add_argument("--shuffles-per-graph", type=int, default=3,
                     help="How many independent shuffles to generate per graph.")
+    ap.add_argument(
+        "--given-edge-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of true edges to reveal as known ground-truth edges (Scheme 1). "
+             "0.0 means no edges are given.",
+    )
 
     args = ap.parse_args()
-
+    args.out_dir = os.path.join(
+        os.path.dirname(__file__),
+        "prompts",
+        os.path.splitext(os.path.basename(args.bif_file))[0],
+    )
     # ---------- Load graph & basic info ----------
     bif_abs = Path(args.bif_file).resolve(strict=True)
     graph = load_graph_file(str(bif_abs))
@@ -481,7 +622,30 @@ def main():
     # anonymization map
     vmap = {name: f"X{i+1}" for i, name in enumerate(variables)} if args.anonymize else {}
     variables_out = [vmap.get(v, v) for v in variables]
+    # ------------------ Scheme 1: choose given edges ------------------
+    if args.given_edge_frac > 0.0:
+        given_edges_idx = choose_given_edges(
+            adj_bin,
+            frac=args.given_edge_frac,
+            seed=args.seed,
+            max_per_node=2,  # tweak if you like
+        )
+        # convert from indices to displayed variable names (respecting anonymization)
+        given_edges_named: List[Tuple[str, str]] = [
+            (variables_out[i], variables_out[j]) for (i, j) in given_edges_idx
+        ]
+    else:
+        given_edges_idx = []
+        given_edges_named = []
 
+    if args.given_edge_frac > 0.0:
+        # Option A: encode fraction as percentage, e.g. _gedge20 for 0.2
+        frac_pct = int(round(100 * args.given_edge_frac))
+        edge_tag = f"_gedge{frac_pct}"
+        # Option B (alternative): encode absolute # of revealed edges:
+        # edge_tag = f"_gedge{len(given_edges_idx)}"
+    else:
+        edge_tag = ""
     # state name codebook
     codebook = build_codebook(graph, variables, str(bif_abs))
 
@@ -510,6 +674,9 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # NEW: directory to store prompt text files
+    prompt_txt_dir = out_dir / "prompt_txt"
+    prompt_txt_dir.mkdir(parents=True, exist_ok=True)
     # Compose suffixes reflecting configuration
     tags = []
     if args.anonymize:
@@ -523,7 +690,7 @@ def main():
     base_name = (
         f"prompts_obs{args.obs_per_prompt}"
         f"_int{args.int_per_combo}"
-        f"_shuf{args.shuffles_per_graph}{extra_suffix}"
+        f"_shuf{args.shuffles_per_graph}{edge_tag}{extra_suffix}"
     )
 
     jsonl_path = out_dir / f"{base_name}.jsonl"
@@ -532,7 +699,7 @@ def main():
     jsonl_f = jsonl_path.open("w", encoding="utf-8")
 
     csv_f = csv_path.open("w", newline="", encoding="utf-8")
-    fieldnames = ["data_idx", "shuffle_idx", "prompt", "answer"]
+    fieldnames = ["data_idx", "shuffle_idx", "prompt_path", "answer", "given_edges"]
     csv_writer = csv.DictWriter(csv_f, fieldnames=fieldnames, extrasaction="ignore")
     csv_writer.writeheader()
 
@@ -579,7 +746,6 @@ def main():
 
                     dataset_size = args.int_per_combo  # ENCO-style: #samples per variable
 
-                    # values_vec[t] ~ Uniform({0, ..., num_categs-1})
                     values_vec = rng_int.integers(
                         low=0,
                         high=num_categs,
@@ -656,6 +822,7 @@ def main():
                 all_rows = interventional_rows + obs_rows
 
                 # ---------- Build prompt ----------
+                # ---------- Build prompt ----------
                 if args.int_per_combo > 0:
                     prompt_text = format_prompt_with_interventions(
                         variables_out,
@@ -663,36 +830,45 @@ def main():
                         variable_map=vmap,
                         include_causal_rules=args.causal_rules,
                         include_give_steps=args.give_steps,
+                        given_edges=given_edges_named if args.given_edge_frac > 0.0 else None,
                     )
                 else:
-                    # obs_rows_base is what you already build (list of dicts with var->value)
                     prompt_text = format_prompt_without_intervention(
                         variables_out,
                         obs_rows_base,
                         include_causal_rules=args.causal_rules,
                         include_give_steps=args.give_steps,
+                        given_edges=given_edges_named if args.given_edge_frac > 0.0 else None,
                     )
 
+                # ---------- Write prompt text to its own .txt file ----------
+                prompt_filename = f"{base_name}_data{i}_shuf{rep}.txt"
+                prompt_path = prompt_txt_dir / prompt_filename
+                prompt_path.write_text(prompt_text, encoding="utf-8")
 
+                # ---------- JSONL record (can still include full prompt) ----------
                 record = {
                     "data_idx": i,
                     "shuffle_idx": rep,
-                    "prompt": prompt_text,
+                    "prompt": prompt_text,  # keep full text in JSONL if you want
                     "answer": {
                         "variables": variables_out,
                         "adjacency_matrix": adj_bin,
                     },
                     "rows": all_rows,
+                    "given_edges": given_edges_named if args.given_edge_frac > 0.0 else None,
                 }
                 jsonl_f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-                # CSV: simple view (no rows)
+                # ---------- CSV: store only path to the prompt file ----------
                 csv_writer.writerow({
                     "data_idx": i,
                     "shuffle_idx": rep,
-                    "prompt": record["prompt"],
+                    "prompt_path": str(prompt_path),
                     "answer": json.dumps(record["answer"], ensure_ascii=False),
+                    "given_edges": json.dumps(given_edges_named, ensure_ascii=False),
                 })
+
 
         print(f"Generated {args.num_prompts * max(1, args.shuffles_per_graph)} prompt,answer pairs.")
         print(f"- JSONL: {jsonl_path}")

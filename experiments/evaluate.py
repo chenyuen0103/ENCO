@@ -5,40 +5,295 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 import numpy as np
-
-
-def extract_adj_from_json(s: str) -> Optional[np.ndarray]:
+import re
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import networkx as nx
+import sys
+sys.path.append("../")
+from causal_graphs.graph_visualization import graph_to_image
+import matplotlib.pyplot as plt
+import networkx as nx
+from networkx.drawing.nx_pydot import graphviz_layout
+def save_pred_vs_true_graph(A_true, A_pred, var_names, out_path):
     """
-    Parse an adjacency matrix from a JSON string.
+    Draws a side-by-side figure:
 
-    Accepts either:
+        left  = true graph
+        right = predicted graph
+
+    using a single Graphviz layout (like your cancer graph example),
+    with the same visual style (grey nodes, black edges, etc.).
+    """
+    n = len(var_names)
+    # Make sure A_true / A_pred are numpy arrays
+    A_true = np.asarray(A_true)
+    A_pred = np.asarray(A_pred)
+
+    # --- Build DiGraphs with integer nodes 0..n-1 ---
+    G_true = nx.DiGraph()
+    G_pred = nx.DiGraph()
+    G_true.add_nodes_from(range(n))
+    G_pred.add_nodes_from(range(n))
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if A_true[i, j] == 1:
+                G_true.add_edge(i, j)
+            if A_pred[i, j] == 1:
+                G_pred.add_edge(i, j)
+
+    # --- One shared Graphviz layout (like your example) ---
+    pos = graphviz_layout(G_true, prog="dot")
+
+    # --- Figure + axes ---
+    figsize = max(3, n ** 0.7)
+    fig, axes = plt.subplots(1, 2, figsize=(2 * figsize, figsize))
+
+    # Label dict: int node -> name
+    labels = {i: var_names[i] for i in range(n)}
+
+    draw_kwargs = dict(
+        arrows=True,
+        node_color="lightgrey",
+        edgecolors="black",
+        node_size=600,
+        arrowstyle="-|>",
+        arrowsize=16,
+    )
+
+    # Left: TRUE graph
+    ax = axes[0]
+    nx.draw(G_true, pos, ax=ax, with_labels=False, **draw_kwargs)
+    nx.draw_networkx_labels(G_true, pos, labels=labels, font_weight="bold", ax=ax)
+    ax.set_title("True graph")
+    ax.set_axis_off()
+    ax.margins(0.2)
+
+    # Right: PREDICTED graph
+    ax = axes[1]
+    nx.draw(G_pred, pos, ax=ax, with_labels=False, **draw_kwargs)
+    nx.draw_networkx_labels(G_pred, pos, labels=labels, font_weight="bold", ax=ax)
+    ax.set_title("Predicted graph")
+    ax.set_axis_off()
+    ax.margins(0.2)
+
+    plt.tight_layout(pad=1.0)
+    fig.savefig(out_path, bbox_inches="tight", transparent=True)
+    plt.close(fig)
+
+def scan_given_edges_df(df: pd.DataFrame):
+    """
+    Look through the 'given_edges' column (if present).
+
+    Returns:
+        has_given_edges (0/1 flag),
+        max_given_edge_count (max number of edges given in any row)
+    """
+    if "given_edges" not in df.columns:
+        return 0, 0
+
+    has_any = 0
+    max_count = 0
+
+    for raw in df["given_edges"].dropna():
+        s = str(raw).strip()
+        if not s:
+            continue
+
+        try:
+            edges = json.loads(s)
+        except json.JSONDecodeError:
+            # try a light clean-up if quoting is weird
+            cleaned = s.replace("''", '"').replace('""', '"')
+            try:
+                edges = json.loads(cleaned)
+            except json.JSONDecodeError:
+                continue
+
+        if isinstance(edges, list):
+            has_any = 1
+            max_count = max(max_count, len(edges))
+
+    return has_any, max_count
+
+
+def get_true_num_edges_from_answers(df: pd.DataFrame) -> int | None:
+    """
+    Use the first non-empty 'answer' JSON to infer the true number of edges
+    by summing the adjacency_matrix entries.
+
+    Supports both:
       - {"variables": [...], "adjacency_matrix": [[...], ...]}
-      - or just [[...], ...] directly.
-
-    Returns an (N,N) np.ndarray of ints or None on failure.
+      - [[...], [...], ...]  (plain list-of-lists)
     """
-    if not s:
-        return None
-    try:
-        obj = json.loads(s)
-    except Exception:
+    if "answer" not in df.columns:
         return None
 
-    if isinstance(obj, dict) and "adjacency_matrix" in obj:
-        mat = obj["adjacency_matrix"]
-    else:
-        mat = obj
+    for raw in df["answer"].dropna():
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            ans_obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
 
-    try:
-        arr = np.asarray(mat, dtype=int)
-    except Exception:
+        # Support both dict and bare matrix
+        if isinstance(ans_obj, dict):
+            mat = ans_obj.get("adjacency_matrix")
+        else:
+            mat = ans_obj
+
+        try:
+            A = np.asarray(mat)
+        except Exception:
+            continue
+
+        if A.ndim == 2:
+            return int(A.sum())
+
+    return None
+
+
+
+def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
+    """
+    Robustly extract a square adjacency matrix from a messy LLM response.
+    Returns a (N, N) numpy array of ints, or None.
+    """
+
+    if not text:
         return None
 
-    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+    # Helper: convert list-of-lists to square numpy array
+    def _normalize_matrix(mat: Any) -> Optional[np.ndarray]:
+        if not isinstance(mat, list) or not mat:
+            return None
+        try:
+            rows: List[List[int]] = [[int(x) for x in row] for row in mat]
+        except Exception:
+            return None
+        n = len(rows)
+        if any(len(r) != n for r in rows):
+            return None
+        try:
+            arr = np.asarray(rows, dtype=int)
+        except Exception:
+            return None
+        if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+            return None
+        return arr
+
+    def _from_obj(obj: Any) -> Optional[np.ndarray]:
+        if isinstance(obj, dict) and "adjacency_matrix" in obj:
+            return _normalize_matrix(obj["adjacency_matrix"])
+        return _normalize_matrix(obj)
+
+    def _try_one_variant(txt: str) -> Optional[np.ndarray]:
+        txt = txt.strip()
+
+        # 1) Whole-string JSON
+        try:
+            obj = json.loads(txt)
+            m = _from_obj(obj)
+            if m is not None:
+                return m
+        except Exception:
+            pass
+
+        # 2) Objects that start with "variables"
+        for m in re.finditer(r'\{\s*"variables"\s*:[\s\S]*?\}', txt):
+            frag = m.group(0)
+            try:
+                obj = json.loads(frag)
+                mat = _from_obj(obj)
+                if mat is not None:
+                    return mat
+            except Exception:
+                continue
+
+        # 3) Generic { ... } blocks
+        for m in re.finditer(r"\{[\s\S]*?\}", txt):
+            frag = m.group(0)
+            try:
+                obj = json.loads(frag)
+                mat = _from_obj(obj)
+                if mat is not None:
+                    return mat
+            except Exception:
+                continue
+
+        # 4) `"adjacency_matrix": [ ... ]` via bracket-balancing
+        for m in re.finditer(r'"adjacency_matrix"\s*:', txt):
+            start = m.end()
+            lb = txt.find("[", start)
+            if lb == -1:
+                continue
+            depth = 0
+            for i in range(lb, len(txt)):
+                ch = txt[i]
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = txt[lb:i+1]
+                        try:
+                            obj = json.loads(candidate)
+                            mat = _normalize_matrix(obj)
+                            if mat is not None:
+                                return mat
+                        except Exception:
+                            pass
+                        break  # done with this "adjacency_matrix" block
+
+        # 5) Any [[...]]-style matrix
+        for m in re.finditer(r"\[\s*\[", txt):
+            lb = m.start()
+            depth = 0
+            seen_inner = False
+            for i in range(lb, len(txt)):
+                ch = txt[i]
+                if ch == "[":
+                    depth += 1
+                    if depth > 1:
+                        seen_inner = True
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0 and seen_inner:
+                        candidate = txt[lb:i+1]
+                        try:
+                            obj = json.loads(candidate)
+                            mat = _normalize_matrix(obj)
+                            if mat is not None:
+                                return mat
+                        except Exception:
+                            pass
+                        break
+
         return None
-    return arr
+
+    # First try the text as-is
+    mat = _try_one_variant(text)
+    if mat is not None:
+        return mat
+
+    # If we have literal "\n" sequences (backslash+n) but few real newlines,
+    # try again with "\n" converted to actual newlines.
+    if "\\n" in text:
+        alt = text.replace("\\n", "\n")
+        if alt != text:
+            mat = _try_one_variant(alt)
+            if mat is not None:
+                return mat
+
+    return None
 
 
 def eval_pair(
@@ -127,6 +382,33 @@ def eval_pair(
         "orient_acc": orient_acc,
     }
 
+def save_prediction_graph(A_pred: np.ndarray,
+                          var_names,
+                          out_path: Path,
+                          figsize=(3, 3)) -> None:
+    """
+    Turn an adjacency matrix + variable names into a PNG.
+
+    A_pred: (N, N) numpy array with 0/1 entries
+    var_names: list of length N
+    out_path: path to save the image
+    """
+    G = nx.DiGraph()
+    G.add_nodes_from(var_names)
+    n = A_pred.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if A_pred[i, j] == 1:
+                G.add_edge(var_names[i], var_names[j])
+
+    graph_to_image(
+        G,
+        filename=str(out_path),
+        show_plot=False,
+        layout="graphviz",
+        figsize=figsize,
+    )
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -160,12 +442,31 @@ def main():
     csv_path = Path(args.csv)
     if not csv_path.exists():
         raise SystemExit(f"CSV not found: {csv_path}")
-
+    # save 
+    viz_dir = csv_path.parent / (csv_path.stem + "_pred_graphs")
     # Read entire CSV
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         rows: List[Dict[str, Any]] = list(reader)
         orig_fieldnames = list(reader.fieldnames or [])
+        # --------- Pre-pass: recompute prediction & valid from raw_response ---------
+        RAW_COL = "raw_response"  # adjust if your column name differs
+
+        if RAW_COL in orig_fieldnames:
+            for row_idx, row in enumerate(rows):
+                raw = row.get(RAW_COL, "") or ""
+                mat = extract_adjacency_matrix(raw)
+
+                if mat is not None:
+                    # store as JSON list-of-lists
+                    row[args.pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
+                    row["valid"] = 1
+                else:
+                    row[args.pred_col] = ""
+                    row["valid"] = 0
+        else:
+            # no raw_response column; don't touch prediction/valid
+            pass
 
     # Per-row metrics & global aggregates
     per_row_metrics: List[Dict[str, Any]] = []
@@ -188,13 +489,13 @@ def main():
     orient_acc_list: List[Optional[float]] = []
 
     valid_rows = 0
-
-    for row in rows:
+    pred_edges_list: List[int] = []
+    for row_idx, row in enumerate(rows):
         ans_s = row.get(args.answer_col, "") or ""
         pred_s = row.get(args.pred_col, "") or ""
 
-        A_true = extract_adj_from_json(ans_s)
-        A_pred = extract_adj_from_json(pred_s)
+        A_true = extract_adjacency_matrix(ans_s)
+        A_pred = extract_adjacency_matrix(pred_s)
 
         if A_true is None or A_pred is None:
             # No metrics for this row
@@ -233,14 +534,40 @@ def main():
             orient_tp_list.append(met["orient_tp"])
             orient_fn_list.append(met["orient_fn"])
             orient_acc_list.append(met["orient_acc"])
+            # ===== NEW: count predicted edges (off-diagonal) =====
+            # (A_pred is 0/1; we exclude self-loops / diagonal just in case)
+            n = A_pred.shape[0]
+            mask_offdiag = ~np.eye(n, dtype=bool)
+            num_pred_edges = int(A_pred[mask_offdiag].sum())
+            pred_edges_list.append(num_pred_edges)
 
+            # ---------- Optional: visualize this prediction ----------
+            var_names = None
+            try:
+                ans_obj = json.loads(ans_s)
+                if isinstance(ans_obj, dict) and "variables" in ans_obj:
+                    var_names = ans_obj["variables"]
+            except Exception:
+                pass
+
+            if var_names is None:
+                # Fallback: X1, X2, ..., Xn
+                n_vars = A_true.shape[0]
+                var_names = [f"X{i+1}" for i in range(n_vars)]
+
+            # Same directory as CSV, same base name + "_row{idx}_pred_graph.pdf"
+            base_no_suffix = csv_path.with_suffix("")  # drop ".csv"
+            fig_name = f"{base_no_suffix.name}_row{row_idx}_pred_graph.pdf"
+            fig_path = base_no_suffix.with_name(fig_name)
+
+            save_pred_vs_true_graph(A_true, A_pred, var_names, fig_path)
         # Attach identifiers if present
         for k in ("data_idx", "shuffle_idx"):
             if k in row:
                 met[k] = row[k]
 
         per_row_metrics.append(met)
-
+    df = pd.DataFrame(rows)
     # --------- Global summary as averages over valid rows ---------
     if valid_rows > 0:
         def _mean_or_none(xs: List[Optional[float]]) -> Optional[float]:
@@ -262,12 +589,21 @@ def main():
         avg_orient_TP   = float(sum(orient_tp_list) / valid_rows)
         avg_orient_FN   = float(sum(orient_fn_list) / valid_rows)
         avg_orient_acc  = _mean_or_none(orient_acc_list)
+        avg_pred_edges = float(sum(pred_edges_list) / valid_rows)
     else:
         avg_TP = avg_TN = avg_FP = avg_FN = avg_SHD = 0.0
         avg_accuracy = avg_precision = avg_recall = avg_f1 = None
         avg_orient_eval = avg_orient_TP = avg_orient_FN = 0.0
         avg_orient_acc = None
+        avg_pred_edges = None
 
+    has_given_edges, given_edge_count = scan_given_edges_df(df)
+    true_num_edges = get_true_num_edges_from_answers(df)
+
+    if true_num_edges and true_num_edges > 0 and given_edge_count > 0:
+        given_edge_frac = given_edge_count / float(true_num_edges)
+    else:
+        given_edge_frac = None
     summary = {
         "num_rows": len(rows),
         "valid_rows": valid_rows,
@@ -284,6 +620,13 @@ def main():
         "avg_orientation_TP": avg_orient_TP,
         "avg_orientation_FN": avg_orient_FN,
         "avg_orientation_accuracy": avg_orient_acc,
+        "num_pred_edges": avg_pred_edges,           # <-- NEW COLUMN
+        "true_num_edges": int(true_num_edges) if true_num_edges is not None else None,
+        "given_edges": int(has_given_edges),         # 0/1 flag
+        "given_edge_count": int(given_edge_count),   # absolute number of edges given
+        "given_edge_frac": (
+            float(given_edge_frac) if given_edge_frac is not None else None
+        ),
     }
 
     # Pretty-print summary to stdout

@@ -7,26 +7,26 @@ def main():
     base_dir = Path("prompts/cancer")
 
     # Corresponds to prompts_obs{0,200}
-    obs_values = [200,0]
+    obs_values = [5000]
 
     # Corresponds to _int{0,3}
-    int_values = [3, 0]
+    int_values = [200]
 
     # Corresponds to { _anon, '' }
     # anon_suffixes = ["", "_anon"]
-    anon_suffixes = ["_anon", ""]
+    anon_suffixes = ["_anon"]
 
     # Corresponds to { _rules, _steps, _rules_steps, '' }
-    rule_suffixes = ["", "_rules", "_steps", "_rules_steps"]
-    # rule_suffixes = ["", "_rules"]
+    # rule_suffixes = ["", "_rules", "_steps", "_rules_steps"]
+    given_edges_suffixes = [ "" ]
+    rule_suffixes = [""]
+    # rule_suffixes = ["_rules_steps"]
 
     # Models to run
     models = [
-        "Qwen/Qwen3-32B",
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "meta-llama/Meta-Llama-3-8B",
-        "Qwen/Qwen3-4B",
-
+        # "gemini-2.5-flash",
+        # "gpt-5-mini",
+        "gpt-4o-mini",
     ]
 
     temperature = "0.0"
@@ -43,8 +43,9 @@ def main():
                 continue
             for anon in anon_suffixes:
                 for rule in rule_suffixes:
-                    filename = f"prompts_obs{obs}_int{intval}_shuf3{anon}{rule}.csv"
-                    csv_path = base_dir / filename
+                    for given_edges in given_edges_suffixes:
+                        filename = f"prompts_obs{obs}_int{intval}_shuf3{given_edges}{anon}{rule}.csv"
+                        csv_path = base_dir / filename
 
                     total_planned += 1
 

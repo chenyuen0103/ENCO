@@ -115,11 +115,20 @@ class ENCO(object):
         """
         self.graph = graph
         self.num_vars = graph.num_vars
-        # Create observational dataset
-        obs_dataset = ObservationalCategoricalData(graph, dataset_size=sample_size_obs)
-        # breakpoint()
-        obs_data_loader = data.DataLoader(obs_dataset, batch_size=batch_size,
-                                          shuffle=True, drop_last=True)
+        self.use_observational_data = (sample_size_obs != 0)
+        self.use_interventional_data = (sample_size_inters != 0)
+        if not self.use_observational_data and not self.use_interventional_data:
+            raise ValueError("At least one of observational or interventional data must be enabled. "
+                             "Disable both only if you provide external updates.")
+        obs_dataset = None
+        obs_data_loader = None
+        if self.use_observational_data:
+            dataset_size = abs(sample_size_obs)
+            obs_dataset = ObservationalCategoricalData(graph, dataset_size=dataset_size)
+            obs_data_loader = data.DataLoader(obs_dataset, batch_size=batch_size,
+                                              shuffle=True, drop_last=True)
+        else:
+            print("Skipping observational data: sample_size_obs is 0.")
         # Create neural networks for fitting the conditional distributions
         if graph.is_categorical:
             num_categs = max([v.prob_dist.num_categs for v in graph.variables])
@@ -130,26 +139,33 @@ class ENCO(object):
             model = create_continuous_model(num_vars=self.num_vars,
                                             hidden_dims=hidden_dims,
                                             use_flow_model=use_flow_model)
-        model_optimizer = torch.optim.Adam(model.parameters(),
+        self.model = model
+        model_optimizer = torch.optim.Adam(self.model.parameters(),
                                            lr=lr_model,
                                            betas=betas_model,
                                            weight_decay=weight_decay)
         # Initialize graph parameters
         self.init_graph_params(self.num_vars, lr_gamma, betas_gamma, lr_theta, betas_theta)
         # Initialize distribution and graph fitting modules
-        self.distribution_fitting_module = DistributionFitting(model=model,
-                                                               optimizer=model_optimizer,
-                                                               data_loader=obs_data_loader)
-        self.graph_fitting_module = GraphFitting(model=model,
-                                                 graph=graph,
-                                                 num_batches=GF_num_batches,
-                                                 num_graphs=GF_num_graphs,
-                                                 theta_only_num_graphs=theta_only_num_graphs,
-                                                 batch_size=batch_size,
-                                                 lambda_sparse=lambda_sparse,
-                                                 max_graph_stacking=max_graph_stacking,
-                                                 sample_size_inters=sample_size_inters,
-                                                 exclude_inters=self.graph.exclude_inters)
+        self.distribution_fitting_module = None
+        if self.use_observational_data:
+            self.distribution_fitting_module = DistributionFitting(model=self.model,
+                                                                   optimizer=model_optimizer,
+                                                                   data_loader=obs_data_loader)
+        self.graph_fitting_module = None
+        if self.use_interventional_data:
+            self.graph_fitting_module = GraphFitting(model=self.model,
+                                                     graph=graph,
+                                                     num_batches=GF_num_batches,
+                                                     num_graphs=GF_num_graphs,
+                                                     theta_only_num_graphs=theta_only_num_graphs,
+                                                     batch_size=batch_size,
+                                                     lambda_sparse=lambda_sparse,
+                                                     max_graph_stacking=max_graph_stacking,
+                                                     sample_size_inters=sample_size_inters,
+                                                     exclude_inters=self.graph.exclude_inters)
+        else:
+            print("Skipping interventional data: sample_size_inters is 0.")
         # Save other hyperparameters
         self.model_iters = model_iters
         self.graph_iters = graph_iters
@@ -163,8 +179,12 @@ class ENCO(object):
         self.dist_fit_time = -1
 
         # Some debugging info for user
-        print(f'Distribution fitting model:\n{str(model)}')
-        print(f'Dataset size:\n- Observational: {len(obs_dataset)}\n- Interventional: {sample_size_inters}')
+        print(f'Distribution fitting model:\n{str(self.model)}')
+        obs_size = len(obs_dataset) if obs_dataset is not None else 0
+        obs_suffix = "" if obs_dataset is not None else " (disabled)"
+        inters_suffix = "" if self.use_interventional_data else " (disabled)"
+        print("Dataset size:\n- Observational: %s%s\n- Interventional: %s%s" %
+              (obs_size, obs_suffix, sample_size_inters, inters_suffix))
 
     def init_graph_params(self, num_vars, lr_gamma, betas_gamma, lr_theta, betas_theta):
         """
@@ -191,10 +211,17 @@ class ENCO(object):
             self.epoch = epoch
             start_time = time.time()
             # Update Model
-            self.distribution_fitting_step()
-            self.dist_fit_time = time.time() - start_time
+            if self.use_observational_data and self.distribution_fitting_module is not None:
+                self.distribution_fitting_step()
+                self.dist_fit_time = time.time() - start_time
+            else:
+                self.dist_fit_time = 0.0
             # Update graph parameters
-            self.graph_fitting_step()
+            if self.use_interventional_data and self.graph_fitting_module is not None:
+                self.graph_fitting_step()
+            else:
+                if epoch == 0:
+                    print("Graph fitting skipped (interventional data disabled).")
             self.iter_time = time.time() - start_time
             # Print stats
             self.print_graph_statistics(epoch=epoch+1, log_metrics=True)
@@ -212,6 +239,8 @@ class ENCO(object):
         """
         Performs on iteration of distribution fitting.
         """
+        if self.distribution_fitting_module is None:
+            return
         # Probabilities to sample input masks from
         sample_matrix = torch.sigmoid(self.gamma) * torch.sigmoid(self.theta)
         # Update model in a loop
@@ -225,6 +254,8 @@ class ENCO(object):
         """
         Performs on iteration of graph fitting.
         """
+        if self.graph_fitting_module is None:
+            return
         # For large graphs, freeze gamma in every second graph fitting stage
         only_theta = (self.use_theta_only_stage and self.epoch % 2 == 0)
         iters = self.graph_iters if not only_theta else self.theta_only_iters
@@ -418,7 +449,7 @@ class ENCO(object):
         state_dict = {
             "gamma": self.gamma.data.detach(),
             "theta": self.theta.data.detach(),
-            "model": self.distribution_fitting_module.model.state_dict()
+            "model": self.model.state_dict()
         }
         return state_dict
 
@@ -428,13 +459,13 @@ class ENCO(object):
         """
         self.gamma.data = state_dict["gamma"]
         self.theta.data = state_dict["theta"]
-        self.distribution_fitting_module.model.load_state_dict(state_dict["model"])
+        self.model.load_state_dict(state_dict["model"])
 
     def to(self, device):
         """
         Moves all PyTorch parameters to a specified device.
         """
-        self.distribution_fitting_module.model.to(device)
+        self.model.to(device)
         self.gamma.data = self.gamma.data.to(device)
         self.theta.data = self.theta.data.to(device)
         self.theta_optimizer.to(device)

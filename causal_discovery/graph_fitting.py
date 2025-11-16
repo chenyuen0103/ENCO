@@ -66,9 +66,13 @@ class GraphFitting(object):
         self.theta_grad_mask = torch.zeros(self.graph.num_vars, self.graph.num_vars)
         for v in self.exclude_inters:
             self.theta_grad_mask[v, self.exclude_inters] = 1.0
-        self.dataset = InterventionalDataset(self.graph,
-                                             dataset_size=self.sample_size_inters,
-                                             batch_size=self.batch_size)
+        self.dataset = None
+        if self.sample_size_inters > 0:
+            self.dataset = InterventionalDataset(self.graph,
+                                                 dataset_size=self.sample_size_inters,
+                                                 batch_size=self.batch_size)
+        else:
+            print('Skipping pre-sampled interventional dataset (sample_size_inters <= 0).')
         if len(self.exclude_inters) > 0:
             print(f'Excluding interventions on the following {len(self.exclude_inters)}'
                   f' out of {graph.num_vars} variables: '
@@ -143,7 +147,7 @@ class GraphFitting(object):
         device = self.get_device()
 
         # Sample data batch
-        if hasattr(self, "dataset"):
+        if self.dataset is not None:
             # Pre-sampled data
             var_idx = self.sample_next_var_idx()
             int_sample = torch.cat([self.dataset.get_batch(var_idx) for _ in range(num_batches)], dim=0).to(device)

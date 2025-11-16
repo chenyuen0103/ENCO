@@ -33,13 +33,13 @@ def main():
     ap.add_argument(
         "--obs-per-prompt",
         type=int,
-        default=0,
+        default=5000,
         help="Forwarded to generate_prompts.py --obs-per-prompt.",
     )
     ap.add_argument(
         "--int-per-combo",
         type=int,
-        default=3,
+        default=200,
         help="Forwarded to generate_prompts.py --int-per-combo.",
     )
     ap.add_argument(
@@ -53,16 +53,22 @@ def main():
         default=0,
         help="Forwarded to generate_prompts.py --seed.",
     )
-    ap.add_argument(
-        "--out-dir",
-        default="./out/cancer",
-        help="Forwarded to generate_prompts.py --out-dir.",
-    )
+    # ap.add_argument(
+    #     "--out-dir",
+    #     default="./prompts/cancer",
+    #     help="Forwarded to generate_prompts.py --out-dir.",
+    # )
     ap.add_argument(
         "--shuffles-per-graph",
         type=int,
-        default=5,
+        default=3,
         help="Forwarded to generate_prompts.py --shuffles-per-graph.",
+    )
+    ap.add_argument(
+        "--given-edge-frac",
+        type=float,
+        default=0.0,
+        help="Forwarded to generate_prompts.py --given-edge-frac.",
     )
     args = ap.parse_args()
 
@@ -93,8 +99,9 @@ def main():
             "--int-per-combo", str(args.int_per_combo),
             "--intervene-vars", args.intervene_vars,
             "--seed", str(args.seed),
-            "--out-dir", args.out_dir,
+            # "--out-dir", args.out_dir,
             "--shuffles-per-graph", str(args.shuffles_per_graph),
+            "--given-edge-frac", str(args.given_edge_frac),
         ]
 
         # Add flags only when True so the generator's own suffix logic works

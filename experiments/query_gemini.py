@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from tqdm import tqdm
 import random
+import re
 # ---------- Subprocess wrapper to enforce hard timeouts ----------
 # --- imports you need at module top ---
 from multiprocessing import get_context
 from queue import Empty as QueueEmpty  # <-- correct exception
+import numpy as np
 # --- imports near top ---
 
 
@@ -74,12 +76,78 @@ def call_gemini(
         print(tb, file=sys.stderr)
         # Return a short string into the CSV cell
         return f"[ERROR] {type(e).__name__}: {e}"
+    
 
+def call_openai(
+    model_name: str,
+    prompt: str,
+    *,
+    temperature: float = 0.0,
+    api_key: Optional[str] = None,
+    max_retries: int = 0,
+    request_timeout: float = 20.0,
+) -> str:
+    """
+    Call an OpenAI chat model once (or with a small, explicit number of retries).
+    Returns model text, or a '[ERROR] ...' string.
+    """
+    try:
+        if api_key is None:
+            api_key = os.getenv("OPENAI_API_KEY") or ""
+        if not api_key:
+            return "[ERROR] Missing API key (set OPENAI_API_KEY)."
+
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as ie:
+            return f"[ERROR] OpenAI SDK not available: {type(ie).__name__}: {ie}"
+
+        # IMPORTANT: disable/limit automatic retries and set a per-request timeout
+        client = OpenAI(
+            api_key=api_key,
+            max_retries=max_retries,       # 0 = no automatic retries
+            timeout=request_timeout,       # seconds for network / HTTP timeouts
+        )
+
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=float(temperature),
+        )
+        # resp = client.responses.create(
+        #     model=model_name,
+        #     input=prompt,
+        #     )
+
+        if not resp.choices:
+            return "[ERROR] Empty response (no choices)."
+
+        msg = resp.choices[0].message
+        text = getattr(msg, "content", "") or ""
+        # msg = resp.output[1].content[0]
+        # text = msg['text']
+        return text
+
+    except KeyboardInterrupt:
+        # Let Ctrl-C bubble out so you can stop the whole run cleanly
+        raise
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return f"[ERROR] {type(e).__name__}: {e}"
 
 def is_gemini_model(model_name: str) -> bool:
     name = (model_name or "").lower()
     return "gemini" in name
 
+def is_openai_model(model_name: str) -> bool:
+    """
+    Heuristic: treat GPT / o* models as OpenAI API models.
+    Adjust this if you have custom naming.
+    """
+    name = (model_name or "").lower()
+    return any(tag in name for tag in ("gpt", "o1-", "o3-", "omni"))
 
 def build_hf_pipeline(
     model_name: str,
@@ -231,28 +299,139 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
         # propagate an explicit error string for each prompt
         return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
 
-def extract_adjacency_matrix(text: str):
+
+def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
     """
-    Try to extract the 'adjacency_matrix' field from a JSON object in `text`.
-    Returns the adjacency_matrix (list of lists) or None.
+    Robustly extract a square adjacency matrix from a messy LLM response.
+    Returns a (N, N) numpy array of ints, or None.
     """
-    text = text.strip()
-    # Try simple JSON parse first
-    try:
-        obj = json.loads(text)
-    except Exception:
-        # Try to locate the first '{' and last '}' and parse that substring
+
+    if not text:
+        return None
+
+    # Helper: convert list-of-lists to square numpy array
+    def _normalize_matrix(mat: Any) -> Optional[np.ndarray]:
+        if not isinstance(mat, list) or not mat:
+            return None
         try:
-            start = text.index("{")
-            end = text.rindex("}") + 1
-            obj = json.loads(text[start:end])
+            rows: List[List[int]] = [[int(x) for x in row] for row in mat]
         except Exception:
             return None
+        n = len(rows)
+        if any(len(r) != n for r in rows):
+            return None
+        try:
+            arr = np.asarray(rows, dtype=int)
+        except Exception:
+            return None
+        if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+            return None
+        return arr
 
-    if isinstance(obj, dict) and "adjacency_matrix" in obj:
-        return obj["adjacency_matrix"]
+    def _from_obj(obj: Any) -> Optional[np.ndarray]:
+        if isinstance(obj, dict) and "adjacency_matrix" in obj:
+            return _normalize_matrix(obj["adjacency_matrix"])
+        return _normalize_matrix(obj)
+
+    def _try_one_variant(txt: str) -> Optional[np.ndarray]:
+        txt = txt.strip()
+
+        # 1) Whole-string JSON
+        try:
+            obj = json.loads(txt)
+            m = _from_obj(obj)
+            if m is not None:
+                return m
+        except Exception:
+            pass
+
+        # 2) Objects that start with "variables"
+        for m in re.finditer(r'\{\s*"variables"\s*:[\s\S]*?\}', txt):
+            frag = m.group(0)
+            try:
+                obj = json.loads(frag)
+                mat = _from_obj(obj)
+                if mat is not None:
+                    return mat
+            except Exception:
+                continue
+
+        # 3) Generic { ... } blocks
+        for m in re.finditer(r"\{[\s\S]*?\}", txt):
+            frag = m.group(0)
+            try:
+                obj = json.loads(frag)
+                mat = _from_obj(obj)
+                if mat is not None:
+                    return mat
+            except Exception:
+                continue
+
+        # 4) `"adjacency_matrix": [ ... ]` via bracket-balancing
+        for m in re.finditer(r'"adjacency_matrix"\s*:', txt):
+            start = m.end()
+            lb = txt.find("[", start)
+            if lb == -1:
+                continue
+            depth = 0
+            for i in range(lb, len(txt)):
+                ch = txt[i]
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = txt[lb:i+1]
+                        try:
+                            obj = json.loads(candidate)
+                            mat = _normalize_matrix(obj)
+                            if mat is not None:
+                                return mat
+                        except Exception:
+                            pass
+                        break  # done with this "adjacency_matrix" block
+
+        # 5) Any [[...]]-style matrix
+        for m in re.finditer(r"\[\s*\[", txt):
+            lb = m.start()
+            depth = 0
+            seen_inner = False
+            for i in range(lb, len(txt)):
+                ch = txt[i]
+                if ch == "[":
+                    depth += 1
+                    if depth > 1:
+                        seen_inner = True
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0 and seen_inner:
+                        candidate = txt[lb:i+1]
+                        try:
+                            obj = json.loads(candidate)
+                            mat = _normalize_matrix(obj)
+                            if mat is not None:
+                                return mat
+                        except Exception:
+                            pass
+                        break
+
+        return None
+
+    # First try the text as-is
+    mat = _try_one_variant(text)
+    if mat is not None:
+        return mat
+
+    # If we have literal "\n" sequences (backslash+n) but few real newlines,
+    # try again with "\n" converted to actual newlines.
+    if "\\n" in text:
+        alt = text.replace("\\n", "\n")
+        if alt != text:
+            mat = _try_one_variant(alt)
+            if mat is not None:
+                return mat
+
     return None
-
 
 # def main():
 #     ap = argparse.ArgumentParser(
@@ -586,7 +765,7 @@ def main():
     )
     ap.add_argument(
         "--provider",
-        choices=["auto", "gemini", "hf"],
+        choices=["auto", "gemini", "hf","openai"],
         default="auto",
         help="Force provider. Default 'auto' picks 'gemini' if model name contains 'gemini', else 'hf'."
     )
@@ -622,7 +801,7 @@ def main():
 
     ap.add_argument(
         "--prompt-col",
-        default="prompt",
+        default="prompt_path",
         help="Name of the column containing prompts."
     )
     ap.add_argument(
@@ -670,12 +849,12 @@ def main():
     # Decide provider
     provider = args.provider
     if provider == "auto":
-        provider = "gemini" if is_gemini_model(args.model) else "hf"
-
-    # Require API key only for Gemini provider and not dry-run
-    if provider == "gemini" and not args.dry_run:
-        if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
-            sys.exit("Missing API key: set GOOGLE_API_KEY or GEMINI_API_KEY for Gemini provider.")
+        if is_gemini_model(args.model):
+            provider = "gemini"
+        elif is_openai_model(args.model):
+            provider = "openai"
+        else:
+            provider = "hf"
 
     in_path = Path(args.csv)
     if not in_path.exists():
@@ -684,9 +863,9 @@ def main():
     # If user did not explicitly set --max-new-tokens, choose based on filename
     if args.max_new_tokens is None:
         if "_steps" in in_path.stem:
-            args.max_new_tokens = 4096
+            args.max_new_tokens = 8192
         else:
-            args.max_new_tokens = 128
+            args.max_new_tokens = 512
         print(f"[info] Using max_new_tokens={args.max_new_tokens} for {in_path.name}")
 
     # --------- 1. Read input CSV once ---------
@@ -697,21 +876,56 @@ def main():
 
     # Ensure output columns
     fieldnames = orig_fieldnames[:]
-    for extra in ["raw_response", "prediction"]:
+    for extra in ["raw_response", "prediction", "valid"]:
         if extra not in fieldnames:
             fieldnames.append(extra)
 
+    # ---- Reorder columns for writing ----
+    # "indices" = any of these if present
+    index_cols = [c for c in ("data_idx", "shuffle_idx") if c in fieldnames]
+
+    # Priority block in this exact order, but only if present
+    priority_cols = [c for c in ["prediction", "valid", "raw_response"]
+                     if c in fieldnames]
+
+    # Everything else that wasn't already included
+    remaining_cols = [
+        c for c in fieldnames
+        if c not in index_cols and c not in priority_cols
+    ]
+
+    write_fieldnames = index_cols + priority_cols + remaining_cols
+
+
     # Decide output path: either user-specified or input + model suffix
+    # Decide output path: either user-specified, or under responses/cancer
     if args.out_csv is not None:
+        # If user passes an explicit path, respect it as-is
         out_path = Path(args.out_csv)
     else:
+        # inputs:    out/cancer/prompts_....csv
+        # outputs:   responses/cancer/responses_...._MODEL.csv
         safe_model_tag = args.model.split("/")[-1]
         for ch in [":", " "]:
             safe_model_tag = safe_model_tag.replace(ch, "_")
-        if safe_model_tag not in in_path.stem:
-            out_path = in_path.with_name(f"{in_path.stem}_{safe_model_tag}{in_path.suffix}")
-        else:
-            out_path = in_path
+
+        # responses_root: "responses"
+        # subdir: same as the input subdir, e.g. "cancer"
+        responses_root = Path("responses")
+        subdir_name = in_path.parent.name  # "cancer"
+        responses_dir = responses_root / subdir_name
+        responses_dir.mkdir(parents=True, exist_ok=True)
+
+        # start from input filename, swap 'prompts' -> 'responses'
+        base_name = in_path.name.replace("prompts", "responses")
+        base_stem = Path(base_name).stem
+        base_suffix = Path(base_name).suffix
+
+        if safe_model_tag not in base_stem:
+            base_stem = f"{base_stem}_{safe_model_tag}"
+
+        out_path = responses_dir / f"{base_stem}{base_suffix}"
+
 
     # JSONL path next to CSV
     json_out_path = out_path.with_suffix(".jsonl")
@@ -719,29 +933,58 @@ def main():
     # --------- 2. Determine resume vs overwrite ---------
     resume = out_path.exists() and not args.overwrite
 
+    existing_rows = []
     if resume:
-        already_done = 0
         with out_path.open("r", encoding="utf-8", newline="") as f_existing:
-            r_existing = csv.reader(f_existing)
-            next(r_existing, None)  # header
-            for _ in r_existing:
-                already_done += 1
-        print(f"[info] Resuming: {already_done} rows already present in {out_path.name}")
+            r_existing = csv.DictReader(f_existing)
+            for r in r_existing:
+                existing_rows.append(r)
+
+        # Find first row whose raw_response starts with [ERROR]
+        first_error_idx = None
+        for i, r in enumerate(existing_rows):
+            raw = (r.get("raw_response") or "").lstrip()
+            if raw.startswith("[ERROR]") or 'rate limit' in raw.lower() or 'ratelimit' in raw.lower():
+                first_error_idx = i
+                break
+
+        if first_error_idx is None:
+            already_done = len(existing_rows)
+            print(f"[info] Resuming: {already_done} rows already present in {out_path.name}, no [ERROR] rows.")
+        else:
+            already_done = first_error_idx
+            print(
+                f"[info] Resuming from row {already_done} (first [ERROR] at index {first_error_idx}) "
+                f"in {out_path.name}"
+            )
     else:
         already_done = 0
-        if out_path.exists():
-            print(f"[info] Overwrite requested; ignoring existing {out_path.name}")
-        else:
-            print(f"[info] No existing output file. Starting from scratch: {out_path.name}")
+        existing_rows = []
 
     total_rows = len(rows_in)
 
     # Respect max_rows only for **new** rows
     max_new = args.max_rows if args.max_rows is not None else float("inf")
 
+    # Check if there is *any* work to do (any new rows)
+    all_rows_done = resume and (already_done >= total_rows)
+    need_model_calls = (not args.dry_run) and (not all_rows_done)
+
+    if all_rows_done:
+        print("[info] All rows already processed in existing output. No new model calls will be made.")
+
+    # Require API key only if we actually need to call Gemini
+    if provider == "gemini" and need_model_calls:
+        if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
+            sys.exit("Missing API key: set GOOGLE_API_KEY or GEMINI_API_KEY for Gemini provider.")
+    # Require API key only if we actually need to call OpenAI
+    if provider == "openai" and need_model_calls:
+        if not os.getenv("OPENAI_API_KEY"):
+            sys.exit("Missing API key: set OPENAI_API_KEY for OpenAI provider.")
+
     # --------- 3. Build HF pipeline (if needed) ---------
     hf_pipe = None
-    if provider == "hf" and not args.dry_run:
+    if provider == "hf" and need_model_calls:
         try:
             dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
             hf_pipe = build_hf_pipeline(
@@ -762,14 +1005,26 @@ def main():
 
     # --------- 4. Open output files in append-or-write mode ---------
     # CSV
+
     if resume:
-        fout = out_path.open("a", encoding="utf-8", newline="")
-        writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
+        fout = out_path.open("w", encoding="utf-8", newline="")
+        writer = csv.DictWriter(fout, fieldnames=write_fieldnames, extrasaction="ignore")
+        writer.writeheader()
+
+        jf = json_out_path.open("w", encoding="utf-8")
+
+        # If resuming, first write all good rows (before first [ERROR]) back out
+        if resume and already_done > 0:
+            for i in range(already_done):
+                good_row = existing_rows[i]
+                writer.writerow(good_row)
+                jf.write(json.dumps(good_row, ensure_ascii=False) + "\n")
         # header already there
     else:
         fout = out_path.open("w", encoding="utf-8", newline="")
-        writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(fout, fieldnames=write_fieldnames, extrasaction="ignore")
         writer.writeheader()
+
 
     # JSONL: append only when resuming; otherwise overwrite
     if resume and json_out_path.exists():
@@ -800,13 +1055,14 @@ def main():
             row_obj["raw_response"] = resp
             adj = extract_adjacency_matrix(resp)
             if adj is not None:
-                row_obj["prediction"] = json.dumps(adj, ensure_ascii=False)
+                row_obj["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
+                row_obj["valid"] = 1
             else:
                 row_obj["prediction"] = ""
+                row_obj["valid"] = 0
             processed_new += 1
             writer_obj.writerow(row_obj)
             jf_obj.write(json.dumps(row_obj, ensure_ascii=False) + "\n")
-
         hf_batch_prompts.clear()
         hf_batch_rows.clear()
 
@@ -815,31 +1071,44 @@ def main():
             for idx, row in enumerate(rows_in):
                 pbar.update(1)
 
-                # Skip rows already written in previous runs (only if resuming)
+                # 1) Skip rows we've already fully written (before first [ERROR])
+                #    Those rows were re-emitted from existing_rows[:already_done]
                 if resume and idx < already_done:
                     continue
 
-                prompt = row.get(args.prompt_col, "") or ""
-                raw = row.get("raw_response", "") or ""
-                pred = row.get("prediction", "") or ""
+                # For rows >= already_done, start from the input CSV row
+                current = row
 
-                # If we've hit max_new, just write the row as-is (no new model calls)
+                # prompt = current.get(args.prompt_col, "") or "
+                prompt_path_str = current.get(args.prompt_col, "") or ""
+                prompt = Path(prompt_path_str).read_text(encoding="utf-8")
+                raw    = current.get("raw_response", "") or ""
+                pred   = current.get("prediction", "") or ""
+
+                # Treat [ERROR] responses as invalid and eligible for retry
+                is_error_resp = raw.lstrip().startswith("[ERROR]")
+
+                # 2) Respect max_rows: don't make new model calls past this,
+                #    but still write the row as-is so the file stays consistent.
                 if processed_new >= max_new:
-                    writer.writerow(row)
-                    jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    writer.writerow(current)
+                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     skipped_new += 1
                     continue
 
-                # If we already have raw_response and no prediction, try to parse it
-                if raw.strip() and not pred.strip():
-                    adj = extract_adjacency_matrix(raw)
-                    if adj is not None:
-                        row["prediction"] = json.dumps(adj, ensure_ascii=False)
+                # 3) If we already have a non-error raw_response **and** a prediction,
+                #    just reuse it (no new model call).
+                if raw.strip() and not is_error_resp and pred.strip():
+                    writer.writerow(current)
+                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    skipped_new += 1
+                    continue
 
+                # 4) Decide if we need to call the model
                 need_call = (
-                    not args.dry_run
+                    need_model_calls
                     and bool(prompt)
-                    and (args.overwrite or not raw.strip())
+                    and (args.overwrite or not raw.strip() or is_error_resp)
                 )
 
                 if need_call:
@@ -849,36 +1118,59 @@ def main():
                             prompt,
                             temperature=args.temperature,
                         )
+                        current["raw_response"] = resp
+                        adj = extract_adjacency_matrix(resp)
+                        if adj is not None:
+                            current["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
+                            current["valid"] = 1
+                        else:
+                            current["prediction"] = ""
+                            current["valid"] = 0
+                        processed_new += 1
+
+                        writer.writerow(current)
+                        jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    elif provider == "openai":
+                        resp = call_openai(
+                            model_name=args.model,
+                            prompt=prompt,
+                            temperature=args.temperature,
+                            max_retries=0,          # or 1 if you want *one* retry
+                            request_timeout=180.0,   # tune as you like
+                        )
                         row["raw_response"] = resp
                         adj = extract_adjacency_matrix(resp)
                         if adj is not None:
-                            row["prediction"] = json.dumps(adj, ensure_ascii=False)
+                            row["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
+                            row["valid"] = 1
                         else:
                             row["prediction"] = ""
+                            row["valid"] = 0
                         processed_new += 1
 
-                        # Gemini rows are written immediately
                         writer.writerow(row)
                         jf.write(json.dumps(row, ensure_ascii=False) + "\n")
 
                     elif provider == "hf":
-                        # Buffer HF rows for batched generation
+                        # Buffer for batched HF generation
                         hf_batch_prompts.append(prompt)
-                        hf_batch_rows.append(row)
+                        hf_batch_rows.append(current)
                         if len(hf_batch_prompts) >= int(args.hf_batch_size):
                             flush_hf_batch(writer, jf)
 
                     else:
-                        row["raw_response"] = "[ERROR] Unknown provider"
-                        row["prediction"] = ""
+                        current["raw_response"] = "[ERROR] Unknown provider"
+                        current["prediction"] = ""
+                        current["valid"] = 0
                         processed_new += 1
-                        writer.writerow(row)
-                        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        writer.writerow(current)
+                        jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+
                 else:
-                    skipped_new += 1
                     # No new call; just write the row as-is
-                    writer.writerow(row)
-                    jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    writer.writerow(current)
+                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    skipped_new += 1
 
                 # Flush occasionally so crashes don't lose much
                 if (idx + 1) % 10 == 0:
@@ -888,7 +1180,7 @@ def main():
                 pbar.set_postfix(processed_new=processed_new, skipped_new=skipped_new)
 
             # After the loop, flush any remaining HF batch
-            if provider == "hf":
+            if provider == "hf" and need_model_calls:
                 flush_hf_batch(writer, jf)
 
     finally:
@@ -900,6 +1192,7 @@ def main():
             jf.flush()
         except Exception:
             pass
+
 
     print(
         f"\nDone.\n"

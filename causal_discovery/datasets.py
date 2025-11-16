@@ -3,6 +3,8 @@ import torch.utils.data as data
 import numpy as np
 import time
 
+DEFAULT_SYNTH_OBS_SAMPLES = 200
+
 
 class ObservationalCategoricalData(data.Dataset):
 
@@ -28,18 +30,23 @@ class ObservationalCategoricalData(data.Dataset):
         self.graph = graph
         self.var_names = [v.name for v in self.graph.variables]
         if not hasattr(self.graph, "data_obs"):
+            if dataset_size <= 0:
+                dataset_size = max(1, getattr(self.graph, "default_obs_samples", DEFAULT_SYNTH_OBS_SAMPLES))
+                print('[INFO - ObservationalCategoricalData] sample_size_obs <= 0 but no observational'
+                      f' dataset was provided. Sampling {dataset_size} synthetic observational samples instead.')
             start_time = time.time()
             print("Creating dataset...")
             data = graph.sample(batch_size=dataset_size, as_array=True)
             print("Dataset created in %4.2fs" % (time.time() - start_time))
         else:
             data = self.graph.data_obs
-            if dataset_size <= data.shape[0]:
-                data = data[:dataset_size]
-            else:
-                print('[WARNING - ObservationalCategoricalData] The requested dataset size is'
-                      f' {dataset_size} but the exported graph\'s observational dataset has only'
-                      f' {data.shape[0]} samples. Using {data.shape[0]} samples...')
+            if dataset_size > 0:
+                if dataset_size <= data.shape[0]:
+                    data = data[:dataset_size]
+                else:
+                    print('[WARNING - ObservationalCategoricalData] The requested dataset size is'
+                          f' {dataset_size} but the exported graph\'s observational dataset has only'
+                          f' {data.shape[0]} samples. Using {data.shape[0]} samples...')
         data = torch.from_numpy(data)
         self.data = correct_data_types(data)
 
@@ -126,7 +133,7 @@ class InterventionalDataset(object):
         int_sample = self.graph.sample(interventions=intervention_dict,
                                        batch_size=self.dataset_size*num_vars,
                                        as_array=True)
-        breakpoint()
+        # breakpoint()
         int_sample = torch.from_numpy(int_sample).reshape(num_vars, self.dataset_size, int_sample.shape[-1])
         for i, (var_idx, var, values) in enumerate(intervention_list):
             self._add_dataset(int_sample[i], var_idx)

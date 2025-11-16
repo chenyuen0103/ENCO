@@ -142,5 +142,9 @@ causal_graphs/exported_graphs.zip
 checkpoints/*
 *.csv
 *.json
+*.jsonl
 out/
 prompts/
+*.pdf
+*.txt
+*/responses/
