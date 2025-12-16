@@ -14,7 +14,7 @@ from experiments.utils import set_seed, get_basic_parser, test_graph
 
 if __name__ == '__main__':
     parser = get_basic_parser()
-    parser.add_argument('--graph_files', type=str, nargs='+', default=["../causal_graphs/real_data/small_graphs/cancer.bif"],
+    parser.add_argument('--graph_files', type=str, nargs='+', default=["../causal_graphs/real_data/small_graphs/asia.bif"],
                         help='Graph files to apply ENCO to. Files must be .pt, .npz, or .bif files.')
     args = parser.parse_args()
 

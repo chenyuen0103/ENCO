@@ -5,119 +5,187 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 def main():
     ap = argparse.ArgumentParser(
-        description=(
-            "Run generate_prompts.py for all combinations of "
-            "--anonymize / --causal-rules / --give-steps."
-        )
+        description="Generate prompts for Experiment 1 (Data Representation & Robustness)."
     )
     ap.add_argument(
         "--script",
         default="generate_prompts.py",
-        help="Path to the prompt-generating script (default: generate_prompts.py in this directory).",
+        help="Path to the standard prompt-generating script.",
     )
-    # Common args to forward to generate_prompts.py
     ap.add_argument(
         "--bif-file",
-        default="../causal_graphs/real_data/small_graphs/cancer.bif",
-        help="Forwarded to generate_prompts.py --bif-file.",
+        default="../causal_graphs/real_data/small_graphs/asia.bif",
+        help="Path to the BIF file.",
     )
     ap.add_argument(
         "--num-prompts",
         type=int,
-        default=10,
-        help="Forwarded to generate_prompts.py --num-prompts.",
-    )
-    ap.add_argument(
-        "--obs-per-prompt",
-        type=int,
-        default=5000,
-        help="Forwarded to generate_prompts.py --obs-per-prompt.",
-    )
-    ap.add_argument(
-        "--int-per-combo",
-        type=int,
-        default=200,
-        help="Forwarded to generate_prompts.py --int-per-combo.",
-    )
-    ap.add_argument(
-        "--intervene-vars",
-        default="all",
-        help="Forwarded to generate_prompts.py --intervene-vars.",
+        default=5,
+        help="Number of random prompts (replicates) per configuration.",
     )
     ap.add_argument(
         "--seed",
         type=int,
-        default=0,
-        help="Forwarded to generate_prompts.py --seed.",
-    )
-    # ap.add_argument(
-    #     "--out-dir",
-    #     default="./prompts/cancer",
-    #     help="Forwarded to generate_prompts.py --out-dir.",
-    # )
-    ap.add_argument(
-        "--shuffles-per-graph",
-        type=int,
-        default=3,
-        help="Forwarded to generate_prompts.py --shuffles-per-graph.",
-    )
-    ap.add_argument(
-        "--given-edge-frac",
-        type=float,
-        default=0.0,
-        help="Forwarded to generate_prompts.py --given-edge-frac.",
+        default=42,
     )
     args = ap.parse_args()
 
-    script_path = Path(args.script).resolve()
-    if not script_path.exists():
-        sys.exit(f"Generator script not found: {script_path}")
+    # Resolve default script path
+    script_arg = Path(args.script)
+    # Interpret relative paths w.r.t. this file so defaults work when run from repo root
+    if script_arg.is_absolute():
+        default_script_path = script_arg
+    else:
+        default_script_path = (Path(__file__).parent / script_arg).resolve()
+    if not default_script_path.exists():
+        print(f"Error: Default script not found at {default_script_path}")
+        sys.exit(1)
 
-    # All combinations of the three boolean flags:
-    # anonymize ∈ {False, True}
-    # causal_rules ∈ {False, True}
-    # give_steps ∈ {False, True}
-    combos = list(itertools.product([False, True], repeat=3))
+    # Resolve names-only script path (always next to this orchestrator)
+    names_only_script = Path(__file__).parent / "generate_prompts_names_only.py"
 
-    for anonymize, causal_rules, give_steps in combos:
-        flag_str = (
-            f"anonymize={anonymize}, "
-            f"causal_rules={causal_rules}, "
-            f"give_steps={give_steps}"
+    # ==========================================
+    # EXPERIMENT 1 GRID DEFINITION
+    # ==========================================
+    
+    # 1. Data Representation
+    styles = ["cases", "matrix"]
+    
+    # 2. Semantics
+    anonymize_opts = [False, True]
+    
+    # 3. Data Volume (Observational)
+    obs_sizes = [0, 100, 1000, 5000, 8000]
+    
+    # 4. Data Volume (Interventional)
+    int_sizes = [0, 50, 100, 200, 500] 
+
+    # 5. Robustness: Ordering
+    row_order_opts = ["random", "sorted", "reverse"]
+    col_order_opts = ["original", "reverse", "random", "topo", "reverse_topo"]
+
+    # Create the Cartesian Product
+    flag_combos = itertools.product(
+        styles, 
+        anonymize_opts, 
+        obs_sizes,
+        int_sizes,
+        row_order_opts,
+        col_order_opts
+    )
+
+    print(f"--- Starting Experiment 1 Generation ---")
+    print(f"BIF File: {args.bif_file}")
+    
+    count = 0
+    for style, anon, obs_n, int_n, row_ord, col_ord in flag_combos:
+        
+        # --- DEFINITIONS ---
+        is_names_only = (obs_n == 0 and int_n == 0)
+        
+        # --- NEW BASELINE DEFINITION ---
+        # We perform expensive robustness checks (Topo/Reverse) ONLY on this config.
+        # N=5000, Int=200, Cases, Real Names
+        is_robustness_baseline = (
+            obs_n == 5000 and 
+            int_n == 200 and 
+            style == "cases" and 
+            anon is False
         )
-        print(f"\n=== Running combination: {flag_str} ===")
 
+        # --- FILTER 1: Names Only Constraints ---
+        if is_names_only:
+            # For names only, we ignore Data Size, Row Order, Anonymization
+            if row_ord != "random": continue
+            if anon is True: continue
+            if style != "cases": continue 
+            
+            current_script_path = names_only_script
+
+        # --- FILTER 2: Data Experiments Constraints ---
+        else:
+            current_script_path = default_script_path
+            
+            # Skip invalid empty data configs that aren't the official "Names Only" run
+            if obs_n == 0 and int_n == 0: continue 
+
+            # --- FILTER 3: Robustness (Ordering) ---
+            # If this is NOT the baseline, force standard ordering.
+            is_non_default_ordering = (row_ord != "random" or col_ord != "original")
+            
+            if is_non_default_ordering and not is_robustness_baseline:
+                continue
+
+            # --- FILTER 4: Context Window Safety ---
+            # 'Cases' style with N=5000/8000 is massive. 
+            # We allow it ONLY if it is the specific baseline we want to test.
+            # Otherwise, we skip it to save time/tokens.
+            if obs_n >= 5000 and style == "cases" and not is_robustness_baseline:
+                continue
+
+        # ----------------------------------------------------
+
+        # Construct Output Directory Name
+        parts = [style]
+        parts.append("anon" if anon else "real")
+        parts.append(f"obs{obs_n}")
+        parts.append(f"int{int_n}")
+        
+        if row_ord != "random":
+            parts.append(f"row{row_ord}")
+        if col_ord != "original":
+            parts.append(f"col{col_ord}")
+
+        config_name = "_".join(parts)
+        out_dir = Path(f"prompts/experiment1/asia") / config_name
+
+        print(f"[{count+1}] Generating: {config_name} (Script: {current_script_path.name}) ...")
+
+        # Build Command
         cmd = [
             sys.executable,
-            str(script_path),
+            str(current_script_path),
             "--bif-file", args.bif_file,
             "--num-prompts", str(args.num_prompts),
-            "--obs-per-prompt", str(args.obs_per_prompt),
-            "--int-per-combo", str(args.int_per_combo),
-            "--intervene-vars", args.intervene_vars,
             "--seed", str(args.seed),
-            # "--out-dir", args.out_dir,
-            "--shuffles-per-graph", str(args.shuffles_per_graph),
-            "--given-edge-frac", str(args.given_edge_frac),
+            
+            # Grid Variables
+            "--prompt-style", style,
+            "--obs-per-prompt", str(obs_n),
+            "--int-per-combo", str(int_n),
+            "--row-order", row_ord,
+            "--col-order", col_ord,
+            
+            # Output
+            "--out-dir", str(out_dir)
         ]
 
-        # Add flags only when True so the generator's own suffix logic works
-        if anonymize:
+        if anon:
             cmd.append("--anonymize")
-        if causal_rules:
-            cmd.append("--causal-rules")
-        if give_steps:
-            cmd.append("--give-steps")
+        
+        if int_n > 0:
+            cmd.extend(["--intervene-vars", "all"]) 
+        else:
+            cmd.extend(["--intervene-vars", "none"])
 
-        print("Command:", " ".join(cmd))
-        # Run and fail fast if any combination errors
-        subprocess.run(cmd, check=True)
+        # Execute
+        try:
+            if not current_script_path.exists():
+                 raise FileNotFoundError(f"Script {current_script_path} not found.")
 
-    print("\nAll flag combinations completed.")
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running config {config_name}: {e}")
+            sys.exit(1)
+        except FileNotFoundError as e:
+            print(e)
+            sys.exit(1)
+        
+        count += 1
 
+    print(f"\n=== generation complete. {count} configurations generated. ===")
 
 if __name__ == "__main__":
     main()

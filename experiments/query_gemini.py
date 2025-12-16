@@ -10,6 +10,28 @@ import re
 from multiprocessing import get_context
 from queue import Empty as QueueEmpty  # <-- correct exception
 import numpy as np
+
+# ---- OpenAI token counting helper ----
+try:
+    import tiktoken  # type: ignore
+except Exception:
+    tiktoken = None
+
+
+def count_openai_tokens(model_name: str, text: str) -> int:
+    """
+    Return the number of tokens this text would use for a given OpenAI model.
+    If tiktoken is not available, returns -1.
+    """
+    if tiktoken is None:
+        return -1
+    try:
+        enc = tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        # Fallback to a reasonable default for modern GPT models
+        enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
 # --- imports near top ---
 
 
@@ -78,18 +100,93 @@ def call_gemini(
         return f"[ERROR] {type(e).__name__}: {e}"
     
 
+# def call_openai(
+#     model_name: str,
+#     prompt: str,
+#     *,
+#     temperature: float = 0.0,
+#     api_key: Optional[str] = None,
+#     max_retries: int = 0,
+#     request_timeout: float = 20.0,
+# ) -> str:
+#     """
+#     Call an OpenAI chat model once (or with a small, explicit number of retries).
+#     Returns model text, or a '[ERROR] ...' string.
+#     """
+#     try:
+#         if api_key is None:
+#             api_key = os.getenv("OPENAI_API_KEY") or ""
+#         if not api_key:
+#             return "[ERROR] Missing API key (set OPENAI_API_KEY)."
+
+#         try:
+#             from openai import OpenAI  # type: ignore
+#         except Exception as ie:
+#             return f"[ERROR] OpenAI SDK not available: {type(ie).__name__}: {ie}"
+
+#         # IMPORTANT: disable/limit automatic retries and set a per-request timeout
+#         client = OpenAI(
+#             api_key=api_key,
+#             max_retries=max_retries,       # 0 = no automatic retries
+#             timeout=request_timeout,       # seconds for network / HTTP timeouts
+#         )
+
+#         # resp = client.chat.completions.create(
+#         #     model=model_name,
+#         #     messages=[{"role": "user", "content": prompt}],
+#         #     temperature=float(temperature),
+#         # )
+#         resp = client.responses.create(
+#             model=model_name,
+#             input=prompt,
+#             )
+
+#         if not resp.choices:
+#             return "[ERROR] Empty response (no choices)."
+
+#         # msg = resp.choices[0].message
+#         # text = getattr(msg, "content", "") or ""
+#         msg = resp.output[1].content[0]
+#         text = msg['text']
+#         return text
+
+#     except KeyboardInterrupt:
+#         # Let Ctrl-C bubble out so you can stop the whole run cleanly
+#         raise
+
+#     except Exception as e:
+#         tb = traceback.format_exc()
+#         print(tb, file=sys.stderr)
+#         return f"[ERROR] {type(e).__name__}: {e}"
+
+
+# Heuristic: some OpenAI models enforce default decoding and reject any temperature value.
+# Adjust this list/pattern as you observe behavior.
+_OPENAI_FIXED_TEMP_PAT = re.compile(r"^(o\d|o-|o3|o4)\b", re.IGNORECASE)
+_OPENAI_FIXED_TEMP_SET = {
+    "gpt-4.1", "gpt-4.1-mini",
+    # add other exact names if you encounter them
+}
+
+def _model_requires_default_temperature(model_name: str) -> bool:
+    mn = (model_name or "").strip()
+    return bool(_OPENAI_FIXED_TEMP_PAT.match(mn)) or (mn in _OPENAI_FIXED_TEMP_SET)
+
+
+
 def call_openai(
     model_name: str,
     prompt: str,
     *,
-    temperature: float = 0.0,
+    temperature: float = 0.0,   # caller can still pass 0.0, we'll omit it on the wire
     api_key: Optional[str] = None,
     max_retries: int = 0,
-    request_timeout: float = 20.0,
+    request_timeout: float = 6000.0,
 ) -> str:
     """
-    Call an OpenAI chat model once (or with a small, explicit number of retries).
-    Returns model text, or a '[ERROR] ...' string.
+    Call an OpenAI model once via the Responses API.
+    - Omits 'temperature' if it is None, 0.0, or 1.0 (default-only models like 'gpt-5-mini').
+    - Returns '[ERROR] ...' on failure.
     """
     try:
         if api_key is None:
@@ -98,44 +195,103 @@ def call_openai(
             return "[ERROR] Missing API key (set OPENAI_API_KEY)."
 
         try:
-            from openai import OpenAI  # type: ignore
+            from openai import OpenAI
         except Exception as ie:
             return f"[ERROR] OpenAI SDK not available: {type(ie).__name__}: {ie}"
 
-        # IMPORTANT: disable/limit automatic retries and set a per-request timeout
         client = OpenAI(
             api_key=api_key,
-            max_retries=max_retries,       # 0 = no automatic retries
-            timeout=request_timeout,       # seconds for network / HTTP timeouts
+            max_retries=max_retries,
+            timeout=request_timeout,
         )
 
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=float(temperature),
-        )
-        # resp = client.responses.create(
-        #     model=model_name,
-        #     input=prompt,
-        #     )
+        def _is_rate_limitish(err: Exception) -> bool:
+            msg = str(err).lower()
+            return any(
+                token in msg
+                for token in (
+                    "rate limit",
+                    "ratelimit",
+                    "too many requests",
+                    "tpm",
+                    "rpm",
+                    "429",
+                )
+            )
 
-        if not resp.choices:
-            return "[ERROR] Empty response (no choices)."
+        # Build request kwargs. Do NOT include temperature if it's default-like.
+        req: Dict[str, Any] = {"model": model_name, "input": prompt}
+        try:
+            t = float(temperature) if temperature is not None else None
+        except Exception:
+            t = None
 
-        msg = resp.choices[0].message
-        text = getattr(msg, "content", "") or ""
-        # msg = resp.output[1].content[0]
-        # text = msg['text']
-        return text
+        # Only include temperature if it is a non-default value not equal to 1.0.
+        if t is not None and t not in (0.0, 1.0):
+            req["temperature"] = t  # include only when explicitly non-default
+
+        # Retry once on TPM/RPM-style rate limiting.
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = client.responses.create(**req)
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt == 0 and _is_rate_limitish(e):
+                    print(
+                        f"[warn] OpenAI rate limit (TPM/RPM). Sleeping 60s then retrying once. Error: {e}",
+                        file=sys.stderr,
+                    )
+                    time.sleep(60)
+                    continue
+                raise
+        else:
+            # Should be unreachable, but keep mypy happy.
+            if last_exc is not None:
+                raise last_exc
+
+        # Preferred extraction path
+        text = getattr(resp, "output_text", None)
+        if text:
+            return text
+
+        # Fallbacks
+        try:
+            if hasattr(resp, "output") and resp.output:
+                for blk in resp.output:
+                    parts = getattr(blk, "content", None)
+                    if isinstance(parts, list):
+                        for part in parts:
+                            # dict-like
+                            if isinstance(part, dict) and part.get("type") == "output_text":
+                                return part.get("text", "")
+                            # object-like
+                            if getattr(part, "type", None) == "output_text":
+                                t = getattr(part, "text", "") or ""
+                                if t:
+                                    return t
+                    t = getattr(blk, "text", "") or ""
+                    if t:
+                        return t
+            if hasattr(resp, "choices") and resp.choices:
+                msg = getattr(resp.choices[0], "message", None)
+                if msg is not None:
+                    t = getattr(msg, "content", "") or ""
+                    if t:
+                        return t
+        except Exception:
+            pass
+
+        return "[ERROR] Empty response (no text found)."
 
     except KeyboardInterrupt:
-        # Let Ctrl-C bubble out so you can stop the whole run cleanly
         raise
-
     except Exception as e:
         tb = traceback.format_exc()
         print(tb, file=sys.stderr)
         return f"[ERROR] {type(e).__name__}: {e}"
+
 
 def is_gemini_model(model_name: str) -> bool:
     name = (model_name or "").lower()
@@ -865,18 +1021,19 @@ def main():
         if "_steps" in in_path.stem:
             args.max_new_tokens = 8192
         else:
-            args.max_new_tokens = 512
+            args.max_new_tokens = 1024
         print(f"[info] Using max_new_tokens={args.max_new_tokens} for {in_path.name}")
 
     # --------- 1. Read input CSV once ---------
     with in_path.open("r", encoding="utf-8", newline="") as fin:
         reader = csv.DictReader(fin)
         orig_fieldnames = list(reader.fieldnames or [])
+        # breakpoint()
         rows_in = [row for row in reader if any((v or "").strip() for v in row.values())]
 
     # Ensure output columns
     fieldnames = orig_fieldnames[:]
-    for extra in ["raw_response", "prediction", "valid"]:
+    for extra in ["raw_response", "prediction", "valid", "prompt_tokens"]:
         if extra not in fieldnames:
             fieldnames.append(extra)
 
@@ -928,7 +1085,7 @@ def main():
 
 
     # JSONL path next to CSV
-    json_out_path = out_path.with_suffix(".jsonl")
+    # json_out_path = out_path.with_suffix(".jsonl")
 
     # --------- 2. Determine resume vs overwrite ---------
     resume = out_path.exists() and not args.overwrite
@@ -1011,14 +1168,14 @@ def main():
         writer = csv.DictWriter(fout, fieldnames=write_fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-        jf = json_out_path.open("w", encoding="utf-8")
+        # jf = json_out_path.open("w", encoding="utf-8")
 
         # If resuming, first write all good rows (before first [ERROR]) back out
         if resume and already_done > 0:
             for i in range(already_done):
                 good_row = existing_rows[i]
                 writer.writerow(good_row)
-                jf.write(json.dumps(good_row, ensure_ascii=False) + "\n")
+                # jf.write(json.dumps(good_row, ensure_ascii=False) + "\n")
         # header already there
     else:
         fout = out_path.open("w", encoding="utf-8", newline="")
@@ -1027,10 +1184,10 @@ def main():
 
 
     # JSONL: append only when resuming; otherwise overwrite
-    if resume and json_out_path.exists():
-        jf = json_out_path.open("a", encoding="utf-8")
-    else:
-        jf = json_out_path.open("w", encoding="utf-8")
+    # if resume and json_out_path.exists():
+    #     jf = json_out_path.open("a", encoding="utf-8")
+    # else:
+    #     jf = json_out_path.open("w", encoding="utf-8")
 
     processed_new = 0
     skipped_new = 0
@@ -1039,7 +1196,7 @@ def main():
     hf_batch_prompts: list[str] = []
     hf_batch_rows: list[dict] = []
 
-    def flush_hf_batch(writer_obj, jf_obj):
+    def flush_hf_batch(writer_obj):
         nonlocal processed_new
         if not hf_batch_prompts:
             return
@@ -1062,12 +1219,12 @@ def main():
                 row_obj["valid"] = 0
             processed_new += 1
             writer_obj.writerow(row_obj)
-            jf_obj.write(json.dumps(row_obj, ensure_ascii=False) + "\n")
+            # jf_obj.write(json.dumps(row_obj, ensure_ascii=False) + "\n")
         hf_batch_prompts.clear()
         hf_batch_rows.clear()
 
     try:
-        with fout, jf, tqdm(total=total_rows, desc="Rows", unit="row") as pbar:
+        with fout, tqdm(total=total_rows, desc="Rows", unit="row") as pbar:
             for idx, row in enumerate(rows_in):
                 pbar.update(1)
 
@@ -1092,7 +1249,7 @@ def main():
                 #    but still write the row as-is so the file stays consistent.
                 if processed_new >= max_new:
                     writer.writerow(current)
-                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     skipped_new += 1
                     continue
 
@@ -1100,7 +1257,7 @@ def main():
                 #    just reuse it (no new model call).
                 if raw.strip() and not is_error_resp and pred.strip():
                     writer.writerow(current)
-                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     skipped_new += 1
                     continue
 
@@ -1129,14 +1286,21 @@ def main():
                         processed_new += 1
 
                         writer.writerow(current)
-                        jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                        # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     elif provider == "openai":
+                        n_tok = count_openai_tokens(args.model, prompt)
+                        row["prompt_tokens"] = n_tok
+
+                        # Optional: print to stderr for live debugging
+                        if n_tok >= 0:
+                            print(f"[debug] row {idx}: prompt_tokens={n_tok}", file=sys.stderr)
+
                         resp = call_openai(
                             model_name=args.model,
                             prompt=prompt,
                             temperature=args.temperature,
                             max_retries=0,          # or 1 if you want *one* retry
-                            request_timeout=180.0,   # tune as you like
+                            request_timeout=6000.0,   # tune as you like
                         )
                         row["raw_response"] = resp
                         adj = extract_adjacency_matrix(resp)
@@ -1149,7 +1313,7 @@ def main():
                         processed_new += 1
 
                         writer.writerow(row)
-                        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        # jf.write(json.dumps(row, ensure_ascii=False) + "\n")
 
                     elif provider == "hf":
                         # Buffer for batched HF generation
@@ -1164,34 +1328,34 @@ def main():
                         current["valid"] = 0
                         processed_new += 1
                         writer.writerow(current)
-                        jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                        # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
 
                 else:
                     # No new call; just write the row as-is
                     writer.writerow(current)
-                    jf.write(json.dumps(current, ensure_ascii=False) + "\n")
+                    # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     skipped_new += 1
 
                 # Flush occasionally so crashes don't lose much
                 if (idx + 1) % 10 == 0:
                     fout.flush()
-                    jf.flush()
+                    # jf.flush()
 
                 pbar.set_postfix(processed_new=processed_new, skipped_new=skipped_new)
 
             # After the loop, flush any remaining HF batch
             if provider == "hf" and need_model_calls:
-                flush_hf_batch(writer, jf)
+                flush_hf_batch(writer)
 
     finally:
         try:
             fout.flush()
         except Exception:
             pass
-        try:
-            jf.flush()
-        except Exception:
-            pass
+        # try:
+        #     jf.flush()
+        # except Exception:
+        #     pass
 
 
     print(
@@ -1201,7 +1365,7 @@ def main():
         f"- Newly processed: {processed_new}\n"
         f"- Newly skipped (no call / max_rows): {skipped_new}\n"
         f"- CSV: {out_path}\n"
-        f"- JSONL: {json_out_path}"
+        # f"- JSONL: {json_out_path}"
     )
 
 
