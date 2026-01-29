@@ -4,6 +4,9 @@ set -euo pipefail
 ENV_NAME="${1:-enco-llm}"
 PYTHON_VERSION="${2:-3.9}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
 if ! command -v conda >/dev/null 2>&1; then
   echo "[error] conda not found. Install Miniconda/Anaconda first, then re-run." >&2
   exit 1
@@ -28,6 +31,11 @@ conda install -c conda-forge graphviz -y
 
 echo "[info] installing python deps via pip (requirements.txt)"
 python -m pip install --upgrade pip
+if [[ ! -f requirements.txt ]]; then
+  echo "[error] requirements.txt not found in ${SCRIPT_DIR}" >&2
+  echo "[hint] If you cloned an older version of the repo, run: git pull" >&2
+  exit 1
+fi
 python -m pip install -r requirements.txt
 
 cat <<EOF
@@ -48,4 +56,3 @@ Torch notes:
   - This installs a default torch build from pip. If you want GPU PyTorch, install the
     correct CUDA-enabled torch build for your system instead.
 EOF
-

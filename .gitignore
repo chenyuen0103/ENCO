@@ -146,5 +146,6 @@ checkpoints/*
 out/
 prompts/
 *.pdf
-*.txt
+# *.txt
 */responses/
+experiments/prompts*

@@ -4,6 +4,10 @@
 
 This is the official repository of the paper **Efficient Neural Causal Discovery without Acyclicity Constraints** by Phillip Lippe, Taco Cohen, and Efstratios Gavves. *Presented at the International Conference on Learning Representations (ICLR), 2022.*
 
+## Note on repository origin
+
+This repository is adapted from the original ENCO codebase by Lippe, Cohen, and Gavves. We keep the original ENCO implementation and add additional code under `experiments/` for LLM-based causal discovery prompts, querying, evaluation, and analysis.
+
 ## Paper summary
 
 <center><img src="ENCO_figure.svg" width="800px"></center>
