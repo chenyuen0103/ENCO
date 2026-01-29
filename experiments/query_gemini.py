@@ -253,7 +253,7 @@ def call_openai(
             req["temperature"] = t  # include only when explicitly non-default
 
         # Retry once on TPM/RPM-style rate limiting.
-        last_exc: Exception | None = None
+        last_exc: Optional[Exception] = None
         for attempt in range(2):
             try:
                 resp = client.responses.create(**req)

@@ -89,7 +89,7 @@ def sample_interventional_values_vec(
 
     # 2) Fallback: group by state and call _try_sample_interventional_api
     unique_states = np.unique(values_vec)
-    arr_all: np.ndarray | None = None
+    arr_all: Optional[np.ndarray] = None
 
     for s in unique_states:
         idxs = np.where(values_vec == s)[0]
@@ -145,14 +145,14 @@ def _canon(s: str) -> str:
     return re.sub(r"\s+", "", s).lower()
 
 
-def build_codebook_from_bif(bif_path: str, variables: List[str]) -> Dict[str, List[str] | None]:
+def build_codebook_from_bif(bif_path: str, variables: List[str]) -> Dict[str, Optional[List[str]]]:
     """
     Map BIF variable names to the exact names in `variables`, using
     case/whitespace-insensitive matching.
     """
     raw = parse_bif_categories(bif_path)  # e.g., {"Pollution": ["low","high"], ...}
     raw_canon = {_canon(k): v for k, v in raw.items()}
-    codebook: Dict[str, List[str] | None] = {}
+    codebook: Dict[str, Optional[List[str]]] = {}
     for v in variables:
         codebook[v] = raw_canon.get(_canon(v), None)
     return codebook
