@@ -89,3 +89,68 @@ python experiments/run_experiment1_pipeline.py \
 - Aggregated analysis tables:
   - `experiments/out/experiment1/<dataset>_summary.csv`
   - `experiments/out/experiment1/<dataset>_ordering_bias.csv`
+
+### Running all table dimensions (recommended workflow)
+
+The LaTeX table dimensions map onto two batches of runs:
+
+1) **Core grid** (semantics/volume/type/representation/robustness + shuffle replicates)
+2) **Inductive-bias ablations** (rules/steps/intervention definition/examples), typically on a small subset
+
+#### 1) Core grid (covers most of the table)
+
+This is the “main sweep” and is what you usually mean by “run the table”:
+- **Semantics**: real vs anonymized variable names
+- **Data Volume**: multiple `N` (observational) and intervention sizes
+- **Data Type**: observational-only vs interventional
+- **Data Granularity / Representation**: serialized samples (`cases`) vs summary statistics (`matrix`)
+- **Robustness**: ordering variants (currently generated only for the baseline config to control cost)
+- **Shuffle Replicates**: `shuffles_per_graph` sweep (`_shuf1/_shuf3/_shuf10` etc.)
+
+Run:
+```bash
+python experiments/run_experiment1_pipeline.py \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --dataset cancer \
+  --model gpt-5-mini \
+  --shuffles-per-graph 1 --shuffles-per-graph 3 --shuffles-per-graph 10
+```
+
+#### 2) Inductive-bias ablations (rules/steps/definitions/examples)
+
+These are additional prompt sets you generate explicitly (often on the baseline condition) and then re-run
+the pipeline from the `run` step so the model is queried + evaluated + analyzed.
+
+Example: add causal rules + steps + a definition of interventions (only relevant when `int-per-combo > 0`):
+```bash
+python experiments/generate_prompts.py \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --out-dir experiments/prompts/experiment1/cancer/cases_real_obs5000_int200 \
+  --prompt-style cases --obs-per-prompt 5000 --int-per-combo 200 --intervene-vars all \
+  --shuffles-per-graph 10 \
+  --causal-rules --give-steps --def-int
+```
+
+If you want “examples / partial supervision”, use known edges:
+```bash
+python experiments/generate_prompts.py \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --out-dir experiments/prompts/experiment1/cancer/cases_real_obs5000_int200 \
+  --prompt-style cases --obs-per-prompt 5000 --int-per-combo 200 --intervene-vars all \
+  --shuffles-per-graph 10 \
+  --given-edge-frac 0.2
+```
+
+Then query/evaluate/analyze the newly generated CSVs:
+```bash
+python experiments/run_experiment1_pipeline.py \
+  --steps run,evaluate,analyze \
+  --dataset cancer \
+  --model gpt-5-mini
+```
+
+#### Notes
+
+- If you truly want **robustness ordering variants for every single grid point**, you’ll need to relax the
+  filtering in `experiments/generate_prompt_files.py` that currently restricts topo/reverse ordering to a
+  baseline config (this is intentional to reduce runtime/cost).
