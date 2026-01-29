@@ -42,6 +42,8 @@ def main():
     )
     args = ap.parse_args()
 
+    dataset_name = Path(args.bif_file).stem
+
     # Resolve default script path
     script_arg = Path(args.script)
     # Interpret relative paths w.r.t. this file so defaults work when run from repo root
@@ -157,7 +159,7 @@ def main():
             parts.append(f"col{col_ord}")
 
         config_name = "_".join(parts)
-        out_dir = Path(f"prompts/experiment1/cancer") / config_name
+        out_dir = Path(f"prompts/experiment1/{dataset_name}") / config_name
 
         print(
             f"[{count+1}] Generating: {config_name} (shuffles_per_graph={shuf_n}, Script: {current_script_path.name}) ..."
