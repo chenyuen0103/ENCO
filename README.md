@@ -34,6 +34,36 @@ We recommend to use conda for installing the requirements. If you haven't instal
    conda activate enco
    ```
 
+### Setup for ENCO + LLM prompt experiments
+
+This repo also contains an LLM experiment pipeline under `experiments/` (prompt generation, OpenAI/Gemini/HF querying, evaluation, analysis).
+For that workflow, use a separate environment based on `requirements.txt` (Python 3.9 recommended).
+
+Step-by-step:
+
+1. Create and activate a new conda environment:
+   ```bash
+   conda create -n enco-llm python=3.9 -y
+   conda activate enco-llm
+   ```
+2. Install Graphviz (needed for some plotted layouts):
+   ```bash
+   conda install -c conda-forge graphviz -y
+   ```
+3. Install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+Or run the helper script:
+```bash
+./setup.sh enco-llm 3.9
+```
+
+Notes:
+- For GPU ENCO, install the correct CUDA-enabled PyTorch build for your machine (instead of the default pip build).
+- For OpenAI runs, export `OPENAI_API_KEY`. For Gemini runs, export `GOOGLE_API_KEY` (or `GEMINI_API_KEY`).
+
 ### Datasets
 
 To reproduce the experiments in the paper, we provide datasets of causal graphs for the synthetic, confounder, and real-world experiments. The datasets can be download by executing `download_datasets.sh` (requires approx. 600MB disk space). Alternatively, the datasets can be accessed through [this link](https://drive.google.com/file/d/1mJXJpvkG8Ol4w6QlbzW4EETjpXmHPlMX/view?usp=sharing) (unzip the file in the `causal_graphs` folder).
