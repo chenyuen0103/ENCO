@@ -154,3 +154,72 @@ python experiments/run_experiment1_pipeline.py \
 - If you truly want **robustness ordering variants for every single grid point**, you’ll need to relax the
   filtering in `experiments/generate_prompt_files.py` that currently restricts topo/reverse ordering to a
   baseline config (this is intentional to reduce runtime/cost).
+
+## Classical baselines (ENCO)
+
+To run a classical causal discovery baseline, use ENCO on the same underlying graph(s) with sampled
+observational/interventional data sizes that match the “Data Volume” / “Data Type” dimensions.
+
+### Run ENCO on one config (example: cancer, obs=5000, int=200)
+
+Run from `experiments/`:
+```bash
+cd experiments
+
+python run_exported_graphs.py \
+  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+  --sample_size_obs 5000 \
+  --sample_size_inters 200 \
+  --max_inters -1 \
+  --seed 42
+```
+
+This produces:
+- checkpoints/logs under `experiments/checkpoints/...`
+- a predictions CSV under `experiments/responses/cancer/predictions_obs5000_int200_ENCO.csv`
+
+### Sweep ENCO over a grid (obs N × intervention M)
+
+```bash
+cd experiments
+
+for N in 0 100 1000 5000 8000; do
+  for M in 0 50 100 200 500; do
+    # skip the empty-data case
+    if [ "$N" -eq 0 ] && [ "$M" -eq 0 ]; then
+      continue
+    fi
+
+    python run_exported_graphs.py \
+      --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+      --sample_size_obs "$N" \
+      --sample_size_inters "$M" \
+      --max_inters -1 \
+      --seed 42 \
+      --checkpoint_dir "checkpoints/enco_grid/cancer/obs${N}_int${M}"
+  done
+done
+```
+
+Notes:
+- Observational-only baseline: set `--sample_size_inters 0`
+- Interventional-only baseline: set `--sample_size_obs 0`
+
+### Evaluate ENCO predictions
+
+```bash
+cd experiments
+python evaluate.py --csv responses/cancer/predictions_obs5000_int200_ENCO.csv
+```
+
+This writes `responses/cancer/predictions_obs5000_int200_ENCO.csv.summary.json` and appends per-row metrics
+into the CSV (ENCO outputs are typically 1-row CSVs).
+
+### Include ENCO in the aggregated analysis tables
+
+After ENCO CSVs exist under `experiments/responses/<dataset>/`, you can re-run:
+```bash
+python run_experiment1_pipeline.py --steps evaluate,analyze --dataset cancer
+```
+
+This will include `predictions_obs*_int*_ENCO.csv` in `experiments/out/experiment1/cancer_summary.csv`.

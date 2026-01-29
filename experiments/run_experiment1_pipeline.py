@@ -16,6 +16,11 @@ _RESP_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_ENCO_RE = re.compile(
+    r"^predictions_obs(?P<obs>\d+)_int(?P<int>\d+)_ENCO$",
+    flags=re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ResponseMeta:
@@ -58,6 +63,25 @@ def _infer_model_from_stem(stem: str) -> str:
 
 def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     stem = csv_path.stem
+
+    # ENCO baseline: "predictions_obs{N}_int{M}_ENCO.csv"
+    m_enco = _ENCO_RE.match(stem)
+    if m_enco:
+        return ResponseMeta(
+            dataset=dataset,
+            csv_path=csv_path,
+            model="ENCO",
+            is_names_only=False,
+            obs_n=int(m_enco.group("obs")),
+            int_n=int(m_enco.group("int")),
+            shuf_n=None,
+            anonymize=False,
+            prompt_style="baseline",
+            row_order="random",
+            col_order="original",
+            causal_rules=False,
+            give_steps=False,
+        )
 
     # Names-only: "responses_names_only..." (no obs/int/shuf encoded)
     if "responses_names_only" in stem:
@@ -437,4 +461,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
