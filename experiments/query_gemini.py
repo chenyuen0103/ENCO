@@ -172,6 +172,28 @@ def _model_requires_default_temperature(model_name: str) -> bool:
     mn = (model_name or "").strip()
     return bool(_OPENAI_FIXED_TEMP_PAT.match(mn)) or (mn in _OPENAI_FIXED_TEMP_SET)
 
+def _infer_dataset_name_from_csv_path(csv_path: Path) -> Optional[str]:
+    """
+    Infer the dataset name from a prompt CSV path.
+
+    Expected layouts include:
+      - prompts/experiment1/<dataset>/.../prompts_*.csv
+      - prompts/<dataset>/.../prompts_*.csv
+      - out/<dataset>/.../prompts_*.csv
+    Returns None if it can't be inferred safely.
+    """
+    parts = list(csv_path.parts)
+    for anchor in ("experiment1", "prompts", "out"):
+        if anchor not in parts:
+            continue
+        i = parts.index(anchor)
+        j = i + 1
+        if anchor == "prompts" and j < len(parts) - 1 and parts[j] == "experiment1":
+            j += 1
+        if j < len(parts) - 1:
+            return parts[j]
+    return None
+
 
 
 def call_openai(
@@ -1060,16 +1082,16 @@ def main():
         # If user passes an explicit path, respect it as-is
         out_path = Path(args.out_csv)
     else:
-        # inputs:    out/cancer/prompts_....csv
-        # outputs:   responses/cancer/responses_...._MODEL.csv
+        # inputs:    prompts/experiment1/<dataset>/.../prompts_....csv
+        # outputs:   responses/<dataset>/responses_...._MODEL.csv
         safe_model_tag = args.model.split("/")[-1]
         for ch in [":", " "]:
             safe_model_tag = safe_model_tag.replace(ch, "_")
 
         # responses_root: "responses"
-        # subdir: same as the input subdir, e.g. "cancer"
+        # subdir: dataset inferred from the input path (falls back to parent dir name)
         responses_root = Path("responses")
-        subdir_name = in_path.parent.name  # "cancer"
+        subdir_name = _infer_dataset_name_from_csv_path(in_path) or in_path.parent.name
         responses_dir = responses_root / subdir_name
         responses_dir.mkdir(parents=True, exist_ok=True)
 
