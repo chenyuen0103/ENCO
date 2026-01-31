@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import numpy as np
 
@@ -565,6 +565,81 @@ def format_names_only_prompt(
 
     lines.append("\nOutput the JSON now.")
     return "\n".join(lines)
+
+
+def iter_names_only_prompts_in_memory(
+    *,
+    bif_file: str,
+    num_prompts: int,
+    seed: int,
+    col_order: str,
+    anonymize: bool,
+    causal_rules: bool,
+) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
+    """
+    Generate names-only prompts in-memory.
+    Returns (base_name, answer_obj, iterator of rows with prompt_text).
+    """
+    bif_abs = Path(bif_file).resolve(strict=True)
+    graph = load_graph_file(str(bif_abs))
+    base_variables = normalize_variable_names(graph)
+    nvars = len(base_variables)
+
+    adj_np = np.asarray(graph.adj_matrix)
+    base_adj_bin = (adj_np > 0).astype(int).tolist()
+
+    col_indices = list(range(nvars))
+    if col_order == "reverse":
+        col_indices.reverse()
+    elif col_order == "random":
+        rng_col = np.random.default_rng(seed + 999)
+        rng_col.shuffle(col_indices)
+    elif col_order == "topo":
+        col_indices = get_topological_sort(base_adj_bin)
+    elif col_order == "reverse_topo":
+        topo = get_topological_sort(base_adj_bin)
+        topo.reverse()
+        col_indices = topo
+
+    permuted_real_names = [base_variables[i] for i in col_indices]
+
+    adj_bin = [[0] * nvars for _ in range(nvars)]
+    for r in range(nvars):
+        for c in range(nvars):
+            old_r, old_c = col_indices[r], col_indices[c]
+            adj_bin[r][c] = base_adj_bin[old_r][old_c]
+
+    vmap: Dict[str, str] = {}
+    if anonymize:
+        for i, name in enumerate(permuted_real_names):
+            vmap[name] = f"X{i+1}"
+    else:
+        for name in permuted_real_names:
+            vmap[name] = name
+
+    variables_out = [vmap[name] for name in permuted_real_names]
+    answer_obj = {
+        "variables": variables_out,
+        "adjacency_matrix": adj_bin,
+    }
+
+    base_name = "prompts_names_only"
+    if col_order != "original":
+        base_name += f"_col{col_order.capitalize()}"
+
+    dataset_name = os.path.splitext(os.path.basename(bif_file))[0]
+    prompt_text = format_names_only_prompt(variables_out, dataset_name, causal_rules)
+
+    def _iter() -> Iterator[dict[str, Any]]:
+        for i in range(num_prompts):
+            yield {
+                "data_idx": i,
+                "shuffle_idx": 0,
+                "prompt_text": prompt_text,
+                "given_edges": None,
+            }
+
+    return base_name, answer_obj, _iter()
 
 # ------------------------ Main ------------------------ #
 

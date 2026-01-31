@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import numpy as np
 
@@ -115,6 +115,217 @@ def normalize_variable_names(graph) -> List[str]:
     Adjust here if your graph uses a different naming convention.
     """
     return [v.name for v in graph.variables]
+
+
+def iter_prompts_in_memory(
+    *,
+    bif_file: str,
+    num_prompts: int,
+    shuffles_per_graph: int,
+    seed: int,
+    prompt_style: str,
+    obs_per_prompt: int,
+    int_per_combo: int,
+    row_order: str,
+    col_order: str,
+    anonymize: bool,
+    causal_rules: bool,
+    give_steps: bool,
+    def_int: bool,
+    intervene_vars: str,
+) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
+    """
+    Generate prompts in-memory (no prompt files, no prompt CSV).
+    Returns (base_name, answer_obj, iterator of rows with prompt_text).
+    """
+    bif_abs = Path(bif_file).resolve(strict=True)
+    graph = load_graph_file(str(bif_abs))
+    base_variables = normalize_variable_names(graph)
+    nvars = len(base_variables)
+    codebook = build_codebook(graph, base_variables, str(bif_abs))
+
+    adj_np = np.asarray(graph.adj_matrix)
+    base_adj_bin = (adj_np > 0).astype(int).tolist()
+
+    col_indices = list(range(nvars))
+    if col_order == "reverse":
+        col_indices.reverse()
+    elif col_order == "random":
+        rng_col = np.random.default_rng(seed + 999)
+        rng_col.shuffle(col_indices)
+    elif col_order == "topo":
+        col_indices = get_topological_sort(base_adj_bin)
+    elif col_order == "reverse_topo":
+        topo = get_topological_sort(base_adj_bin)
+        topo.reverse()
+        col_indices = topo
+
+    permuted_real_names = [base_variables[i] for i in col_indices]
+
+    adj_bin = [[0] * nvars for _ in range(nvars)]
+    for r in range(nvars):
+        for c in range(nvars):
+            old_r, old_c = col_indices[r], col_indices[c]
+            adj_bin[r][c] = base_adj_bin[old_r][old_c]
+
+    vmap: Dict[str, str] = {}
+    if anonymize:
+        for i, name in enumerate(permuted_real_names):
+            vmap[name] = f"X{i+1}"
+    else:
+        for name in permuted_real_names:
+            vmap[name] = name
+
+    variables_out = [vmap[name] for name in permuted_real_names]
+    answer_obj = {
+        "variables": variables_out,
+        "adjacency_matrix": adj_bin,
+    }
+
+    if int_per_combo > 0 and intervene_vars.lower() not in {"none", ""}:
+        if intervene_vars.lower() == "all":
+            intervene_var_names = base_variables
+        else:
+            intervene_var_names = [s.strip() for s in intervene_vars.split(",") if s.strip()]
+        intervene_var_idxs = [(base_variables.index(v), v) for v in intervene_var_names]
+    else:
+        intervene_var_idxs = []
+    include_def_int = bool(def_int and int_per_combo > 0)
+
+    def value_for_display(var_original_name: str, idx: int) -> str:
+        idx = int(idx)
+        if anonymize:
+            return str(idx)
+        names = codebook.get(var_original_name, [])
+        return names[idx] if 0 <= idx < len(names) else str(idx)
+
+    tags = []
+    if anonymize:
+        tags.append("anon")
+    if causal_rules:
+        tags.append("rules")
+    if give_steps:
+        tags.append("steps")
+    if prompt_style == "matrix":
+        tags.append(prompt_style)
+    if row_order != "random":
+        tags.append(f"row{row_order}")
+    if col_order != "original":
+        tags.append(f"col{col_order}")
+    extra_suffix = ("_" + "_".join(tags)) if tags else ""
+
+    base_name = (
+        f"prompts_obs{obs_per_prompt}"
+        f"_int{int_per_combo}"
+        f"_shuf{shuffles_per_graph}{extra_suffix}"
+    )
+
+    def _iter() -> Iterator[dict[str, Any]]:
+        for i in range(num_prompts):
+            seed_data = seed + i * 1000
+            np.random.seed(seed_data)
+
+            arr_obs = graph.sample(batch_size=obs_per_prompt, as_array=True)
+            obs_rows_base = []
+            for r in arr_obs:
+                row_orig = {
+                    base_variables[j]: value_for_display(base_variables[j], r[j])
+                    for j in range(nvars)
+                }
+                row_disp = {vmap.get(k, k): v for k, v in row_orig.items()}
+                row_disp["intervened_variable"] = "Observational"
+                row_disp["intervened_value"] = None
+                obs_rows_base.append(row_disp)
+
+            interventional_rows_base = []
+            if intervene_var_idxs:
+                rng_int = np.random.default_rng(seed_data + 10_000)
+                for var_idx, var_name in intervene_var_idxs:
+                    prob_dist = getattr(graph.variables[var_idx], "prob_dist", None)
+                    num_categs = getattr(prob_dist, "num_categs", None)
+                    if not isinstance(num_categs, int) or num_categs <= 0:
+                        num_categs = len(codebook.get(var_name, [])) or 2
+
+                    dataset_size = int_per_combo
+                    values_vec = rng_int.integers(low=0, high=num_categs, size=dataset_size, dtype=np.int32)
+                    arr_int = sample_interventional_values_vec(graph, var_idx, var_name, values_vec)
+
+                    for sample_idx, r in enumerate(arr_int):
+                        s_idx = int(values_vec[sample_idx])
+                        row_orig = {
+                            base_variables[j]: value_for_display(base_variables[j], r[j])
+                            for j in range(nvars)
+                        }
+                        row_disp = {vmap.get(k, k): v for k, v in row_orig.items()}
+                        ivar_out = vmap.get(var_name, var_name)
+                        interventional_rows_base.append({
+                            "intervened_variable": ivar_out,
+                            "intervened_value": (str(s_idx) if anonymize else value_for_display(var_name, s_idx)),
+                            **row_disp,
+                        })
+
+            for rep in range(shuffles_per_graph):
+                seed_ir = seed_data + rep
+                obs_rows = [r.copy() for r in obs_rows_base]
+                rng_obs = np.random.default_rng(seed_ir)
+
+                if row_order == "random":
+                    rng_obs.shuffle(obs_rows)
+                elif row_order == "reverse":
+                    obs_rows.reverse()
+                elif row_order == "sorted":
+                    key_var = variables_out[0]
+                    obs_rows.sort(key=lambda x: str(x.get(key_var, "")))
+
+                int_rows_final = []
+                if interventional_rows_base:
+                    if row_order == "random":
+                        tmp_rows = [r.copy() for r in interventional_rows_base]
+                        buckets = {}
+                        for r in tmp_rows:
+                            k = (r["intervened_variable"], r["intervened_value"])
+                            buckets.setdefault(k, []).append(r)
+                        keys = list(buckets.keys())
+                        np.random.default_rng(seed_ir + 1).shuffle(keys)
+                        for k in keys:
+                            batch = buckets[k]
+                            np.random.default_rng(seed_ir + 2).shuffle(batch)
+                            int_rows_final.extend(batch)
+                    elif row_order == "reverse":
+                        int_rows_final = interventional_rows_base[::-1]
+                    elif row_order == "sorted":
+                        int_rows_final = sorted(
+                            interventional_rows_base,
+                            key=lambda x: str(x.get(variables_out[0], "")),
+                        )
+
+                if int_per_combo > 0:
+                    rows_for_prompt = int_rows_final + obs_rows
+                else:
+                    rows_for_prompt = obs_rows
+
+                rows_text_source = rows_for_prompt
+
+                dataset_name = os.path.splitext(os.path.basename(bif_file))[0]
+                if prompt_style == "matrix":
+                    prompt_text = format_prompt_cb_matrix(
+                        variables_out, rows_text_source, dataset_name,
+                        causal_rules, give_steps, include_def_int=include_def_int,
+                    )
+                else:
+                    prompt_text = format_prompt_with_interventions(
+                        variables_out, rows_text_source, vmap,
+                        causal_rules, give_steps, include_def_int=include_def_int,
+                    )
+
+                yield {
+                    "data_idx": i,
+                    "shuffle_idx": rep,
+                    "prompt_text": prompt_text,
+                    "given_edges": None,
+                }
+
+    return base_name, answer_obj, _iter()
 
 
 # ------------------------ BIF parsing and codebook ------------------------ #

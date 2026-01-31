@@ -189,6 +189,32 @@ def step_generate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
 
+def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
+    cmd = [
+        sys.executable,
+        "run_experiment1_in_memory.py",
+        "--bif-file",
+        args.bif_file,
+        "--num-prompts",
+        str(args.num_prompts),
+        "--seed",
+        str(args.seed),
+        "--temperature",
+        str(args.temperature),
+    ]
+    for s in args.shuffles_per_graph:
+        cmd.extend(["--shuffles-per-graph", str(int(s))])
+    for m in args.model:
+        cmd.extend(["--model", m])
+    if args.overwrite:
+        cmd.append("--overwrite")
+    if getattr(args, "only_names_only", False):
+        cmd.append("--only-names-only")
+    if args.dry_run:
+        cmd.append("--dry-run")
+    _run(cmd, cwd=experiments_dir, dry_run=dry_run)
+
+
 def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
     core_csvs, names_only_csvs = _find_prompt_csvs(experiments_dir, args.dataset)
     if not core_csvs and not names_only_csvs:
@@ -421,6 +447,16 @@ def main() -> None:
     ap.add_argument("--overwrite", action="store_true", help="Re-query model responses.")
     ap.add_argument("--overwrite-eval", action="store_true", help="Re-run evaluation even if summary exists.")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
+    ap.add_argument(
+        "--in-memory",
+        action="store_true",
+        help="Generate prompts in-memory and query models without writing prompt files.",
+    )
+    ap.add_argument(
+        "--only-names-only",
+        action="store_true",
+        help="In in-memory mode, run only the names-only configuration.",
+    )
 
     ap.add_argument(
         "--steps",
@@ -449,10 +485,13 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    if "generate" in steps:
-        step_generate(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
-    if "run" in steps:
-        step_run_models(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
+    if args.in_memory and ("generate" in steps or "run" in steps):
+        step_generate_and_run_in_memory(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
+    else:
+        if "generate" in steps:
+            step_generate(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
+        if "run" in steps:
+            step_run_models(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
     if "evaluate" in steps:
         step_evaluate(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
     if "analyze" in steps:
