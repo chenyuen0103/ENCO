@@ -17,7 +17,13 @@ from scipy.stats import binomtest
 
 # If your project layout needs this:
 import sys
-sys.path.append("../")
+from pathlib import Path as _Path
+
+# Make imports work regardless of current working directory.
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from causal_graphs.graph_visualization import graph_to_image  # noqa: E402
 
 # Optional: graphviz layout; guarded with try/except in _safe_layout
@@ -667,6 +673,19 @@ def main():
     ap.add_argument("--pred-col", default="prediction", help="Predicted adjacency JSON column.")
     ap.add_argument("--per-row-out", default=None,
                     help="If set, writes a separate CSV of per-row metrics; otherwise appends to input CSV.")
+    ap.add_argument(
+        "--inplace",
+        action="store_true",
+        help="If set, appends per-row metrics to the input CSV in-place (default: write per-row metrics to a new CSV).",
+    )
+    ap.add_argument(
+        "--summary-csv",
+        default=None,
+        help=(
+            "If set, appends/writes ONE row of summary metrics to this CSV (aggregated over rows in --csv). "
+            "Useful for collecting summaries across many runs."
+        ),
+    )
     # Consensus/stability controls & outputs
     ap.add_argument("--tau", type=float, default=0.7,
                     help="Consensus threshold; include edge if selection prob >= tau.")
@@ -809,6 +828,12 @@ def main():
         per_row_metrics.append(met)
 
     df = pd.DataFrame(rows)
+
+    # If nothing parsed into a valid prediction/GT pair, skip writing any outputs.
+    # This is useful when batch-evaluating a directory and some runs are incomplete.
+    if valid_rows == 0:
+        print(f"[info] No valid rows in {csv_path}. Skipping evaluation outputs.")
+        return
 
     # --- Global averages (existing flow) ---
     if valid_rows > 0:
@@ -1053,7 +1078,30 @@ def main():
         json.dump(summary, f_sum, indent=2)
     print(f"Saved summary to: {summary_path}")
 
-    # ---- Per-row metrics output handling (unchanged) ----
+    # Optional: append a single-row summary table
+    if args.summary_csv:
+        out_path = Path(args.summary_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"csv": str(csv_path)}
+        # Best-effort model tag inference from filename suffix
+        try:
+            row["model_tag"] = csv_path.stem.split("_")[-1]
+        except Exception:
+            row["model_tag"] = ""
+        row.update(summary)
+        if out_path.exists():
+            df_prev = pd.read_csv(out_path)
+            df_out = pd.concat([df_prev, pd.DataFrame([row])], ignore_index=True, sort=False)
+        else:
+            df_out = pd.DataFrame([row])
+        # If the existing summary CSV already contains duplicate column names (can happen after manual edits),
+        # keep the first occurrence to avoid repeated columns accumulating over time.
+        if df_out.columns.duplicated().any():
+            df_out = df_out.loc[:, ~df_out.columns.duplicated()]
+        df_out.to_csv(out_path, index=False)
+        print(f"Appended summary row to: {out_path}")
+
+    # ---- Per-row metrics output handling ----
     metric_keys = [
         "n_vars","tp","tn","fp","fn","accuracy","precision","recall","f1",
         "shd","orient_eval_pairs","orient_tp","orient_fn","orient_acc",
@@ -1061,20 +1109,7 @@ def main():
 
     ]
 
-    if args.per_row_out:
-        per_path = Path(args.per_row_out)
-        per_fieldnames = []
-        for k in ("data_idx", "shuffle_idx"):
-            if any(k in m for m in per_row_metrics):
-                per_fieldnames.append(k)
-        per_fieldnames.extend(metric_keys)
-        with per_path.open("w", encoding="utf-8", newline="") as f_out:
-            writer = csv.DictWriter(f_out, fieldnames=per_fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for m in per_row_metrics:
-                writer.writerow(m)
-        print(f"Per-row metrics written to: {per_path}")
-    else:
+    if args.inplace:
         for row, m in zip(rows, per_row_metrics):
             for k in metric_keys:
                 row[k] = "" if m.get(k, None) is None else m.get(k)
@@ -1090,6 +1125,24 @@ def main():
                 writer.writerow(row)
         os.replace(tmp_path, csv_path)
         print(f"Metrics appended to original CSV: {csv_path}")
+    else:
+        per_path = (
+            Path(args.per_row_out)
+            if args.per_row_out
+            else csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
+        )
+        per_path.parent.mkdir(parents=True, exist_ok=True)
+        per_fieldnames = []
+        for k in ("data_idx", "shuffle_idx"):
+            if any(k in m for m in per_row_metrics):
+                per_fieldnames.append(k)
+        per_fieldnames.extend(metric_keys)
+        with per_path.open("w", encoding="utf-8", newline="") as f_out:
+            writer = csv.DictWriter(f_out, fieldnames=per_fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for m in per_row_metrics:
+                writer.writerow(m)
+        print(f"Per-row metrics written to: {per_path}")
 
 
 if __name__ == "__main__":

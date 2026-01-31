@@ -51,6 +51,35 @@ def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
         return
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
+def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -> str:
+    """
+    Resolve a user-provided path string to an absolute path when possible.
+
+    We try common bases in a user-friendly order:
+    1) as-is (absolute or relative to invocation cwd)
+    2) relative to repo root (matches README examples run from repo root)
+    3) relative to experiments/ (useful when running from that directory)
+    """
+    p = Path(path_str)
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    cand1 = (invocation_cwd / p).resolve()
+    if cand1.exists():
+        return str(cand1)
+
+    cand2 = (repo_root / p).resolve()
+    if cand2.exists():
+        return str(cand2)
+
+    experiments_dir = repo_root / "experiments"
+    cand3 = (experiments_dir / p).resolve()
+    if cand3.exists():
+        return str(cand3)
+
+    # best effort fallback; let downstream scripts raise a clear error
+    return str((invocation_cwd / p).resolve())
+
 
 def _infer_model_from_stem(stem: str) -> str:
     # query_gemini.py appends args.model.split("/")[-1] to the stem
@@ -274,11 +303,13 @@ def _ordering_bias_from_csv(csv_path: Path) -> dict[str, Any]:
     """
     Estimate ordering sensitivity by grouping rows by data_idx and measuring the spread
     across shuffle_idx for each data_idx, then aggregating across data_idx.
-    Requires that evaluate.py has already appended per-row metrics (e.g. shd).
+    Uses the per-row metrics CSV produced by evaluate.py (<csv>.per_row.csv) when available.
     """
     import pandas as pd  # local import to keep script import-light
 
-    df = pd.read_csv(csv_path)
+    per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
+    df_path = per_row_path if per_row_path.exists() else csv_path
+    df = pd.read_csv(df_path)
     for col in ("data_idx", "shuffle_idx", "shd"):
         if col not in df.columns:
             return {
@@ -400,6 +431,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
 
 def main() -> None:
     repo_root, experiments_dir = _repo_paths()
+    invocation_cwd = Path.cwd().resolve()
 
     ap = argparse.ArgumentParser(
         description="Run Experiment 1 end-to-end: generate prompts, query models, evaluate, and analyze."
@@ -429,6 +461,7 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+    args.bif_file = _resolve_file_arg(args.bif_file, repo_root=repo_root, invocation_cwd=invocation_cwd)
 
     # If dataset wasn’t explicitly set, default to bif basename
     if not args.dataset or args.dataset == "cancer" and Path(args.bif_file).stem != "cancer":

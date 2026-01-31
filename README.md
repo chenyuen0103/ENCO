@@ -59,9 +59,23 @@ Step-by-step:
    pip install -r requirements.txt
    ```
 
+Quick sanity check (dry-run) from repo root:
+```bash
+python experiments/run_experiment1_pipeline.py --dry-run \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --dataset cancer \
+  --model gpt-5-mini \
+  --shuffles-per-graph 1
+```
+
 Or run the helper script:
 ```bash
 ./setup.sh enco-llm 3.9
+```
+If you don’t use conda, `setup.sh` can fall back to a virtualenv:
+```bash
+SETUP_METHOD=venv ./setup.sh
+source .venv/bin/activate
 ```
 
 Notes:

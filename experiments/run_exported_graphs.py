@@ -2,9 +2,11 @@ import json
 import os
 from datetime import datetime
 import sys
-sys.path.append("../")
 from pathlib import Path
-from causal_graphs.graph_visualization import visualize_graph
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
+import numpy as np
 from causal_graphs.graph_export import load_graph
 from causal_graphs.graph_real_world import load_graph_file
 from causal_graphs.graph_definition import CausalDAG
@@ -47,13 +49,30 @@ if __name__ == '__main__':
         if graph_name.startswith("graph_"):
             graph_name = graph_name.split("graph_")[-1]
         file_id = "%s_%s" % (str(gindex+1).zfill(3), graph_name)
+
+        # Print experiment info (graph stats) before training
+        A_true = graph.adj_matrix.astype(int)
+        np.fill_diagonal(A_true, 0)
+        n = int(graph.num_vars)
+        e = int(A_true.sum())
+        denom = max(1, n * (n - 1))
+        density = float(e) / float(denom)
+        print(
+            f"[info] Graph stats: name={graph_name} nodes={n} edges={e} density={density:.4f} file={graph_path}"
+        )
+
         # Visualize graph
         if graph.num_vars <= 100:
             figsize = max(3, graph.num_vars ** 0.7)
-            visualize_graph(graph,
-                            filename=os.path.join(checkpoint_dir, "graph_%s.pdf" % (file_id)),
-                            figsize=(figsize, figsize),
-                            layout="circular" if graph.num_vars < 40 else "graphviz")
+            try:
+                from causal_graphs.graph_visualization import visualize_graph  # lazy import (matplotlib)
+
+                visualize_graph(graph,
+                                filename=os.path.join(checkpoint_dir, "graph_%s.pdf" % (file_id)),
+                                figsize=(figsize, figsize),
+                                layout="circular" if graph.num_vars < 40 else "graphviz")
+            except Exception as e:
+                print(f"[warn] Skipping graph visualization (failed to import/render): {e}", file=sys.stderr)
         s = "== Testing graph \"%s\" ==" % graph_name
         print("="*len(s)+"\n"+s+"\n"+"="*len(s))
         # Start structure learning
