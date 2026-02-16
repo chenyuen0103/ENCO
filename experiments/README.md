@@ -40,9 +40,15 @@ This repo also includes an Experiment 1 pipeline that:
 - Model querying (batch over a dataset folder): `experiments/run_api_models.py`
   - Runs `query_gemini.py` over discovered prompt CSVs.
 - Evaluation: `experiments/evaluate.py`
-  - Appends per-row metrics to each responses CSV and writes `<csv>.summary.json`.
+  - Writes per-row metrics to `<csv>.per_row.csv` (or appends in-place with `--inplace`) and writes `<csv>.summary.json` (skips outputs if no valid rows).
   - Produces a probability/consensus artifact per CSV (JSON + a `.probplot.pdf`).
 - End-to-end wrapper (recommended): `experiments/run_experiment1_pipeline.py`
+
+### Tool-use during inference (smoke test)
+
+If you want to test an “LLM+tools” setup (where the model can call local Python during inference),
+use: `experiments/tool_use_smoke_test.py`.
+It demonstrates OpenAI function-calling with a local tool that computes stats from a CSV.
 
 ### “Shuffles per graph” dimension (ordering bias)
 
@@ -155,6 +161,15 @@ python experiments/run_experiment1_pipeline.py \
   filtering in `experiments/generate_prompt_files.py` that currently restricts topo/reverse ordering to a
   baseline config (this is intentional to reduce runtime/cost).
 
+### Summary-statistics prompts (shorter)
+
+`experiments/generate_prompts.py` supports `--prompt-style summary` to embed compact summary statistics
+(e.g., observational correlation + intervention mean shifts) instead of listing all samples.
+This usually yields much shorter prompts and avoids having the LLM call tools during inference.
+
+To build an ENCO-style LaTeX grid table from evaluated LLM runs, use:
+`experiments/make_llm_baseline_table.py`.
+
 ## Classical baselines (ENCO)
 
 To run a classical causal discovery baseline, use ENCO on the same underlying graph(s) with sampled
@@ -212,8 +227,8 @@ cd experiments
 python evaluate.py --csv responses/cancer/predictions_obs5000_int200_ENCO.csv
 ```
 
-This writes `responses/cancer/predictions_obs5000_int200_ENCO.csv.summary.json` and appends per-row metrics
-into the CSV (ENCO outputs are typically 1-row CSVs).
+This writes `responses/cancer/predictions_obs5000_int200_ENCO.csv.summary.json` and writes per-row metrics
+to `<csv>.per_row.csv` by default (or in-place with `--inplace`). ENCO outputs are typically 1-row CSVs.
 
 ### Include ENCO in the aggregated analysis tables
 

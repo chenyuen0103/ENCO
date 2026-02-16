@@ -5,7 +5,10 @@ conditional probability distribution. Additionally, we have
 an explicit representation of the adjacency matrix for easier
 handling. 
 """
-import torch
+try:
+    import torch  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore
 import numpy as np
 from copy import deepcopy
 import importlib
@@ -212,6 +215,8 @@ class CausalDAG(object):
         """
         Saves the graph including all conditional distributions to disk.
         """
+        if torch is None:  # pragma: no cover
+            raise ModuleNotFoundError("torch is required for save_to_file().")
         torch.save(self.get_state_dict(), filename)
 
     @staticmethod
@@ -229,6 +234,8 @@ class CausalDAG(object):
         """
         Loads a graph object from disk.
         """
+        if torch is None:  # pragma: no cover
+            raise ModuleNotFoundError("torch is required for load_from_file().")
         state_dict = torch.load(filename)
         return CausalDAG.load_from_state_dict(state_dict)
 

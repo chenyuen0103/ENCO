@@ -102,7 +102,18 @@ def main() -> None:
     if base_root_arg.is_absolute():
         base_root = base_root_arg
     else:
-        base_root = (Path(__file__).parent / base_root_arg).resolve()
+        # Most scripts live in experiments/, so base roots are often given as
+        # either "prompts/experiment1" (relative to experiments/) or
+        # "experiments/prompts/experiment1" (relative to repo root).
+        # Try both to avoid accidentally resolving to experiments/experiments/...
+        candidate1 = (Path(__file__).parent / base_root_arg).resolve()
+        candidate2 = (Path(__file__).parent.parent / base_root_arg).resolve()
+        if candidate1.exists():
+            base_root = candidate1
+        elif candidate2.exists():
+            base_root = candidate2
+        else:
+            base_root = candidate1
     datasets = _infer_datasets(base_root)
     if args.dataset is None:
         if len(datasets) == 1:

@@ -6,10 +6,25 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Cluster/hardened env defaults: avoid OpenMP shared-memory issues and oversubscription.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_USE_SHM", "0")
+
 import math
 import re
 import numpy as np
 import pandas as pd
+
+# Ensure matplotlib has a writable config/cache directory (common issue on clusters).
+# Must be set before importing matplotlib.
+if not os.getenv("MPLCONFIGDIR"):
+    try:
+        mpl_dir = Path("/tmp") / f"matplotlib_{os.getuid()}"
+        mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+    except Exception:
+        os.environ["MPLCONFIGDIR"] = "/tmp"
+
 import matplotlib.pyplot as plt
 import networkx as nx
 
@@ -419,7 +434,11 @@ def edges_to_adjacency(edges: Any, variables: Optional[List[str]]) -> Optional[n
         return None
 
 
-def load_gt_from_cell(cell: str) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
+def load_gt_from_cell(
+    cell: str,
+    *,
+    resolve_roots: Optional[List[Path]] = None,
+) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
     """
     For a ground-truth cell, support:
       1) direct JSON (old format), e.g. {"variables": [...], "adjacency_matrix": [...]}
@@ -442,9 +461,29 @@ def load_gt_from_cell(cell: str) -> Tuple[Optional[np.ndarray], Optional[List[st
     # If not JSON, try: path to file
     if not isinstance(obj, (dict, list)):
         p = Path(s)
-        if p.exists():
+        candidates: List[Path] = []
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            candidates.append(p)
+            for root in (resolve_roots or []):
+                try:
+                    candidates.append((root / p).resolve())
+                except Exception:
+                    continue
+
+        file_obj = None
+        for cand in candidates:
+            if cand.exists():
+                try:
+                    file_obj = json.loads(cand.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    file_obj = None
+                    continue
+        if file_obj is not None:
             try:
-                obj = json.loads(p.read_text(encoding="utf-8"))
+                obj = file_obj
             except Exception:
                 obj = None
 
@@ -479,7 +518,7 @@ def load_gt_from_cell(cell: str) -> Tuple[Optional[np.ndarray], Optional[List[st
 
 # ------------------------ Parsing predictions ------------------------ #
 
-def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
+def extract_adjacency_matrix(text: str, *, fallback_variables: Optional[List[str]] = None) -> Optional[np.ndarray]:
     if not text:
         return None
 
@@ -507,8 +546,11 @@ def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
                 mat = _normalize_matrix(obj["adjacency_matrix"])
                 if mat is not None:
                     return mat
-            if "edges" in obj and "variables" in obj:
-                return edges_to_adjacency(obj.get("edges"), obj.get("variables"))
+            if "edges" in obj:
+                vars_for_edges = obj.get("variables")
+                if not isinstance(vars_for_edges, list):
+                    vars_for_edges = fallback_variables
+                return edges_to_adjacency(obj.get("edges"), vars_for_edges)
         return _normalize_matrix(obj)
 
     def _try_one_variant(txt: str) -> Optional[np.ndarray]:
@@ -662,6 +704,61 @@ def eval_pair(A_true: np.ndarray, A_pred: np.ndarray) -> Dict[str, Any]:
     }
 
 
+_RESP_META_RE = re.compile(
+    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tail>.*)$",
+    re.IGNORECASE,
+)
+
+
+def _infer_prompt_style_from_stem(stem: str) -> str:
+    # Order matters: prefer the most specific/longest first.
+    styles = [
+        "payload_topk",
+        "summary_hist_rows",
+        "summary_joint",
+        "summary_probs",
+        "summary",
+        "matrix",
+        "payload",
+        "cases",
+        "names_only",
+    ]
+    for style in styles:
+        if re.search(rf"(?:^|_){re.escape(style)}(?:_|$)", stem, flags=re.IGNORECASE):
+            return style
+    return ""
+
+
+def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
+    """
+    Best-effort extraction of metadata from the response CSV filename/path.
+
+    Expected filename pattern:
+      responses_obs<obs>_int<int>_shuf<shuf>_<...>_<model>.csv
+    """
+    stem = csv_path.stem
+    m = _RESP_META_RE.match(stem)
+    model = ""
+    try:
+        # Most response CSVs end with ..._<model>.csv, e.g. "..._gpt-5-mini.csv"
+        model = stem.split("_")[-1]
+    except Exception:
+        model = ""
+
+    out: Dict[str, Any] = {
+        "dataset": csv_path.parent.name,
+        "model": model,
+        "obs_n": None,
+        "int_n": None,
+        "prompt_style": _infer_prompt_style_from_stem(stem),
+        "anonymize": int(bool(re.search(r"(?:^|_)anon(?:_|$)", stem, flags=re.IGNORECASE))),
+    }
+    if m:
+        out["obs_n"] = int(m.group("obs"))
+        out["int_n"] = int(m.group("int"))
+    return out
+
+
 # ------------------------ Main ------------------------ #
 
 def main():
@@ -672,11 +769,11 @@ def main():
                     help="Ground-truth JSON column. If not set, will try 'answer' then 'answer_path'.")
     ap.add_argument("--pred-col", default="prediction", help="Predicted adjacency JSON column.")
     ap.add_argument("--per-row-out", default=None,
-                    help="If set, writes a separate CSV of per-row metrics; otherwise appends to input CSV.")
+                    help="If set, write per-row metrics CSV to this path (default: <csv>.per_row.csv).")
     ap.add_argument(
         "--inplace",
         action="store_true",
-        help="If set, appends per-row metrics to the input CSV in-place (default: write per-row metrics to a new CSV).",
+        help="If set, append per-row metrics columns to the input CSV (instead of writing <csv>.per_row.csv).",
     )
     ap.add_argument(
         "--summary-csv",
@@ -704,6 +801,13 @@ def main():
     if not csv_path.exists():
         raise SystemExit(f"CSV not found: {csv_path}")
 
+    # Some model outputs (especially large adjacency payloads) can exceed the default
+    # csv module field limit (~128KB). Raise it to avoid _csv.Error.
+    try:
+        csv.field_size_limit(10_000_000)
+    except OverflowError:
+        csv.field_size_limit(1_000_000)
+
     # Read all rows
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -723,12 +827,24 @@ def main():
             answer_col = "answer_path"  # fall back; will likely yield None later
     print(f"[info] Using answer column: {answer_col}")
 
+    # When the GT is stored as a relative path (answer_path), resolve it relative to
+    # the experiments/ directory (so evaluation works no matter what your CWD is).
+    # Typical layout: experiments/responses/<dataset>/responses_....csv
+    resolve_roots: List[Path] = []
+    try:
+        if len(csv_path.parents) >= 3:
+            resolve_roots.append(csv_path.parents[2])  # .../experiments
+    except Exception:
+        pass
+
     # Optionally rebuild `prediction` from `raw_response`
     RAW_COL = "raw_response"
     if RAW_COL in orig_fieldnames:
         for row in rows:
             raw = row.get(RAW_COL, "") or ""
-            mat = extract_adjacency_matrix(raw)
+            ans_s = row.get(answer_col, "") or ""
+            _A_true_for_vars, vars_for_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
+            mat = extract_adjacency_matrix(raw, fallback_variables=vars_for_this)
             if mat is not None:
                 row[args.pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
                 row["valid"] = 1
@@ -769,8 +885,8 @@ def main():
         ans_s = row.get(answer_col, "") or ""
         pred_s = row.get(args.pred_col, "") or ""
 
-        A_true, vars_from_this = load_gt_from_cell(ans_s)
-        A_pred = extract_adjacency_matrix(pred_s)
+        A_true, vars_from_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
+        A_pred = extract_adjacency_matrix(pred_s, fallback_variables=vars_from_this)
 
         if variables_first is None and vars_from_this is not None:
             variables_first = vars_from_this
@@ -858,9 +974,9 @@ def main():
         avg_orient_acc  = _mean_or_none(orient_acc_list)
         avg_pred_edges  = float(sum(pred_edges_list) / valid_rows)
     else:
-        avg_TP = avg_TN = avg_FP = avg_FN = avg_SHD = 0.0
+        avg_TP = avg_TN = avg_FP = avg_FN = avg_SHD = None
         avg_accuracy = avg_precision = avg_recall = avg_f1 = None
-        avg_orient_eval = avg_orient_TP = avg_orient_FN = 0.0
+        avg_orient_eval = avg_orient_TP = avg_orient_FN = None
         avg_orient_acc = None
         avg_pred_edges = None
 
@@ -1082,12 +1198,11 @@ def main():
     if args.summary_csv:
         out_path = Path(args.summary_csv)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        row = {"csv": str(csv_path)}
-        # Best-effort model tag inference from filename suffix
-        try:
-            row["model_tag"] = csv_path.stem.split("_")[-1]
-        except Exception:
-            row["model_tag"] = ""
+        row = {
+            "response_csv": str(csv_path.resolve()),
+            "evaluated": 1,
+        }
+        row.update(_infer_response_metadata(csv_path))
         row.update(summary)
         if out_path.exists():
             df_prev = pd.read_csv(out_path)

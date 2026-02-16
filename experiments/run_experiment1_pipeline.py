@@ -11,6 +11,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+_DEFAULT_CONTEXT_WINDOWS: dict[str, int] = {
+    # Keep a small mapping; adjust/extend as needed.
+    "gpt-5-mini": 400_000,
+    "gpt-5": 400_000,
+}
+
+
+def _context_window_for(model: str) -> int:
+    key = (model or "").split("/")[-1]
+    return int(_DEFAULT_CONTEXT_WINDOWS.get(key, 128_000))
+
+
 _RESP_RE = re.compile(
     r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>[^_]+))?$",
     flags=re.IGNORECASE,
@@ -138,6 +150,21 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     m = _RESP_RE.match(stem)
     if not m:
         # best-effort fallback
+        prompt_style = "cases"
+        stem_l = stem.lower()
+        if "summary_probs" in stem_l:
+            prompt_style = "summary_probs"
+        elif "payload_topk" in stem_l:
+            prompt_style = "payload_topk"
+        elif "payload" in stem_l:
+            prompt_style = "payload"
+        elif "summary_joint" in stem_l:
+            prompt_style = "summary_joint"
+        elif "summary" in stem_l:
+            prompt_style = "summary"
+        elif "matrix" in stem_l:
+            prompt_style = "matrix"
+
         return ResponseMeta(
             dataset=dataset,
             csv_path=csv_path,
@@ -147,7 +174,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             int_n=None,
             shuf_n=None,
             anonymize=("anon" in stem.lower()),
-            prompt_style=("matrix" if "matrix" in stem.lower() else "cases"),
+            prompt_style=prompt_style,
             row_order="random",
             col_order=("topo" if "coltopo" in stem.lower() else "original"),
             causal_rules=("rules" in stem.lower()),
@@ -169,7 +196,19 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         if token.startswith("col"):
             col_order = token.removeprefix("col")
 
-    prompt_style = "matrix" if "matrix" in tags else "cases"
+    prompt_style = "cases"
+    if "summary_probs" in tags:
+        prompt_style = "summary_probs"
+    elif "payload_topk" in tags:
+        prompt_style = "payload_topk"
+    elif "payload" in tags:
+        prompt_style = "payload"
+    elif "summary_joint" in tags:
+        prompt_style = "summary_joint"
+    elif "summary" in tags:
+        prompt_style = "summary"
+    elif "matrix" in tags:
+        prompt_style = "matrix"
     return ResponseMeta(
         dataset=dataset,
         csv_path=csv_path,
@@ -196,10 +235,84 @@ def _find_prompt_csvs(experiments_dir: Path, dataset: str) -> tuple[list[Path], 
 
 
 def _find_response_csvs(experiments_dir: Path, dataset: str) -> list[Path]:
-    resp_dir = experiments_dir / "responses" / dataset
-    if not resp_dir.exists():
+    # Responses may live either under experiments/responses/<dataset> (when run from experiments/)
+    # or under repo_root/responses/<dataset> (when run from repo root).
+    repo_root = experiments_dir.parent
+    resp_dirs = [
+        experiments_dir / "responses" / dataset,
+        repo_root / "responses" / dataset,
+    ]
+    resp_dirs = [d for d in resp_dirs if d.exists()]
+    if not resp_dirs:
         return []
-    return sorted(resp_dir.glob("*.csv"))
+    # Only include *raw response* CSVs produced by query scripts / in-memory runs.
+    # Exclude derived artifacts like *.per_row.csv or eval_summary.csv to avoid
+    # mis-evaluating them as model outputs.
+    out: list[Path] = []
+    for resp_dir in resp_dirs:
+        for p in resp_dir.glob("responses_*.csv"):
+            if p.name.endswith(".per_row.csv"):
+                continue
+            out.append(p)
+    return sorted(out)
+
+
+def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any]:
+    """
+    Best-effort scan of a response CSV to quantify prompt lengths and context errors.
+
+    This is used in the analyze step so you can see which configurations exceeded
+    the model context window (often producing all-[ERROR] rows / valid=0).
+    """
+    stats: dict[str, Any] = {
+        "context_window": int(context_window),
+        "prompt_tokens_max": None,
+        "prompt_tokens_mean": None,
+        "prompt_tokens_rows": 0,
+        "prompt_tokens_missing_rows": 0,
+        "context_exceeded_by_tokens_rows": 0,
+        "context_exceeded_by_error_rows": 0,
+        "context_exceeded_any": 0,
+    }
+
+    toks: list[int] = []
+    exceed_tokens = 0
+    exceed_err = 0
+    missing = 0
+
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                raw = (row.get("raw_response") or "").lower()
+                if "context window" in raw or "context_length_exceeded" in raw:
+                    exceed_err += 1
+
+                pt = row.get("prompt_tokens")
+                if pt is None or pt == "":
+                    missing += 1
+                    continue
+                try:
+                    v = int(float(pt))
+                except Exception:
+                    missing += 1
+                    continue
+                if v >= 0:
+                    toks.append(v)
+                    if v > int(context_window):
+                        exceed_tokens += 1
+    except Exception:
+        return stats
+
+    if toks:
+        stats["prompt_tokens_max"] = int(max(toks))
+        stats["prompt_tokens_mean"] = float(sum(toks) / float(len(toks)))
+        stats["prompt_tokens_rows"] = int(len(toks))
+    stats["prompt_tokens_missing_rows"] = int(missing)
+    stats["context_exceeded_by_tokens_rows"] = int(exceed_tokens)
+    stats["context_exceeded_by_error_rows"] = int(exceed_err)
+    stats["context_exceeded_any"] = int((exceed_tokens > 0) or (exceed_err > 0))
+    return stats
 
 
 def step_generate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
@@ -213,7 +326,10 @@ def step_generate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
         "--seed",
         str(args.seed),
     ]
-    for s in args.shuffles_per_graph:
+    if getattr(args, "styles", None):
+        cmd.append("--styles")
+        cmd.extend([str(s) for s in args.styles])
+    for s in (args.shuffles_per_graph or []):
         cmd.extend(["--shuffles-per-graph", str(int(s))])
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
@@ -231,7 +347,10 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
         "--temperature",
         str(args.temperature),
     ]
-    for s in args.shuffles_per_graph:
+    if getattr(args, "styles", None):
+        cmd.append("--styles")
+        cmd.extend([str(s) for s in args.styles])
+    for s in (args.shuffles_per_graph or []):
         cmd.extend(["--shuffles-per-graph", str(int(s))])
     for m in args.model:
         cmd.extend(["--model", m])
@@ -239,6 +358,12 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
         cmd.append("--overwrite")
     if getattr(args, "only_names_only", False):
         cmd.append("--only-names-only")
+    if getattr(args, "save_example_prompt", False):
+        cmd.append("--save-example-prompt")
+    if getattr(args, "example_prompt_dir", None):
+        cmd.extend(["--example-prompt-dir", str(args.example_prompt_dir)])
+    if getattr(args, "overwrite_example_prompt", False):
+        cmd.append("--overwrite-example-prompt")
     if args.dry_run:
         cmd.append("--dry-run")
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
@@ -296,7 +421,7 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
     resp_csvs = _find_response_csvs(experiments_dir, args.dataset)
     if not resp_csvs:
         raise SystemExit(
-            f"No response CSVs found under {experiments_dir/'responses'/args.dataset}. "
+            f"No response CSVs found under {(experiments_dir/'responses'/args.dataset)} or {(experiments_dir.parent/'responses'/args.dataset)}. "
             "Run the model step first."
         )
 
@@ -304,14 +429,7 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
         summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
         if summary_path.exists() and not args.overwrite_eval:
             continue
-        cmd = [
-            sys.executable,
-            "evaluate.py",
-            "--csv",
-            str(csv_path),
-            "--tau",
-            str(args.tau),
-        ]
+        cmd = [sys.executable, "evaluate.py", "--csv", str(csv_path), "--tau", str(args.tau)]
         _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
 
@@ -373,7 +491,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
     resp_csvs = _find_response_csvs(experiments_dir, args.dataset)
     if not resp_csvs:
         raise SystemExit(
-            f"No response CSVs found under {experiments_dir/'responses'/args.dataset}. "
+            f"No response CSVs found under {(experiments_dir/'responses'/args.dataset)} or {(experiments_dir.parent/'responses'/args.dataset)}. "
             "Run the model step first."
         )
 
@@ -384,14 +502,98 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
     summary_rows: list[dict[str, Any]] = []
     ordering_rows: list[dict[str, Any]] = []
 
+    def _parse_enco_csvs(responses_dir_override: Path | None) -> list[dict[str, Any]]:
+        """
+        Parse ENCO baseline rows from prediction CSVs:
+          predictions_obs{N}_int{M}_ENCO.csv
+
+        We read f1/SHD directly from the CSV single row (or first row if multiple),
+        and return rows compatible with <dataset>_summary.csv schema.
+        """
+        if responses_dir_override is not None:
+            resp_dirs = [Path(responses_dir_override)]
+        else:
+            resp_dirs = [
+                experiments_dir / "responses" / args.dataset,
+                experiments_dir.parent / "responses" / args.dataset,
+            ]
+        resp_dirs = [d for d in resp_dirs if d.exists()]
+        if not resp_dirs:
+            return []
+
+        out: list[dict[str, Any]] = []
+        seen: set[Path] = set()
+        for resp_dir in resp_dirs:
+            for csv_path in sorted(resp_dir.glob("predictions_obs*_int*_ENCO.csv")):
+                csv_abs = csv_path.resolve()
+                if csv_abs in seen:
+                    continue
+                seen.add(csv_abs)
+                meta = _parse_response_meta(args.dataset, csv_path)
+                try:
+                    with csv_path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        rows = list(reader)
+                except Exception:
+                    continue
+                if not rows:
+                    continue
+                row0 = rows[0]
+                try:
+                    raw_f1 = row0.get("f1", row0.get("avg_f1", ""))
+                    raw_shd = row0.get("SHD", row0.get("shd", row0.get("avg_shd", "")))
+                    f1 = float(raw_f1)
+                    shd = int(float(raw_shd))
+                except Exception:
+                    continue
+
+                out.append(
+                    {
+                        "dataset": args.dataset,
+                        "model": "ENCO",
+                        "prompt_style": "enco",
+                        # ENCO does not depend on variable names; treat it as anonymized by default
+                        # so it groups with anonymized LLM settings in downstream comparisons.
+                        "anonymize": 1,
+                        "is_names_only": 0,
+                        "obs_n": meta.obs_n,
+                        "int_n": meta.int_n,
+                        "shuffles_per_graph": None,
+                        "row_order": "random",
+                        "col_order": "original",
+                        "causal_rules": 0,
+                        "give_steps": 0,
+                        "response_csv": str(csv_path),
+                        "summary_json": str(csv_path),
+                        "evaluated": 1,
+                        # Use avg_* slots for ENCO (single run per cell).
+                        "avg_f1": f1,
+                        "avg_shd": shd,
+                        "consensus_f1": None,
+                        "consensus_shd": None,
+                        "num_rows": len(rows),
+                        "valid_rows": None,
+                        "tau": None,
+                        "context_window": None,
+                        "prompt_tokens_max": None,
+                        "prompt_tokens_mean": None,
+                        "prompt_tokens_rows": None,
+                        "prompt_tokens_missing_rows": None,
+                        "context_exceeded_by_tokens_rows": 0,
+                        "context_exceeded_by_error_rows": 0,
+                        "context_exceeded_any": 0,
+                    }
+                )
+        return out
+
     for csv_path in resp_csvs:
         meta = _parse_response_meta(args.dataset, csv_path)
         summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-        if not summary_path.exists():
-            # Require evaluation first; keeps pipeline explicit
-            continue
-
-        summary = _read_json(summary_path)
+        ctx = _context_window_for(meta.model)
+        pt_stats = _prompt_token_stats(csv_path, context_window=ctx)
+        summary: dict[str, Any] = {}
+        if summary_path.exists():
+            summary = _read_json(summary_path)
         row: dict[str, Any] = {
             "dataset": meta.dataset,
             "model": meta.model,
@@ -406,8 +608,11 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "causal_rules": int(meta.causal_rules),
             "give_steps": int(meta.give_steps),
             "response_csv": str(csv_path),
+            "summary_json": str(summary_path),
+            "evaluated": int(bool(summary)),
         }
         row.update(summary)
+        row.update(pt_stats)
         summary_rows.append(row)
 
         # 2) Ordering bias analysis (only makes sense if shuffle_idx varies)
@@ -428,6 +633,10 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                     **ob,
                 }
             )
+
+    if getattr(args, "include_enco_in_summary", False):
+        enco_rows = _parse_enco_csvs(getattr(args, "enco_responses_dir", None))
+        summary_rows.extend(enco_rows)
 
     if not summary_rows:
         raise SystemExit(
@@ -465,14 +674,40 @@ def main() -> None:
     ap.add_argument("--dataset", default="cancer", help="Dataset name (defaults to bif basename).")
     ap.add_argument(
         "--bif-file",
-        default=str(repo_root / "causal_graphs" / "real_data" / "small_graphs" / "cancer.bif"),
+        default=str(repo_root / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"),
         help="Path to the BIF file.",
     )
     ap.add_argument("--num-prompts", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--shuffles-per-graph", type=int, action="append", default=[1])
+    # NOTE: default=[] is important; we forward these flags into sub-scripts that
+    # also have defaults. If we used default=[1] here, we'd accidentally pass "1"
+    # and the callee would get [1,1] (duplicated grid).
+    ap.add_argument("--shuffles-per-graph", type=int, action="append", default=[])
+    ap.add_argument(
+        "--styles",
+        nargs="*",
+        default=None,
+        help=(
+            'Optional subset of prompt styles to generate (any of: "cases", "matrix", "summary", '
+            '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
+        ),
+    )
+    ap.add_argument(
+        "--include-enco-in-summary",
+        action="store_true",
+        default=True,
+        help="Append ENCO baseline cells into experiments/out/experiment1/<dataset>_summary.csv (default: enabled).",
+    )
+    ap.add_argument(
+        "--enco-responses-dir",
+        default="experiments/responses/sachs",
+        help=(
+            "Optional ENCO responses directory override. "
+            "Default: experiments/responses/sachs."
+        ),
+    )
 
-    ap.add_argument("--model", action="append", default=["gpt-5-mini"], help="Repeatable.")
+    ap.add_argument("--model", action="append", default=[], help="Repeatable.")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--tau", type=float, default=0.7, help="Consensus threshold for evaluate.py.")
 
@@ -488,6 +723,21 @@ def main() -> None:
         "--only-names-only",
         action="store_true",
         help="In in-memory mode, run only the names-only configuration.",
+    )
+    ap.add_argument(
+        "--save-example-prompt",
+        action="store_true",
+        help="(In in-memory mode) Save one example prompt per configuration for debugging.",
+    )
+    ap.add_argument(
+        "--example-prompt-dir",
+        default=None,
+        help="(In in-memory mode) Directory to write example prompts (passed to run_experiment1_in_memory.py).",
+    )
+    ap.add_argument(
+        "--overwrite-example-prompt",
+        action="store_true",
+        help="(In in-memory mode) Overwrite existing example prompt files.",
     )
 
     ap.add_argument(
@@ -508,6 +758,9 @@ def main() -> None:
     if any(s not in allowed for s in steps):
         bad = [s for s in steps if s not in allowed]
         raise SystemExit(f"Unknown step(s): {bad}. Allowed: {sorted(allowed)}")
+
+    if not args.model:
+        args.model = ["gpt-5-mini"]
 
     # Small guardrail: OpenAI models need OPENAI_API_KEY available at runtime.
     if any(("gpt" in m.lower() or m.lower().startswith("o")) for m in args.model):

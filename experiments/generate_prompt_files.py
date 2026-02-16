@@ -29,7 +29,7 @@ def main():
         "--shuffles-per-graph",
         type=int,
         action="append",
-        default=[1],
+        default=[],
         help=(
             "How many independent row-order shuffles to generate per base sampled dataset "
             "(repeatable). Encoded in filenames as '_shufN'."
@@ -39,6 +39,15 @@ def main():
         "--seed",
         type=int,
         default=42,
+    )
+    ap.add_argument(
+        "--styles",
+        nargs="*",
+        default=None,
+        help=(
+            'Optional subset of prompt styles to generate (any of: "cases", "matrix", "summary", '
+            '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
+        ),
     )
     args = ap.parse_args()
 
@@ -63,7 +72,24 @@ def main():
     # ==========================================
     
     # 1. Data Representation
-    styles = ["cases", "matrix"]
+    # - cases: full sample listing (largest prompts)
+    # - matrix: matrix blocks of samples
+    # - summary: compact summary statistics (short prompts)
+    # - summary_probs: discrete marginals + intervention effects (short prompts, usually better than means)
+    # - payload: a single JSON blob with summary stats (machine-parsable)
+    # - payload_topk: compact JSON payload (top-K intervention effects)
+    style_aliases = {
+        "summary_join": "summary_joint",
+    }
+
+    styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    if args.styles:
+        requested_raw = [s.strip().lower() for s in args.styles if s.strip()]
+        requested = [style_aliases.get(s, s) for s in requested_raw]
+        unknown = [s for s in requested if s not in set(styles)]
+        if unknown:
+            raise SystemExit(f"Unknown --styles: {unknown}. Allowed: {styles}")
+        styles = requested
     
     # 2. Semantics
     anonymize_opts = [False, True]
@@ -76,7 +102,8 @@ def main():
 
     # 5. Robustness: Ordering
     row_order_opts = ["random", "sorted", "reverse"]
-    col_order_opts = ["original", "reverse", "random", "topo", "reverse_topo"]
+    # For now, only use the default column order.
+    col_order_opts = ["original"]
 
     shuf_values = [int(x) for x in (args.shuffles_per_graph or [1])]
 
@@ -99,6 +126,12 @@ def main():
         
         # --- DEFINITIONS ---
         is_names_only = (obs_n == 0 and int_n == 0)
+        is_payload_without_obs = (style in {"payload", "payload_topk"} and obs_n == 0 and int_n > 0)
+
+        # payload style requires observational samples (it builds an obs summary payload).
+        # With obs=0 and int>0 we'd error; skip these configs.
+        if is_payload_without_obs:
+            continue
 
         # Names-only generator currently ignores shuffles-per-graph and would overwrite outputs
         # if we varied it; keep a single value here.
@@ -117,11 +150,22 @@ def main():
 
         # --- FILTER 1: Names Only Constraints ---
         if is_names_only:
-            # For names only, we ignore Data Size, Row Order, Anonymization
+            # For names only, we ignore Data Size, Row Order, Anonymization.
+            # Names-only is independent of prompt style. To avoid duplicate work, we run it exactly once.
+            # If the user requested styles explicitly and excluded "cases" (e.g., --styles payload),
+            # we still run names-only once using the first requested style entry as the anchor.
             if row_ord != "random": continue
             if anon is True: continue
-            if style != "cases": continue 
-            
+            if args.styles:
+                requested = [s.strip().lower() for s in args.styles if s.strip()]
+                if requested:
+                    if "cases" in requested:
+                        if style != "cases": continue
+                    else:
+                        if style != requested[0]: continue
+            else:
+                if style != "cases": continue
+
             current_script_path = names_only_script
 
         # --- FILTER 2: Data Experiments Constraints ---
@@ -159,7 +203,8 @@ def main():
             parts.append(f"col{col_ord}")
 
         config_name = "_".join(parts)
-        out_dir = Path(f"prompts/experiment1/{dataset_name}") / config_name
+        # Always write under experiments/prompts/experiment1/<dataset>, regardless of invocation CWD.
+        out_dir = (Path(__file__).parent / "prompts" / "experiment1" / dataset_name / config_name).resolve()
 
         print(
             f"[{count+1}] Generating: {config_name} (shuffles_per_graph={shuf_n}, Script: {current_script_path.name}) ..."

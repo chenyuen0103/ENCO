@@ -11,6 +11,8 @@ from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import numpy as np
 
+LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
+
 # Allow running from experiments/ with repo root one level up
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 try:
@@ -542,7 +544,8 @@ def normalize_variable_names(graph) -> List[str]:
 def format_names_only_prompt(
     variables: List[str],
     dataset_name: str,
-    include_causal_rules: bool = False
+    include_causal_rules: bool = False,
+    output_edge_list: bool = False,
 ) -> str:
     lines = []
     lines.append("You are a highly intelligent causal discovery expert.")
@@ -555,9 +558,12 @@ def format_names_only_prompt(
     
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.append('Respond with a single valid JSON object and nothing else.')
-    lines.append('The object must have exactly two keys: "variables" and "adjacency_matrix".')
-    lines.append('- "variables": the list of variable names exactly as shown above.')
-    lines.append('- "adjacency_matrix": an N x N list of lists of 0/1 integers.')
+    if output_edge_list:
+        lines.append('The object must have exactly one key: "edges".')
+        lines.append('- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section above.')
+    else:
+        lines.append('The object must have exactly one key: "adjacency_matrix".')
+        lines.append('- "adjacency_matrix": an N x N list of lists of 0/1 integers in the VARIABLES order shown above.')
     
     if include_causal_rules:
         lines.append("\n--- REMINDER ---")
@@ -618,17 +624,27 @@ def iter_names_only_prompts_in_memory(
             vmap[name] = name
 
     variables_out = [vmap[name] for name in permuted_real_names]
-    answer_obj = {
-        "variables": variables_out,
-        "adjacency_matrix": adj_bin,
-    }
+    use_edge_list_output = nvars > LARGE_GRAPH_EDGE_LIST_THRESHOLD
+    edge_list = [
+        [variables_out[i], variables_out[j]]
+        for i in range(nvars)
+        for j in range(nvars)
+        if adj_bin[i][j] == 1
+    ]
+    answer_obj: Dict[str, Any] = {"variables": variables_out}
+    if use_edge_list_output:
+        answer_obj["edges"] = edge_list
+    else:
+        answer_obj["adjacency_matrix"] = adj_bin
 
-    base_name = "prompts_names_only"
+    base_name = f"prompts_names_only_p{num_prompts}"
     if col_order != "original":
         base_name += f"_col{col_order.capitalize()}"
 
     dataset_name = os.path.splitext(os.path.basename(bif_file))[0]
-    prompt_text = format_names_only_prompt(variables_out, dataset_name, causal_rules)
+    prompt_text = format_names_only_prompt(
+        variables_out, dataset_name, causal_rules, output_edge_list=use_edge_list_output
+    )
 
     def _iter() -> Iterator[dict[str, Any]]:
         for i in range(num_prompts):
@@ -718,18 +734,28 @@ def main():
     prompt_txt_dir = out_dir / "prompt_txt"
     prompt_txt_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = f"prompts_names_only"
+    base_name = f"prompts_names_only_p{args.num_prompts}"
     if args.col_order != "original": base_name += f"_col{args.col_order.capitalize()}"
     
     csv_path = out_dir / f"{base_name}.csv"
     answer_path = out_dir / f"{base_name}_answer.json"
 
+    use_edge_list_output = nvars > LARGE_GRAPH_EDGE_LIST_THRESHOLD
+    edge_list = [
+        [variables_out[i], variables_out[j]]
+        for i in range(nvars)
+        for j in range(nvars)
+        if adj_bin[i][j] == 1
+    ]
+    answer_obj: Dict[str, Any] = {"variables": variables_out}
+    if use_edge_list_output:
+        answer_obj["edges"] = edge_list
+    else:
+        answer_obj["adjacency_matrix"] = adj_bin
+
     # Write Answer Key
-    # with answer_path.open("w", encoding="utf-8") as f_ans:
-    #     json.dump({
-    #         "answer": {"variables": variables_out, "adjacency_matrix": adj_bin},
-    #         "given_edges": None
-    #     }, f_ans, indent=2)
+    with answer_path.open("w", encoding="utf-8") as f_ans:
+        json.dump({"answer": answer_obj, "given_edges": None}, f_ans, ensure_ascii=False, indent=2)
 
     # Write CSV
     csv_f = csv_path.open("w", newline="", encoding="utf-8")
@@ -739,7 +765,9 @@ def main():
 
     # 5. Generate Prompts (Since there's no data, the prompt is identical for all 'replicates')
     dataset_name = os.path.splitext(os.path.basename(args.bif_file))[0]
-    prompt_text = format_names_only_prompt(variables_out, dataset_name, args.causal_rules)
+    prompt_text = format_names_only_prompt(
+        variables_out, dataset_name, args.causal_rules, output_edge_list=use_edge_list_output
+    )
     
     print(f"Generating 'Names Only' prompts into {out_dir}...")
 

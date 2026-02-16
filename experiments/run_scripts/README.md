@@ -6,6 +6,7 @@ The scripts in this folder contain the commands for running the experiments pres
 * To run the whole ENCO baseline suite in one go, use `run_all_enco_baselines.sh` (also respects `SEED`).
 * To run ENCO on the Experiment 1 “table range” (obs/int grid), use `experiment1_enco_table_range.sh`.
   * One graph (default `cancer.bif`): `SEED=0 bash experiment1_enco_table_range.sh`
+  * Sachs convenience wrapper: `SEED=0 bash sachs_enco_baseline.sh`
   * All real_data graphs: `ALL_REAL_DATA=1 REAL_DATA_SCOPE=all SEED=0 bash experiment1_enco_table_range.sh`
   * OOM tuning knobs (env vars): `MAX_GRAPH_STACKING_LARGE`, `BATCH_SIZE_LARGE`, `GF_NUM_BATCHES_LARGE`, `HIDDEN_SIZE_LARGE` (and `*_SMALL` variants)
 * To run both the paper baselines and the table-range sweep, use `run_all_enco_paper_and_table.sh`.

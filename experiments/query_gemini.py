@@ -17,6 +17,9 @@ try:
 except Exception:
     tiktoken = None
 
+# OpenAI Responses API per-string input length cap.
+OPENAI_MAX_INPUT_CHARS = 10_485_760
+
 
 def count_openai_tokens(model_name: str, text: str) -> int:
     """
@@ -31,6 +34,65 @@ def count_openai_tokens(model_name: str, text: str) -> int:
         # Fallback to a reasonable default for modern GPT models
         enc = tiktoken.get_encoding("cl100k_base")
     return len(enc.encode(text))
+
+
+def classify_error_type(raw_response: str) -> str:
+    """
+    Map standardized '[ERROR] ...' responses to a compact error_type label.
+    Returns empty string for non-error responses.
+    """
+    text = (raw_response or "").strip()
+    if not text.startswith("[ERROR]"):
+        return ""
+    low = text.lower()
+    if "input too long" in low or "string_above_max_length" in low:
+        return "input_too_long"
+    if "rate limit" in low or "ratelimit" in low or "too many requests" in low:
+        return "rate_limit"
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    if "missing api key" in low:
+        return "missing_api_key"
+    return "error"
+
+
+def edges_to_adjacency(edges: Any, variables: Any) -> Optional[np.ndarray]:
+    """
+    Convert an edge list [[src, dst], ...] into a square adjacency matrix.
+    If variables is not a non-empty list, infer variable order from first appearance in edges.
+    """
+    if not isinstance(edges, list):
+        return None
+    try:
+        if not isinstance(variables, list) or not variables:
+            seen = set()
+            inferred = []
+            for e in edges:
+                if not isinstance(e, (list, tuple)) or len(e) != 2:
+                    continue
+                s, d = str(e[0]), str(e[1])
+                if s not in seen:
+                    inferred.append(s)
+                    seen.add(s)
+                if d not in seen:
+                    inferred.append(d)
+                    seen.add(d)
+            variables = inferred
+        if not variables:
+            return None
+
+        var_to_idx = {v: i for i, v in enumerate(variables)}
+        n = len(variables)
+        A = np.zeros((n, n), dtype=int)
+        for e in edges:
+            if not isinstance(e, (list, tuple)) or len(e) != 2:
+                continue
+            s, d = str(e[0]), str(e[1])
+            if s in var_to_idx and d in var_to_idx:
+                A[var_to_idx[s], var_to_idx[d]] = 1
+        return A
+    except Exception:
+        return None
 
 # --- imports near top ---
 
@@ -211,6 +273,13 @@ def call_openai(
     - Returns '[ERROR] ...' on failure.
     """
     try:
+        prompt_len = len(prompt)
+        if prompt_len > OPENAI_MAX_INPUT_CHARS:
+            return (
+                "[ERROR][input_too_long] OpenAI input too long: "
+                f"{prompt_len} chars > {OPENAI_MAX_INPUT_CHARS} max."
+            )
+
         if api_key is None:
             api_key = os.getenv("OPENAI_API_KEY") or ""
         if not api_key:
@@ -241,6 +310,33 @@ def call_openai(
                 )
             )
 
+        def _is_transientish(err: Exception) -> bool:
+            """
+            Best-effort detection of transient OpenAI/API transport errors worth retrying.
+            We use string/type checks to avoid depending on exact SDK exception classes.
+            """
+            name = type(err).__name__.lower()
+            msg = str(err).lower()
+            if any(k in name for k in ("internalservererror", "apiconnectionerror", "apitimeouterror")):
+                return True
+            return any(
+                token in msg
+                for token in (
+                    "502",
+                    "503",
+                    "504",
+                    "bad gateway",
+                    "service unavailable",
+                    "gateway timeout",
+                    "cloudflare",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "connection aborted",
+                    "connection error",
+                    "timed out",
+                )
+            )
+
         # Build request kwargs. Do NOT include temperature if it's default-like.
         req: Dict[str, Any] = {"model": model_name, "input": prompt}
         try:
@@ -252,20 +348,37 @@ def call_openai(
         if t is not None and t not in (0.0, 1.0):
             req["temperature"] = t  # include only when explicitly non-default
 
-        # Retry once on TPM/RPM-style rate limiting.
+        # Retry on transient-ish failures (rate limit + 5xx/transport).
         last_exc: Optional[Exception] = None
-        for attempt in range(2):
+        max_attempts = 6
+        for attempt in range(max_attempts):
             try:
                 resp = client.responses.create(**req)
                 break
             except Exception as e:
                 last_exc = e
-                if attempt == 0 and _is_rate_limitish(e):
+                if _is_rate_limitish(e):
+                    # Conservative backoff for TPM/RPM bursts.
+                    sleep_s = 60.0 if attempt == 0 else min(120.0, 30.0 * (attempt + 1))
                     print(
-                        f"[warn] OpenAI rate limit (TPM/RPM). Sleeping 60s then retrying once. Error: {e}",
+                        f"[warn] OpenAI rate limit (attempt {attempt+1}/{max_attempts}). "
+                        f"Sleeping {sleep_s:.0f}s then retrying. Error: {e}",
                         file=sys.stderr,
                     )
-                    time.sleep(60)
+                    time.sleep(sleep_s)
+                    continue
+                if _is_transientish(e) and attempt < (max_attempts - 1):
+                    # Exponential backoff with jitter, capped.
+                    import random
+
+                    base = min(60.0, 2.0 * (2 ** attempt))
+                    sleep_s = base + random.random() * 0.5 * base
+                    print(
+                        f"[warn] OpenAI transient error (attempt {attempt+1}/{max_attempts}). "
+                        f"Sleeping {sleep_s:.1f}s then retrying. Error: {type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    time.sleep(sleep_s)
                     continue
                 raise
         else:
@@ -478,7 +591,7 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
         return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
 
 
-def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
+def extract_adjacency_matrix(text: str, *, fallback_variables: Optional[list[str]] = None) -> Optional[np.ndarray]:
     """
     Robustly extract a square adjacency matrix from a messy LLM response.
     Returns a (N, N) numpy array of ints, or None.
@@ -507,8 +620,27 @@ def extract_adjacency_matrix(text: str) -> Optional[np.ndarray]:
         return arr
 
     def _from_obj(obj: Any) -> Optional[np.ndarray]:
-        if isinstance(obj, dict) and "adjacency_matrix" in obj:
-            return _normalize_matrix(obj["adjacency_matrix"])
+        if isinstance(obj, dict):
+            if "adjacency_matrix" in obj:
+                mat = _normalize_matrix(obj["adjacency_matrix"])
+                if mat is not None:
+                    return mat
+            if "edges" in obj:
+                vars_for_edges = obj.get("variables")
+                if not isinstance(vars_for_edges, list):
+                    vars_for_edges = fallback_variables
+                return edges_to_adjacency(obj.get("edges"), vars_for_edges)
+            ans = obj.get("answer")
+            if isinstance(ans, dict):
+                if "adjacency_matrix" in ans:
+                    mat = _normalize_matrix(ans["adjacency_matrix"])
+                    if mat is not None:
+                        return mat
+                if "edges" in ans:
+                    vars_for_edges = ans.get("variables")
+                    if not isinstance(vars_for_edges, list):
+                        vars_for_edges = fallback_variables
+                    return edges_to_adjacency(ans.get("edges"), vars_for_edges)
         return _normalize_matrix(obj)
 
     def _try_one_variant(txt: str) -> Optional[np.ndarray]:
@@ -1055,7 +1187,7 @@ def main():
 
     # Ensure output columns
     fieldnames = orig_fieldnames[:]
-    for extra in ["raw_response", "prediction", "valid", "prompt_tokens"]:
+    for extra in ["raw_response", "prediction", "valid", "prompt_tokens", "error_type"]:
         if extra not in fieldnames:
             fieldnames.append(extra)
 
@@ -1099,6 +1231,18 @@ def main():
         base_name = in_path.name.replace("prompts", "responses")
         base_stem = Path(base_name).stem
         base_suffix = Path(base_name).suffix
+
+        # Ensure response filenames are unique across prompt styles.
+        # Some styles (e.g., legacy payload and cases) may share the same prompt CSV filename
+        # like "prompts_obs100_int0_shuf1.csv" but live in different config folders.
+        # If the config folder indicates payload but the filename doesn't, tag it to avoid
+        # overwriting other styles' response files.
+        cfg_name = in_path.parent.name.lower()
+        stem_l = base_stem.lower()
+        if cfg_name.startswith("payload_topk_") and "payload_topk" not in stem_l:
+            base_stem = f"{base_stem}_payload_topk"
+        elif cfg_name.startswith("payload_") and "payload" not in stem_l:
+            base_stem = f"{base_stem}_payload"
 
         if safe_model_tag not in base_stem:
             base_stem = f"{base_stem}_{safe_model_tag}"
@@ -1236,9 +1380,11 @@ def main():
             if adj is not None:
                 row_obj["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                 row_obj["valid"] = 1
+                row_obj["error_type"] = ""
             else:
                 row_obj["prediction"] = ""
                 row_obj["valid"] = 0
+                row_obj["error_type"] = classify_error_type(resp)
             processed_new += 1
             writer_obj.writerow(row_obj)
             # jf_obj.write(json.dumps(row_obj, ensure_ascii=False) + "\n")
@@ -1302,9 +1448,11 @@ def main():
                         if adj is not None:
                             current["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             current["valid"] = 1
+                            current["error_type"] = ""
                         else:
                             current["prediction"] = ""
                             current["valid"] = 0
+                            current["error_type"] = classify_error_type(resp)
                         processed_new += 1
 
                         writer.writerow(current)
@@ -1329,9 +1477,11 @@ def main():
                         if adj is not None:
                             row["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             row["valid"] = 1
+                            row["error_type"] = ""
                         else:
                             row["prediction"] = ""
                             row["valid"] = 0
+                            row["error_type"] = classify_error_type(resp)
                         processed_new += 1
 
                         writer.writerow(row)
@@ -1348,6 +1498,7 @@ def main():
                         current["raw_response"] = "[ERROR] Unknown provider"
                         current["prediction"] = ""
                         current["valid"] = 0
+                        current["error_type"] = "unknown_provider"
                         processed_new += 1
                         writer.writerow(current)
                         # jf.write(json.dumps(current, ensure_ascii=False) + "\n")

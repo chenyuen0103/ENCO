@@ -26,6 +26,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}/experiments"
 
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+if ! python -c "import torch" >/dev/null 2>&1; then
+  echo "[error] Python cannot import 'torch' (PyTorch), which ENCO requires." >&2
+  echo "[hint] Activate/install the ENCO environment (see ${REPO_ROOT}/environment.yml or ${REPO_ROOT}/requirements.txt)." >&2
+  exit 2
+fi
+
 SEED="${SEED:-42}"
 FORCE="${FORCE:-0}"
 
@@ -66,7 +74,9 @@ _run_sweep_for_bif() {
   local n_vars n_edges
   read -r n_vars n_edges < <(
     python - <<PY
+import sys
 import numpy as np
+sys.path.insert(0, r"${REPO_ROOT}")
 from causal_graphs.graph_real_world import load_graph_file
 g = load_graph_file("${bif_file}")
 A = g.adj_matrix.astype(int)
