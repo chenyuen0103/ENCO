@@ -125,8 +125,10 @@ class ENCO(object):
         if self.use_observational_data:
             dataset_size = abs(sample_size_obs)
             obs_dataset = ObservationalCategoricalData(graph, dataset_size=dataset_size)
+            # drop_last=True can yield zero batches when dataset_size < batch_size,
+            # which breaks the distribution fitting loop. We allow smaller final batches.
             obs_data_loader = data.DataLoader(obs_dataset, batch_size=batch_size,
-                                              shuffle=True, drop_last=True)
+                                              shuffle=True, drop_last=False)
         else:
             print("Skipping observational data: sample_size_obs is 0.")
         # Create neural networks for fitting the conditional distributions

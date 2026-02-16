@@ -6,9 +6,11 @@ import os
 import numpy as np
 import random
 import sys
-sys.path.append("../")
+from pathlib import Path
 
-from causal_graphs.graph_visualization import visualize_graph
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
+
 from causal_graphs.graph_definition import CausalDAGDataset
 from causal_graphs.graph_generation import get_graph_func, generate_categorical_graph
 
@@ -66,10 +68,15 @@ def export_graph(filename, graph, num_obs, num_int, fixed_partial_interventions=
     if graph.num_vars <= 100:
         for i, v in enumerate(graph.variables):
             v.name = r"$X_{%i}$" % (i+1)
-        visualize_graph(graph,
-                        filename=filename+".pdf",
-                        figsize=(8, 8),
-                        layout="graphviz")
+        try:
+            from causal_graphs.graph_visualization import visualize_graph  # lazy import (matplotlib)
+
+            visualize_graph(graph,
+                            filename=filename+".pdf",
+                            figsize=(8, 8),
+                            layout="graphviz")
+        except Exception as e:
+            print(f"[warn] Skipping graph visualization (failed to import/render): {e}", file=sys.stderr)
 
 
 def process_graphs(args):

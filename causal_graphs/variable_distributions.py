@@ -4,12 +4,21 @@ Most experiments in the paper use the "NNCateg" distribution which is a randomly
 initialized neural network.
 """
 import numpy as np
-import torch
-import torch.nn as nn
+try:
+    import torch  # type: ignore
+    import torch.nn as nn  # type: ignore
+    _TORCH_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    _TORCH_AVAILABLE = False
 from copy import copy
 import sys
 sys.path.append("../")
-from causal_discovery.utils import get_device
+if _TORCH_AVAILABLE:
+    from causal_discovery.utils import get_device
+else:  # pragma: no cover
+    get_device = None  # type: ignore
 
 
 class ProbDist(object):
@@ -276,6 +285,10 @@ class NNCateg(object):
         num_categs : int
                      Number of categories over which the conditional distribution should be. 
         """
+        if not _TORCH_AVAILABLE:  # pragma: no cover
+            raise ModuleNotFoundError(
+                "torch is required for NNCateg; install torch or set use_nn=False."
+            )
         num_hidden = 48
         embed_dim = 4
         self.embed_module = nn.Embedding(sum(input_num_categs), embed_dim)
@@ -292,12 +305,15 @@ class NNCateg(object):
         self.num_categs = num_categs
         self.input_names = input_names
         self.input_num_categs = input_num_categs
-        self.device = get_device()
+        self.device = get_device() if get_device is not None else "cpu"
         self.embed_module.to(self.device)
         self.net.to(self.device)
 
-    @torch.no_grad()
     def __call__(self, inputs, batch_size):
+        if not _TORCH_AVAILABLE:  # pragma: no cover
+            raise ModuleNotFoundError(
+                "torch is required for NNCateg; install torch or set use_nn=False."
+            )
         inp_tensor = None
         for i, n, categs in zip(range(len(self.input_names)), self.input_names, self.input_num_categs):
             v = torch.from_numpy(inputs[n]).long()+sum(self.input_num_categs[:i])

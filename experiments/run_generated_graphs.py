@@ -2,9 +2,12 @@ import json
 import os
 from datetime import datetime
 import sys
-sys.path.append("../")
+from pathlib import Path
 
-from causal_graphs.graph_visualization import visualize_graph
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
+import numpy as np
+
 from causal_graphs.graph_generation import generate_categorical_graph, get_graph_func
 from causal_discovery.utils import set_cluster
 from experiments.utils import set_seed, get_basic_parser, test_graph
@@ -53,6 +56,18 @@ if __name__ == '__main__':
                                            use_nn=True,
                                            graph_func=get_graph_func(args.graph_type),
                                            seed=args.seed+gindex)
+
+        # Print experiment info (graph stats) before training
+        A_true = graph.adj_matrix.astype(int)
+        np.fill_diagonal(A_true, 0)
+        n = int(graph.num_vars)
+        e = int(A_true.sum())
+        denom = max(1, n * (n - 1))
+        density = float(e) / float(denom)
+        print(
+            f"[info] Graph stats: type={args.graph_type} nodes={n} edges={e} density={density:.4f} seed={args.seed+gindex}"
+        )
+
         file_id = "%s_%s" % (str(gindex+1).zfill(3), args.graph_type)
         # Save graph
         graph.save_to_file(os.path.join(checkpoint_dir, "graph_%s.pt" % (file_id)))
@@ -60,10 +75,15 @@ if __name__ == '__main__':
         if graph.num_vars <= 100:
             print("Visualizing graph...")
             figsize = max(3, graph.num_vars ** 0.7)
-            visualize_graph(graph,
-                            filename=os.path.join(checkpoint_dir, "graph_%s.pdf" % (file_id)),
-                            figsize=(figsize, figsize),
-                            layout="circular" if graph.num_vars < 40 else "graphviz")
+            try:
+                from causal_graphs.graph_visualization import visualize_graph  # lazy import (matplotlib)
+
+                visualize_graph(graph,
+                                filename=os.path.join(checkpoint_dir, "graph_%s.pdf" % (file_id)),
+                                figsize=(figsize, figsize),
+                                layout="circular" if graph.num_vars < 40 else "graphviz")
+            except Exception as e:
+                print(f"[warn] Skipping graph visualization (failed to import/render): {e}", file=sys.stderr)
 
         # Start structure learning
         test_graph(graph, args, checkpoint_dir, file_id)

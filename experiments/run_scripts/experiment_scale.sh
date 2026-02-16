@@ -1,7 +1,20 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
 # Graphs are dynamically generated here to save disk memory
 
-cd ../  # Go back to experiment direction
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}/experiments"
+SEED="${SEED:-42}"
+
+DONE_DIR="${REPO_ROOT}/experiments/checkpoints/enco_baselines/.done"
+DONE_FILE="${DONE_DIR}/experiment_scale_seed${SEED}.done"
+if [[ -f "${DONE_FILE}" && "${FORCE:-0}" != "1" ]]; then
+  echo "[skip] scale baseline already done (${DONE_FILE}). Set FORCE=1 to rerun."
+  exit 0
+fi
+mkdir -p "${DONE_DIR}"
+
 # Graph with 100 variables
 python run_generated_graphs.py --cluster \
                                --graph_type random_max_10 \
@@ -14,7 +27,7 @@ python run_generated_graphs.py --cluster \
                                --theta_only_iters 1000 \
                                --sample_size_obs 100000 \
                                --sample_size_inters 4096 \
-                               --seed 42
+                               --seed "${SEED}"
 # Graph with 200 variables
 python run_generated_graphs.py --cluster \
                                --graph_type random_max_10 \
@@ -27,7 +40,7 @@ python run_generated_graphs.py --cluster \
                                --theta_only_iters 1000 \
                                --sample_size_obs 100000 \
                                --sample_size_inters 4096 \
-                               --seed 42
+                               --seed "${SEED}"
 # Graph with 400 variables
 python run_generated_graphs.py --cluster \
                                --graph_type random_max_10 \
@@ -40,7 +53,7 @@ python run_generated_graphs.py --cluster \
                                --theta_only_iters 2000 \
                                --sample_size_obs 100000 \
                                --sample_size_inters 4096 \
-                               --seed 42
+                               --seed "${SEED}"
 # Graph with 1000 variables
 python run_generated_graphs.py --cluster \
                                --graph_type random_max_10 \
@@ -55,4 +68,6 @@ python run_generated_graphs.py --cluster \
                                --theta_only_iters 2000 \
                                --sample_size_obs 100000 \
                                --sample_size_inters 4096 \
-                               --seed 42
+                               --seed "${SEED}"
+
+touch "${DONE_FILE}"

@@ -4,6 +4,10 @@
 
 This is the official repository of the paper **Efficient Neural Causal Discovery without Acyclicity Constraints** by Phillip Lippe, Taco Cohen, and Efstratios Gavves. *Presented at the International Conference on Learning Representations (ICLR), 2022.*
 
+## Note on repository origin
+
+This repository is adapted from the original ENCO codebase by Lippe, Cohen, and Gavves. We keep the original ENCO implementation and add additional code under `experiments/` for LLM-based causal discovery prompts, querying, evaluation, and analysis.
+
 ## Paper summary
 
 <center><img src="ENCO_figure.svg" width="800px"></center>
@@ -33,6 +37,50 @@ We recommend to use conda for installing the requirements. If you haven't instal
    ```setup
    conda activate enco
    ```
+
+### Setup for ENCO + LLM prompt experiments
+
+This repo also contains an LLM experiment pipeline under `experiments/` (prompt generation, OpenAI/Gemini/HF querying, evaluation, analysis).
+For that workflow, use a separate environment based on `requirements.txt` (Python 3.9 recommended).
+
+Step-by-step:
+
+1. Create and activate a new conda environment:
+   ```bash
+   conda create -n enco-llm python=3.9 -y
+   conda activate enco-llm
+   ```
+2. Install Graphviz (needed for some plotted layouts):
+   ```bash
+   conda install -c conda-forge graphviz -y
+   ```
+3. Install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+Quick sanity check (dry-run) from repo root:
+```bash
+python experiments/run_experiment1_pipeline.py --dry-run \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --dataset cancer \
+  --model gpt-5-mini \
+  --shuffles-per-graph 1
+```
+
+Or run the helper script:
+```bash
+./setup.sh enco-llm 3.9
+```
+If you don’t use conda, `setup.sh` can fall back to a virtualenv:
+```bash
+SETUP_METHOD=venv ./setup.sh
+source .venv/bin/activate
+```
+
+Notes:
+- For GPU ENCO, install the correct CUDA-enabled PyTorch build for your machine (instead of the default pip build).
+- For OpenAI runs, export `OPENAI_API_KEY`. For Gemini runs, export `GOOGLE_API_KEY` (or `GEMINI_API_KEY`).
 
 ### Datasets
 

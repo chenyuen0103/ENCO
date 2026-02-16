@@ -1,0 +1,29 @@
+# Python >= 3.9 is recommended.
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Notes:
+# - For GPU PyTorch, install the correct torch build for your CUDA version.
+# - Graphviz layout in plots requires the system `graphviz` package (the `dot` binary).
+
+numpy
+scipy
+pandas
+matplotlib
+networkx
+pydot
+tqdm
+
+# ENCO
+torch
+
+# LLM queries
+openai
+tiktoken
+google-genai
+
+# Optional: local/HF models via `experiments/query_gemini.py --provider hf`
+transformers
+accelerate
+sentencepiece
