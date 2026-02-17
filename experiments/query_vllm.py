@@ -360,6 +360,24 @@ def extract_adjacency_matrix(text: str):
     return None
 
 
+def _get_prompt_from_row(row: Dict[str, str], prompt_col: str) -> str:
+    """
+    Read prompt text from a row.
+    - If value in prompt_col is a valid file path, load file contents.
+    - Otherwise, treat the value itself as prompt text.
+    """
+    raw_val = (row.get(prompt_col, "") or "").strip()
+    if not raw_val:
+        return ""
+    p = Path(raw_val)
+    if p.exists() and p.is_file():
+        try:
+            return p.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"[ERROR] Failed to read prompt file '{raw_val}': {type(e).__name__}: {e}"
+    return raw_val
+
+
 # ------------------- Main -------------------
 
 
@@ -450,8 +468,8 @@ def main():
 
     ap.add_argument(
         "--prompt-col",
-        default="prompt",
-        help="Name of the column containing prompts."
+        default="prompt_path",
+        help="Name of the column containing prompt text or prompt file paths."
     )
     ap.add_argument(
         "--overwrite",
@@ -619,7 +637,7 @@ def main():
                 if resume and idx < already_done:
                     continue
 
-                prompt = row.get(args.prompt_col, "") or ""
+                prompt = _get_prompt_from_row(row, args.prompt_col)
                 raw = row.get("raw_response", "") or ""
                 pred = row.get("prediction", "") or ""
 

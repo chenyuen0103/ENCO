@@ -53,6 +53,10 @@ def classify_error_type(raw_response: str) -> str:
         return "timeout"
     if "missing api key" in low:
         return "missing_api_key"
+    if "device-side assert triggered" in low or "acceleratorerror" in low:
+        return "cuda_device_assert"
+    if "out of memory" in low or "cuda out of memory" in low:
+        return "oom"
     return "error"
 
 
@@ -1492,7 +1496,7 @@ def main():
                         hf_batch_prompts.append(prompt)
                         hf_batch_rows.append(current)
                         if len(hf_batch_prompts) >= int(args.hf_batch_size):
-                            flush_hf_batch(writer, jf)
+                            flush_hf_batch(writer)
 
                     else:
                         current["raw_response"] = "[ERROR] Unknown provider"
