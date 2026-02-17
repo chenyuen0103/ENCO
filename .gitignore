@@ -149,3 +149,4 @@ prompts/
 # *.txt
 */responses/
 experiments/prompts*
+wandb/
