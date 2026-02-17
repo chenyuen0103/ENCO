@@ -19,3 +19,6 @@ dependencies:
     - torchvision
     - torchaudio
     - gdown
+    - lark==1.2.2
+    - setuptools>=77.0.3,<80
+    - vllm==0.11.0
