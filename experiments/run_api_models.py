@@ -84,7 +84,7 @@ def main() -> None:
     ap.add_argument(
         "--model",
         action="append",
-        default=["gpt-5-mini"],
+        default=None,
         help="Model to run (repeatable).",
     )
     ap.add_argument(
@@ -93,10 +93,49 @@ def main() -> None:
         default=0.0,
         help="Sampling temperature (passed to query_gemini.py).",
     )
+    ap.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "openai", "gemini", "vllm"],
+        help=(
+            "Provider passed to query_gemini.py. "
+            "Use 'openai'/'gemini' for API backends, or 'vllm' for local vLLM."
+        ),
+    )
+    ap.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=None,
+        help="Optional vLLM tensor parallel size (number of GPUs).",
+    )
+    ap.add_argument(
+        "--vllm-dtype",
+        default=None,
+        help="Optional vLLM dtype (auto, float16/fp16, bfloat16/bf16, float32/fp32).",
+    )
+    ap.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="Optional vLLM max_model_len.",
+    )
+    ap.add_argument(
+        "--vllm-gpu-mem-util",
+        type=float,
+        default=None,
+        help="Optional vLLM gpu_memory_utilization (0.0-1.0).",
+    )
+    ap.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help="Pass --vllm-enforce-eager to vLLM backend.",
+    )
     ap.add_argument("--overwrite", action="store_true", help="Pass --overwrite to query_gemini.py.")
     ap.add_argument("--dry-run", action="store_true", help="List matching CSVs without running.")
 
     args = ap.parse_args()
+    if not args.model:
+        args.model = ["gpt-5-mini"]
 
     base_root_arg = Path(args.base_root)
     if base_root_arg.is_absolute():
@@ -162,7 +201,10 @@ def main() -> None:
             print(p)
         return
 
-    query_script = (Path(__file__).parent / "query_gemini.py").resolve()
+    if args.provider == "vllm":
+        query_script = (Path(__file__).parent / "query_vllm.py").resolve()
+    else:
+        query_script = (Path(__file__).parent / "query_gemini.py").resolve()
     if not query_script.exists():
         raise SystemExit(f"query script not found: {query_script}")
 
@@ -178,7 +220,19 @@ def main() -> None:
                 model,
                 "--temperature",
                 str(args.temperature),
+                "--provider",
+                args.provider,
             ]
+            if args.vllm_tensor_parallel_size is not None:
+                cmd.extend(["--vllm-tensor-parallel-size", str(args.vllm_tensor_parallel_size)])
+            if args.vllm_dtype is not None:
+                cmd.extend(["--vllm-dtype", args.vllm_dtype])
+            if args.vllm_max_model_len is not None:
+                cmd.extend(["--vllm-max-model-len", str(args.vllm_max_model_len)])
+            if args.vllm_gpu_mem_util is not None:
+                cmd.extend(["--vllm-gpu-mem-util", str(args.vllm_gpu_mem_util)])
+            if args.vllm_enforce_eager:
+                cmd.append("--vllm-enforce-eager")
             if args.overwrite:
                 cmd.append("--overwrite")
             print("\n[running]", " ".join(cmd))
