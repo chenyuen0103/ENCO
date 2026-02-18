@@ -15,12 +15,28 @@ from pathlib import Path
 from urllib import request, error
 from urllib.parse import urlparse
 
-from datasets import load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
-from math_verify import LatexExtractionConfig, parse, verify
 from trl import GRPOConfig, GRPOTrainer
+from verifier_cd import (
+    cd_format_reward,
+    build_cd_graph_reward,
+    completion_to_text as cd_completion_to_text,
+    extract_answer_text as cd_extract_answer_text,
+    format_ok as cd_format_ok,
+    score_cd_completion,
+)
+
+try:
+    from math_verify import LatexExtractionConfig, parse, verify
+    _HAS_MATH_VERIFY = True
+except Exception:
+    LatexExtractionConfig = None
+    parse = None
+    verify = None
+    _HAS_MATH_VERIFY = False
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
@@ -40,7 +56,9 @@ class CompactMetricsCallback(TrainerCallback):
         ("loss", "loss"),
         ("reward", "reward"),
         ("rewards/accuracy_reward/mean", "acc"),
+        ("rewards/cd_graph_reward/mean", "cd"),
         ("rewards/format_reward/mean", "fmt"),
+        ("rewards/cd_format_reward/mean", "fmt"),
         ("entropy", "ent"),
         ("step_time", "step_s"),
     ]
@@ -66,6 +84,13 @@ class CompactMetricsCallback(TrainerCallback):
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
     p.add_argument("--mode", type=str, default="train", choices=["train", "ab_eval"])
+    p.add_argument(
+        "--task",
+        type=str,
+        default="causal_discovery",
+        choices=["causal_discovery", "math"],
+        help="Training/eval task type. causal_discovery expects prompt CSV inputs.",
+    )
     p.add_argument("--model_id", type=str, default="Qwen/Qwen2-0.5B-Instruct")
     p.add_argument("--dataset_id", type=str, default="AI-MO/NuminaMath-TIR")
     p.add_argument("--train_split", type=str, default="train[:5%]")
@@ -73,7 +98,7 @@ def build_argparser():
     p.add_argument("--output_dir", type=str, default="Qwen2-0.5B-GRPO-vLLM-server")
 
     # Prompt / generation
-    p.add_argument("--max_prompt_tokens", type=int, default=128)
+    p.add_argument("--max_prompt_tokens", type=int, default=2048)
     p.add_argument("--max_completion_length", type=int, default=64)
     p.add_argument("--num_generations", type=int, default=4)
 
@@ -82,6 +107,41 @@ def build_argparser():
     p.add_argument("--num_train_epochs", type=float, default=1.0)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+
+    # Causal-discovery dataset + verifier options
+    p.add_argument(
+        "--cd-train-csv",
+        action="append",
+        default=[],
+        help=(
+            "Prompt CSV for causal discovery training (repeatable). "
+            "Expected columns include prompt_text or prompt_path plus answer or answer_path."
+        ),
+    )
+    p.add_argument(
+        "--cd-test-csv",
+        action="append",
+        default=[],
+        help="Optional prompt CSV for held-out eval split in causal discovery mode (repeatable).",
+    )
+    p.add_argument(
+        "--cd-test-fraction",
+        type=float,
+        default=0.1,
+        help="If --cd-test-csv is not provided, reserve this fraction from train as eval.",
+    )
+    p.add_argument("--cd-max-train-samples", type=int, default=0, help="Cap train samples (0 = no cap).")
+    p.add_argument("--cd-max-test-samples", type=int, default=0, help="Cap eval samples (0 = no cap).")
+    p.add_argument(
+        "--cd-wrap-system-prompt",
+        action="store_true",
+        help="Wrap causal prompt text using the generic system/user/assistant template.",
+    )
+    p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
+    p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
+    p.add_argument("--cd-reward-require-dag", dest="cd_reward_require_dag", action="store_true")
+    p.add_argument("--no-cd-reward-require-dag", dest="cd_reward_require_dag", action="store_false")
+    p.set_defaults(cd_reward_require_dag=True)
 
     # vLLM server
     p.add_argument(
@@ -168,7 +228,91 @@ def _extract_answer_text(text: str) -> str:
     return m.group(1) if m else text
 
 
+def _require_math_verify():
+    if not _HAS_MATH_VERIFY:
+        raise RuntimeError(
+            "math_verify is not installed, but --task math was requested. "
+            "Install math_verify or switch to --task causal_discovery."
+        )
+
+
+def _resolve_existing_path(path_str: str, *, csv_path: Path) -> Path:
+    p = Path(path_str)
+    if p.is_absolute() and p.exists():
+        return p
+
+    candidates = [
+        csv_path.parent / p,
+        Path.cwd() / p,
+        Path(__file__).resolve().parent.parent / p,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(
+        f"Could not resolve path '{path_str}' from CSV {csv_path}. "
+        f"Tried: {[str(c) for c in candidates]}"
+    )
+
+
+def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -> list[dict]:
+    rows: list[dict] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            prompt_text = (row.get("prompt_text") or "").strip()
+            if not prompt_text:
+                prompt_path_raw = (row.get("prompt_path") or "").strip()
+                if not prompt_path_raw:
+                    raise ValueError(
+                        f"{csv_path}: row {i} missing both prompt_text and prompt_path."
+                    )
+                prompt_path = _resolve_existing_path(prompt_path_raw, csv_path=csv_path)
+                prompt_text = prompt_path.read_text(encoding="utf-8", errors="ignore")
+
+            if wrap_system_prompt:
+                prompt_text = build_prompt(prompt_text)
+
+            answer_raw = (row.get("answer") or "").strip()
+            if not answer_raw:
+                answer_path_raw = (row.get("answer_path") or "").strip()
+                if not answer_path_raw:
+                    raise ValueError(
+                        f"{csv_path}: row {i} missing both answer and answer_path."
+                    )
+                answer_path = _resolve_existing_path(answer_path_raw, csv_path=csv_path)
+                # Keep path string so verifier can parse answer payload on demand.
+                answer_raw = str(answer_path)
+
+            rows.append(
+                {
+                    "prompt": prompt_text,
+                    "answer": answer_raw,
+                }
+            )
+    return rows
+
+
+def _dataset_from_cd_csvs(csv_paths: list[str], *, wrap_system_prompt: bool) -> Dataset:
+    datasets_list = []
+    for path_str in csv_paths:
+        p = Path(path_str)
+        if not p.exists():
+            raise FileNotFoundError(f"--cd-train/test-csv file not found: {p}")
+        rows = _load_cd_rows_from_prompt_csv(p, wrap_system_prompt=wrap_system_prompt)
+        if not rows:
+            raise ValueError(f"No usable rows found in {p}")
+        datasets_list.append(Dataset.from_list(rows))
+
+    if not datasets_list:
+        raise ValueError("No causal discovery CSV inputs were provided.")
+    if len(datasets_list) == 1:
+        return datasets_list[0]
+    return concatenate_datasets(datasets_list)
+
+
 def _is_correct(answer_text: str, solution: str) -> float:
+    _require_math_verify()
     gold = parse(
         solution,
         extraction_mode="first_match",
@@ -189,6 +333,7 @@ def _is_correct(answer_text: str, solution: str) -> float:
 
 
 def _score_answer_with_meta(answer_text: str, solution: str):
+    _require_math_verify()
     gold = parse(
         solution,
         extraction_mode="first_match",
@@ -238,6 +383,7 @@ def _load_eval_model(model_id_or_path: str):
 def _eval_on_dataset(
     model_id_or_path: str,
     eval_dataset,
+    task: str,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
@@ -259,7 +405,10 @@ def _eval_on_dataset(
     debug_rows = []
 
     for idx, example in enumerate(eval_dataset):
-        prompt = build_prompt(example["problem"])
+        if task == "math":
+            prompt = build_prompt(example["problem"])
+        else:
+            prompt = str(example["prompt"])
         inputs = tokenizer(prompt, return_tensors="pt").to(input_device)
         prompt_len = inputs["input_ids"].shape[1]
 
@@ -284,12 +433,28 @@ def _eval_on_dataset(
             for seq in out
         ]
         first_completion = completions[0]
-        fmt_ok += int(bool(FORMAT_RE.match(first_completion)))
+        if task == "math":
+            fmt_ok += int(bool(FORMAT_RE.match(first_completion)))
+        else:
+            fmt_ok += int(cd_format_ok(first_completion))
 
         sample_scores = []
         for sample_idx, completion_text in enumerate(completions):
-            answer_text = _extract_answer_text(completion_text)
-            score, timed_out, had_error = _score_answer_with_meta(answer_text, example["solution"])
+            if task == "math":
+                answer_text = _extract_answer_text(completion_text)
+                score, timed_out, had_error = _score_answer_with_meta(answer_text, example["solution"])
+            else:
+                answer_text = cd_extract_answer_text(cd_completion_to_text(completion_text))
+                meta = score_cd_completion(
+                    completion_text=completion_text,
+                    target_answer=example["answer"],
+                    require_dag=True,
+                    dag_penalty=0.0,
+                    shd_weight=0.0,
+                )
+                score = float(meta["reward"])
+                timed_out = False
+                had_error = False
             sample_scores.append(score)
             verify_timeouts += int(timed_out)
             verify_errors += int(had_error)
@@ -300,11 +465,11 @@ def _eval_on_dataset(
                         "model": debug_model_label,
                         "example_idx": idx,
                         "sample_idx": sample_idx,
-                        "problem": example["problem"],
-                        "solution": example["solution"],
+                        "problem": example.get("problem", example.get("prompt", "")),
+                        "solution": example.get("solution", example.get("answer", "")),
                         "completion": completion_text,
                         "answer_text": answer_text,
-                        "format_ok": int(bool(FORMAT_RE.match(completion_text))),
+                        "format_ok": int(bool(FORMAT_RE.match(completion_text))) if task == "math" else int(cd_format_ok(completion_text)),
                         "is_correct": score,
                         "verify_timed_out": int(timed_out),
                         "verify_error": int(had_error),
@@ -340,9 +505,20 @@ def run_ab_eval(args):
     if args.ab_pass_k <= 0:
         raise ValueError("--ab_pass_k must be > 0")
 
-    full_eval = load_dataset(args.dataset_id, split=args.ab_eval_split)
-    n = min(args.ab_eval_n, len(full_eval))
-    frozen_eval = full_eval.shuffle(seed=args.ab_eval_seed).select(range(n))
+    if args.task == "math":
+        full_eval = load_dataset(args.dataset_id, split=args.ab_eval_split)
+        n = min(args.ab_eval_n, len(full_eval))
+        frozen_eval = full_eval.shuffle(seed=args.ab_eval_seed).select(range(n))
+    else:
+        eval_sources = args.cd_test_csv if args.cd_test_csv else args.cd_train_csv
+        if not eval_sources:
+            raise ValueError("For --task causal_discovery, pass --cd-train-csv (and optionally --cd-test-csv).")
+        full_eval = _dataset_from_cd_csvs(
+            eval_sources,
+            wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+        )
+        n = min(args.ab_eval_n, len(full_eval))
+        frozen_eval = full_eval.shuffle(seed=args.ab_eval_seed).select(range(n))
 
     do_sample = args.ab_do_sample or args.ab_temperature > 0 or args.ab_pass_k > 1
     if args.ab_pass_k > 1 and not do_sample:
@@ -351,6 +527,7 @@ def run_ab_eval(args):
     base_metrics, base_debug_rows = _eval_on_dataset(
         model_id_or_path=args.ab_base_model,
         eval_dataset=frozen_eval,
+        task=args.task,
         max_new_tokens=args.ab_max_new_tokens,
         temperature=args.ab_temperature,
         top_p=args.ab_top_p,
@@ -361,6 +538,7 @@ def run_ab_eval(args):
     grpo_metrics, grpo_debug_rows = _eval_on_dataset(
         model_id_or_path=args.ab_grpo_model,
         eval_dataset=frozen_eval,
+        task=args.task,
         max_new_tokens=args.ab_max_new_tokens,
         temperature=args.ab_temperature,
         top_p=args.ab_top_p,
@@ -668,23 +846,64 @@ def run_train(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     # ---- Dataset
-    train_dataset, test_dataset = load_dataset(
-        args.dataset_id,
-        split=[args.train_split, args.test_split],
-    )
+    if args.task == "math":
+        train_dataset, test_dataset = load_dataset(
+            args.dataset_id,
+            split=[args.train_split, args.test_split],
+        )
 
-    def add_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
-        text = build_prompt(example["problem"])
-        ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
-        return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
+        def add_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
+            text = build_prompt(example["problem"])
+            ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
+            return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
 
-    train_dataset = train_dataset.map(add_prompt)
-    test_dataset = test_dataset.map(add_prompt)
+        train_dataset = train_dataset.map(add_prompt)
+        test_dataset = test_dataset.map(add_prompt)
 
-    # Keep only what GRPO + reward needs
-    keep_cols = ["prompt", "solution"]
-    train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
-    test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
+        # Keep only what GRPO + reward needs
+        keep_cols = ["prompt", "solution"]
+        train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
+        test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
+    else:
+        if not args.cd_train_csv:
+            raise ValueError(
+                "--task causal_discovery requires --cd-train-csv (repeatable) pointing to prompt CSVs."
+            )
+
+        raw_train = _dataset_from_cd_csvs(
+            args.cd_train_csv,
+            wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+        )
+        if args.cd_test_csv:
+            raw_test = _dataset_from_cd_csvs(
+                args.cd_test_csv,
+                wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            )
+        else:
+            split = raw_train.train_test_split(
+                test_size=float(args.cd_test_fraction),
+                seed=int(args.ab_eval_seed),
+            )
+            raw_train = split["train"]
+            raw_test = split["test"]
+
+        if args.cd_max_train_samples and args.cd_max_train_samples > 0:
+            n_train = min(int(args.cd_max_train_samples), len(raw_train))
+            raw_train = raw_train.select(range(n_train))
+        if args.cd_max_test_samples and args.cd_max_test_samples > 0:
+            n_test = min(int(args.cd_max_test_samples), len(raw_test))
+            raw_test = raw_test.select(range(n_test))
+
+        def _truncate_cd_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
+            text = str(example["prompt"])
+            ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
+            return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
+
+        train_dataset = raw_train.map(_truncate_cd_prompt)
+        test_dataset = raw_test.map(_truncate_cd_prompt)
+        keep_cols = ["prompt", "answer"]
+        train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
+        test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
 
     # ---- Model + LoRA
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -710,12 +929,11 @@ def run_train(args):
     model = get_peft_model(model, lora_config)
 
     # ---- Reward functions
-    def format_reward(completions, **kwargs):
+    def format_reward_math(completions, **kwargs):
         texts = [_completion_to_text(c) for c in completions]
         return [1.0 if FORMAT_RE.match(t) else 0.0 for t in texts]
 
-
-    def accuracy_reward(completions, **kwargs):
+    def accuracy_reward_math(completions, **kwargs):
         solutions = kwargs["solution"]
         rewards = []
         for completion, solution in zip(completions, solutions):
@@ -723,6 +941,17 @@ def run_train(args):
             answer_text = _extract_answer_text(text)
             rewards.append(_is_correct(answer_text, solution))
         return rewards
+
+    cd_graph_reward = build_cd_graph_reward(
+        require_dag=bool(args.cd_reward_require_dag),
+        dag_penalty=float(args.cd_reward_dag_penalty),
+        shd_weight=float(args.cd_reward_shd_weight),
+    )
+    reward_funcs = (
+        [format_reward_math, accuracy_reward_math]
+        if args.task == "math"
+        else [cd_format_reward, cd_graph_reward]
+    )
 
     # ---- GRPO config (TRL 0.28.0)
     report_to = ["wandb"] if args.report_to == "wandb" else "none"
@@ -789,7 +1018,7 @@ def run_train(args):
         trainer = GRPOTrainer(
             model=model,
             processing_class=tokenizer,
-            reward_funcs=[format_reward, accuracy_reward],
+            reward_funcs=reward_funcs,
             args=training_args,
             train_dataset=train_dataset,
             callbacks=[CompactMetricsCallback()],

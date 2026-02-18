@@ -8,12 +8,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
+try:
+    import torch
+except Exception:
+    torch = None
 
 from generate_prompts_names_only import iter_names_only_prompts_in_memory
 from query_gemini import (
     call_gemini,
     call_openai,
-    call_hf_textgen,
+    call_hf_textgen_batch,
     build_hf_pipeline,
     is_gemini_model,
     is_openai_model,
@@ -129,6 +133,68 @@ def _select_provider(model: str, provider: str) -> str:
     if is_openai_model(model):
         return "openai"
     return "hf"
+
+
+def _dtype_nbytes(dtype_obj: Any, fallback_hf_dtype: str = "auto") -> int:
+    if dtype_obj is not None:
+        s = str(dtype_obj).lower()
+    else:
+        s = str(fallback_hf_dtype).lower()
+    if "float64" in s or "fp64" in s:
+        return 8
+    if "float32" in s or "fp32" in s:
+        return 4
+    if "bfloat16" in s or "bf16" in s or "float16" in s or "fp16" in s or "half" in s:
+        return 2
+    if "int8" in s or "uint8" in s:
+        return 1
+    # Conservative default for inference.
+    return 2
+
+
+def _estimate_hf_kv_cache_bytes(
+    hf_pipe: Any,
+    *,
+    total_tokens: int,
+    fallback_hf_dtype: str = "auto",
+) -> int | None:
+    """
+    Rough KV-cache estimate (bytes):
+      2 (K,V) * layers * kv_heads * head_dim * total_tokens * bytes_per_elem
+    """
+    try:
+        if hf_pipe is None:
+            return None
+        model = getattr(hf_pipe, "model", None)
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return None
+        layers = getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None)
+        num_heads = getattr(cfg, "num_attention_heads", None) or getattr(cfg, "n_head", None)
+        hidden_size = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None)
+        if not layers or not num_heads or not hidden_size:
+            return None
+        kv_heads = getattr(cfg, "num_key_value_heads", None) or num_heads
+        head_dim = int(hidden_size) // int(num_heads)
+        if head_dim <= 0:
+            return None
+        bytes_per_elem = _dtype_nbytes(getattr(model, "dtype", None), fallback_hf_dtype=fallback_hf_dtype)
+        elems = int(2 * int(layers) * int(kv_heads) * int(head_dim) * max(int(total_tokens), 0))
+        return int(elems * bytes_per_elem)
+    except Exception:
+        return None
+
+
+def _visible_vram_bytes() -> int | None:
+    if torch is None or not torch.cuda.is_available():
+        return None
+    total = 0
+    for i in range(torch.cuda.device_count()):
+        try:
+            total += int(torch.cuda.get_device_properties(i).total_memory)
+        except Exception:
+            continue
+    return total if total > 0 else None
 
 
 def _load_configs_from_file(
@@ -300,6 +366,11 @@ def _run_model_for_config(
     log_calls: bool,
     hf_pipe: Any = None,
     hf_max_new_tokens: int = 0,
+    hf_batch_size: int = 1,
+    hf_skip_if_prompt_tokens_over: int = 0,
+    hf_skip_if_est_kv_exceeds_vram: bool = False,
+    hf_kv_vram_fraction: float = 0.85,
+    hf_dtype_for_estimate: str = "auto",
     extra_output_instruction: str = "",
 ) -> None:
     out_path = _default_response_path(responses_root, dataset, base_name + ".csv", model)
@@ -337,65 +408,23 @@ def _run_model_for_config(
         variables_for_parse = answer_obj.get("variables")
         if not isinstance(variables_for_parse, list):
             variables_for_parse = None
-        for row in prompt_iter:
-            key = (int(row["data_idx"]), int(row["shuffle_idx"]))
-            if key in completed:
-                skipped += 1
-                continue
 
-            prompt = _compose_prompt(row["prompt_text"], extra_output_instruction)
-            prompt_tokens = count_openai_tokens(model, prompt)
+        hf_pending: list[dict[str, Any]] = []
+        visible_vram_bytes = (
+            _visible_vram_bytes()
+            if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram)
+            else None
+        )
+        if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram):
             print(
-                f"[prompt_tokens] key={key} prompt_tokens={prompt_tokens} model={model}",
+                f"[preflight] hf_visible_vram_bytes={visible_vram_bytes} "
+                f"hf_kv_vram_fraction={float(hf_kv_vram_fraction):.2f}",
                 file=sys.stderr,
                 flush=True,
             )
-            if provider == "openai":
-                t0 = time.monotonic()
-                if log_calls:
-                    print(
-                        f"[call:start] key={key} prompt_tokens={prompt_tokens} model={model}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                resp = call_openai(
-                    model_name=model,
-                    prompt=prompt,
-                    temperature=temperature,
-                    max_retries=0,
-                    request_timeout=float(request_timeout_s),
-                )
-                if log_calls:
-                    dt = time.monotonic() - t0
-                    print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
-            elif provider == "gemini":
-                t0 = time.monotonic()
-                if log_calls:
-                    print(f"[call:start] key={key} model={model}", file=sys.stderr, flush=True)
-                resp = call_gemini(
-                    model_name=model,
-                    prompt=prompt,
-                    temperature=temperature,
-                )
-                if log_calls:
-                    dt = time.monotonic() - t0
-                    print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
-            else:
-                if hf_pipe is None:
-                    raise SystemExit("HF provider requested but no pipeline is initialized.")
-                t0 = time.monotonic()
-                if log_calls:
-                    print(f"[call:start] key={key} provider=hf model={model}", file=sys.stderr, flush=True)
-                resp = call_hf_textgen(
-                    hf_pipe,
-                    prompt,
-                    temperature=temperature,
-                    max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
-                )
-                if log_calls:
-                    dt = time.monotonic() - t0
-                    print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
 
+        def _write_out_row(row: dict[str, Any], key: tuple[int, int], prompt_tokens: int, resp: str) -> None:
+            nonlocal wrote
             output_tokens = count_openai_tokens(model, resp)
             total_tokens = (
                 (prompt_tokens + output_tokens)
@@ -447,6 +476,152 @@ def _run_model_for_config(
                     flush=True,
                 )
 
+        def _flush_hf_batch() -> None:
+            nonlocal hf_pending
+            if not hf_pending:
+                return
+            if hf_pipe is None:
+                raise SystemExit("HF provider requested but no pipeline is initialized.")
+
+            prompts = [x["prompt"] for x in hf_pending]
+            keys = [x["key"] for x in hf_pending]
+            t0 = time.monotonic()
+            if log_calls:
+                print(
+                    f"[call:start] provider=hf model={model} batch_size={len(prompts)} keys={keys}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            responses = call_hf_textgen_batch(
+                hf_pipe,
+                prompts,
+                temperature=temperature,
+                max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
+                batch_size=max(1, int(hf_batch_size)),
+            )
+            if log_calls:
+                dt = time.monotonic() - t0
+                print(
+                    f"[call:done] provider=hf model={model} batch_size={len(prompts)} seconds={dt:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            if not isinstance(responses, list):
+                responses = [f"[ERROR] Invalid HF batch response type: {type(responses).__name__}"] * len(hf_pending)
+            if len(responses) != len(hf_pending):
+                fixed = list(responses[: len(hf_pending)])
+                while len(fixed) < len(hf_pending):
+                    fixed.append("[ERROR] Missing HF batch response.")
+                responses = fixed
+
+            for item, resp in zip(hf_pending, responses):
+                _write_out_row(
+                    row=item["row"],
+                    key=item["key"],
+                    prompt_tokens=item["prompt_tokens"],
+                    resp=str(resp),
+                )
+            hf_pending = []
+
+        for row in prompt_iter:
+            key = (int(row["data_idx"]), int(row["shuffle_idx"]))
+            if key in completed:
+                skipped += 1
+                continue
+
+            prompt = _compose_prompt(row["prompt_text"], extra_output_instruction)
+            prompt_tokens = count_openai_tokens(model, prompt)
+            print(
+                f"[prompt_tokens] key={key} prompt_tokens={prompt_tokens} model={model}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if provider == "hf":
+                skip_reason = None
+                if int(hf_skip_if_prompt_tokens_over) > 0 and prompt_tokens >= 0 and prompt_tokens > int(hf_skip_if_prompt_tokens_over):
+                    skip_reason = (
+                        f"prompt_tokens={prompt_tokens} exceeds "
+                        f"hf_skip_if_prompt_tokens_over={int(hf_skip_if_prompt_tokens_over)}"
+                    )
+                elif bool(hf_skip_if_est_kv_exceeds_vram) and prompt_tokens >= 0:
+                    est_total_tokens = int(prompt_tokens) + max(int(hf_max_new_tokens), 0)
+                    est_kv_bytes = _estimate_hf_kv_cache_bytes(
+                        hf_pipe,
+                        total_tokens=est_total_tokens,
+                        fallback_hf_dtype=str(hf_dtype_for_estimate),
+                    )
+                    if est_kv_bytes is not None and visible_vram_bytes is not None:
+                        frac = max(0.05, min(float(hf_kv_vram_fraction), 1.0))
+                        budget_bytes = int(visible_vram_bytes * frac)
+                        if est_kv_bytes > budget_bytes:
+                            skip_reason = (
+                                f"estimated_kv_cache_bytes={est_kv_bytes} exceeds "
+                                f"budget_bytes={budget_bytes} (visible_vram_bytes={visible_vram_bytes}, "
+                                f"hf_kv_vram_fraction={frac})"
+                            )
+
+                if skip_reason is not None:
+                    resp = f"[ERROR] Skipped HF preflight: {skip_reason}"
+                    if log_calls:
+                        print(
+                            f"[skip] key={key} provider=hf reason={skip_reason}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
+                    continue
+
+            if provider == "openai":
+                t0 = time.monotonic()
+                if log_calls:
+                    print(
+                        f"[call:start] key={key} prompt_tokens={prompt_tokens} model={model}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                resp = call_openai(
+                    model_name=model,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_retries=0,
+                    request_timeout=float(request_timeout_s),
+                )
+                if log_calls:
+                    dt = time.monotonic() - t0
+                    print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
+            elif provider == "gemini":
+                t0 = time.monotonic()
+                if log_calls:
+                    print(f"[call:start] key={key} model={model}", file=sys.stderr, flush=True)
+                resp = call_gemini(
+                    model_name=model,
+                    prompt=prompt,
+                    temperature=temperature,
+                )
+                if log_calls:
+                    dt = time.monotonic() - t0
+                    print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
+            elif provider == "hf":
+                hf_pending.append(
+                    {
+                        "row": row,
+                        "key": key,
+                        "prompt": prompt,
+                        "prompt_tokens": prompt_tokens,
+                    }
+                )
+                if len(hf_pending) >= max(1, int(hf_batch_size)):
+                    _flush_hf_batch()
+                continue
+            else:
+                raise SystemExit(f"Unknown provider: {provider}")
+
+            _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
+
+        if provider == "hf":
+            _flush_hf_batch()
+
     print(f"[info] Wrote responses: {out_path}")
 
 
@@ -487,6 +662,29 @@ def main() -> None:
         "--hf-device-map",
         default="auto",
         help='HF device_map for model load (e.g. "auto", "cuda:0", "none").',
+    )
+    ap.add_argument(
+        "--hf-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for HF text generation calls (default: 1).",
+    )
+    ap.add_argument(
+        "--hf-skip-if-prompt-tokens-over",
+        type=int,
+        default=0,
+        help="If >0, skip HF rows whose prompt token count exceeds this threshold.",
+    )
+    ap.add_argument(
+        "--hf-skip-if-est-kv-exceeds-vram",
+        action="store_true",
+        help="Skip HF rows when estimated KV-cache memory exceeds visible VRAM budget.",
+    )
+    ap.add_argument(
+        "--hf-kv-vram-fraction",
+        type=float,
+        default=0.85,
+        help="VRAM budget fraction for KV estimate when --hf-skip-if-est-kv-exceeds-vram is enabled.",
     )
     ap.add_argument(
         "--extra-output-instruction",
@@ -871,6 +1069,11 @@ def main() -> None:
                                         log_calls=bool(args.log_calls),
                                         hf_pipe=hf_pipe,
                                         hf_max_new_tokens=int(args.hf_max_new_tokens),
+                                        hf_batch_size=max(1, int(args.hf_batch_size)),
+                                        hf_skip_if_prompt_tokens_over=max(0, int(args.hf_skip_if_prompt_tokens_over)),
+                                        hf_skip_if_est_kv_exceeds_vram=bool(args.hf_skip_if_est_kv_exceeds_vram),
+                                        hf_kv_vram_fraction=float(args.hf_kv_vram_fraction),
+                                        hf_dtype_for_estimate=str(args.hf_dtype),
                                         extra_output_instruction=str(args.extra_output_instruction),
                                     )
 

@@ -1,0 +1,309 @@
+import json
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
+
+
+def completion_to_text(completion: Any) -> str:
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, dict):
+        return str(completion.get("content", ""))
+    if isinstance(completion, list):
+        if not completion:
+            return ""
+        first = completion[0]
+        if isinstance(first, dict):
+            return str(first.get("content", ""))
+        return str(first)
+    return str(completion)
+
+
+def extract_answer_text(text: str) -> str:
+    m = ANSWER_RE.search(text or "")
+    return m.group(1) if m else (text or "")
+
+
+def format_ok(text: str) -> int:
+    return int(bool(FORMAT_RE.match(text or "")))
+
+
+def cd_format_reward(completions, **kwargs):
+    texts = [completion_to_text(c) for c in completions]
+    return [1.0 if format_ok(t) else 0.0 for t in texts]
+
+
+def _normalize_matrix(mat: Any, expected_n: Optional[int] = None) -> Optional[List[List[int]]]:
+    if not isinstance(mat, list) or not mat:
+        return None
+    try:
+        rows = [[int(x) for x in row] for row in mat]
+    except Exception:
+        return None
+    n = len(rows)
+    if expected_n is not None and n != expected_n:
+        return None
+    if any(len(r) != n for r in rows):
+        return None
+    for i in range(n):
+        for j in range(n):
+            if rows[i][j] not in (0, 1):
+                return None
+    return rows
+
+
+def _matrix_from_obj(obj: Any, expected_n: Optional[int] = None) -> Optional[List[List[int]]]:
+    if isinstance(obj, dict):
+        if "adjacency_matrix" in obj:
+            mat = _normalize_matrix(obj["adjacency_matrix"], expected_n=expected_n)
+            if mat is not None:
+                return mat
+        ans = obj.get("answer")
+        if isinstance(ans, dict) and "adjacency_matrix" in ans:
+            mat = _normalize_matrix(ans["adjacency_matrix"], expected_n=expected_n)
+            if mat is not None:
+                return mat
+    return _normalize_matrix(obj, expected_n=expected_n)
+
+
+def _balanced_spans(text: str, open_ch: str, close_ch: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == open_ch:
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == close_ch and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, i + 1))
+    return spans
+
+
+def extract_adjacency_matrix(text: str, expected_n: Optional[int] = None) -> Optional[List[List[int]]]:
+    if not text:
+        return None
+
+    candidates = [text, extract_answer_text(text)]
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+
+        # 1) Full JSON
+        try:
+            obj = json.loads(cand)
+            mat = _matrix_from_obj(obj, expected_n=expected_n)
+            if mat is not None:
+                return mat
+        except Exception:
+            pass
+
+        # 2) Any JSON object spans
+        for s, e in _balanced_spans(cand, "{", "}"):
+            frag = cand[s:e]
+            try:
+                obj = json.loads(frag)
+            except Exception:
+                continue
+            mat = _matrix_from_obj(obj, expected_n=expected_n)
+            if mat is not None:
+                return mat
+
+        # 3) Any list-of-lists spans
+        for s, e in _balanced_spans(cand, "[", "]"):
+            frag = cand[s:e]
+            if "[[" not in frag:
+                continue
+            try:
+                obj = json.loads(frag)
+            except Exception:
+                continue
+            mat = _normalize_matrix(obj, expected_n=expected_n)
+            if mat is not None:
+                return mat
+
+    return None
+
+
+def _load_json_from_raw(raw: Any) -> Any:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    p = Path(s)
+    if p.exists() and p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def target_matrix_from_answer(raw: Any) -> Optional[List[List[int]]]:
+    obj = _load_json_from_raw(raw)
+    if obj is None:
+        return None
+    return _matrix_from_obj(obj)
+
+
+def is_acyclic(adj: List[List[int]]) -> bool:
+    n = len(adj)
+    indeg = [0] * n
+    out = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if adj[i][j] == 1:
+                indeg[j] += 1
+                out[i].append(j)
+
+    q = [i for i in range(n) if indeg[i] == 0]
+    seen = 0
+    head = 0
+    while head < len(q):
+        u = q[head]
+        head += 1
+        seen += 1
+        for v in out[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    return seen == n
+
+
+def edge_f1(pred: List[List[int]], target: List[List[int]]) -> float:
+    n = len(target)
+    tp = fp = fn = 0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            p = pred[i][j]
+            t = target[i][j]
+            if p == 1 and t == 1:
+                tp += 1
+            elif p == 1 and t == 0:
+                fp += 1
+            elif p == 0 and t == 1:
+                fn += 1
+    denom_p = tp + fp
+    denom_r = tp + fn
+    if denom_p == 0 and denom_r == 0:
+        return 1.0
+    precision = (tp / denom_p) if denom_p > 0 else 0.0
+    recall = (tp / denom_r) if denom_r > 0 else 0.0
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def normalized_shd(pred: List[List[int]], target: List[List[int]]) -> float:
+    n = len(target)
+    denom = float(max(n * (n - 1), 1))
+    diff = 0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if pred[i][j] != target[i][j]:
+                diff += 1
+    return float(diff) / denom
+
+
+def score_cd_completion(
+    completion_text: str,
+    target_answer: Any,
+    require_dag: bool = True,
+    dag_penalty: float = 0.1,
+    shd_weight: float = 0.0,
+) -> Dict[str, Any]:
+    text = completion_to_text(completion_text)
+    fmt = format_ok(text)
+    target_adj = target_matrix_from_answer(target_answer)
+    if target_adj is None:
+        return {"reward": 0.0, "format_ok": fmt, "parse_ok": 0, "dag_ok": 0, "edge_f1": 0.0, "shd_norm": 1.0}
+
+    pred_adj = extract_adjacency_matrix(text, expected_n=len(target_adj))
+    if pred_adj is None:
+        return {"reward": 0.0, "format_ok": fmt, "parse_ok": 0, "dag_ok": 0, "edge_f1": 0.0, "shd_norm": 1.0}
+
+    f1 = edge_f1(pred_adj, target_adj)
+    shd_n = normalized_shd(pred_adj, target_adj)
+    dag_ok = int(is_acyclic(pred_adj))
+
+    reward = f1 - float(shd_weight) * shd_n
+    if require_dag and not dag_ok:
+        reward -= float(dag_penalty)
+    reward = max(min(float(reward), 1.0), -1.0)
+
+    return {
+        "reward": reward,
+        "format_ok": fmt,
+        "parse_ok": 1,
+        "dag_ok": dag_ok,
+        "edge_f1": f1,
+        "shd_norm": shd_n,
+    }
+
+
+def build_cd_graph_reward(
+    require_dag: bool = True,
+    dag_penalty: float = 0.1,
+    shd_weight: float = 0.0,
+):
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def cd_graph_reward(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        rewards: List[float] = []
+        for i, completion in enumerate(completions):
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+
+            target_adj = _cached_target(target_raw)
+            if target_adj is None:
+                rewards.append(0.0)
+                continue
+
+            text = completion_to_text(completion)
+            pred_adj = extract_adjacency_matrix(text, expected_n=len(target_adj))
+            if pred_adj is None:
+                rewards.append(0.0)
+                continue
+
+            f1 = edge_f1(pred_adj, target_adj)
+            shd_n = normalized_shd(pred_adj, target_adj)
+            reward = f1 - float(shd_weight) * shd_n
+            if require_dag and not is_acyclic(pred_adj):
+                reward -= float(dag_penalty)
+            rewards.append(max(min(float(reward), 1.0), -1.0))
+        return rewards
+
+    cd_graph_reward.__name__ = "cd_graph_reward"
+    return cd_graph_reward
