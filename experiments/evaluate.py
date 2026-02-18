@@ -518,6 +518,18 @@ def load_gt_from_cell(
 
 # ------------------------ Parsing predictions ------------------------ #
 
+FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
+
+
+def extract_answer_text(text: str) -> str:
+    m = ANSWER_RE.search(text or "")
+    return m.group(1) if m else (text or "")
+
+
+def is_format_ok(text: str) -> int:
+    return int(bool(FORMAT_RE.match(text or "")))
+
 def extract_adjacency_matrix(text: str, *, fallback_variables: Optional[List[str]] = None) -> Optional[np.ndarray]:
     if not text:
         return None
@@ -842,9 +854,10 @@ def main():
     if RAW_COL in orig_fieldnames:
         for row in rows:
             raw = row.get(RAW_COL, "") or ""
+            row["format_ok"] = is_format_ok(raw)
             ans_s = row.get(answer_col, "") or ""
             _A_true_for_vars, vars_for_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
-            mat = extract_adjacency_matrix(raw, fallback_variables=vars_for_this)
+            mat = extract_adjacency_matrix(extract_answer_text(raw), fallback_variables=vars_for_this)
             if mat is not None:
                 row[args.pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
                 row["valid"] = 1
@@ -873,6 +886,8 @@ def main():
 
     valid_rows = 0
     pred_edges_list: List[int] = []
+    format_ok_rows = 0
+    format_scored_rows = 0
 
     # Collect for consensus/probability plot
     pred_mats_all: List[np.ndarray] = []
@@ -884,6 +899,15 @@ def main():
     for row_idx, row in enumerate(rows):
         ans_s = row.get(answer_col, "") or ""
         pred_s = row.get(args.pred_col, "") or ""
+        raw_s = row.get(RAW_COL, "") or ""
+        fmt_val_raw = row.get("format_ok", "")
+        if fmt_val_raw == "" and raw_s:
+            fmt_val = is_format_ok(raw_s)
+        else:
+            try:
+                fmt_val = int(fmt_val_raw)
+            except Exception:
+                fmt_val = None
 
         A_true, vars_from_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
         A_pred = extract_adjacency_matrix(pred_s, fallback_variables=vars_from_this)
@@ -941,15 +965,17 @@ def main():
         for k in ("data_idx", "shuffle_idx"):
             if k in row:
                 met[k] = row[k]
+        met["format_ok"] = fmt_val
+        if fmt_val is not None:
+            format_scored_rows += 1
+            format_ok_rows += int(fmt_val == 1)
         per_row_metrics.append(met)
 
     df = pd.DataFrame(rows)
 
-    # If nothing parsed into a valid prediction/GT pair, skip writing any outputs.
-    # This is useful when batch-evaluating a directory and some runs are incomplete.
+    # Continue even if graph parsing failed, so format metrics are still reported.
     if valid_rows == 0:
-        print(f"[info] No valid rows in {csv_path}. Skipping evaluation outputs.")
-        return
+        print(f"[info] No valid rows in {csv_path}. Graph metrics will be null; format metrics will still be reported.")
 
     # --- Global averages (existing flow) ---
     if valid_rows > 0:
@@ -1076,6 +1102,9 @@ def main():
     summary = {
         "num_rows": len(rows),
         "valid_rows": valid_rows,
+        "format_scored_rows": format_scored_rows,
+        "format_ok_rows": format_ok_rows,
+        "format_rate": (float(format_ok_rows) / float(format_scored_rows)) if format_scored_rows > 0 else None,
         "avg_TP": avg_TP,
         "avg_TN": avg_TN,
         "avg_FP": avg_FP,
@@ -1218,6 +1247,7 @@ def main():
 
     # ---- Per-row metrics output handling ----
     metric_keys = [
+        "format_ok",
         "n_vars","tp","tn","fp","fn","accuracy","precision","recall","f1",
         "shd","orient_eval_pairs","orient_tp","orient_fn","orient_acc",
         "nhd","nhd_ratio", 

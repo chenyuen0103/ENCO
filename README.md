@@ -8,6 +8,16 @@ This is the official repository of the paper **Efficient Neural Causal Discovery
 
 This repository is adapted from the original ENCO codebase by Lippe, Cohen, and Gavves. We keep the original ENCO implementation and add additional code under `experiments/` for LLM-based causal discovery prompts, querying, evaluation, and analysis.
 
+## Table of contents
+
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Datasets](#datasets)
+- [Running experiments](#running-experiments)
+- [Simple example](#simple-example)
+- [FAQ](#faq)
+- [Citation](#citation)
+
 ## Paper summary
 
 <center><img src="ENCO_figure.svg" width="800px"></center>
@@ -37,6 +47,22 @@ We recommend to use conda for installing the requirements. If you haven't instal
    ```setup
    conda activate enco
    ```
+
+## Quick start
+
+### Core ENCO workflow
+
+After creating the `enco` environment, you can run the tutorial notebook:
+
+```bash
+jupyter notebook walkthrough.ipynb
+```
+
+Or run a baseline ENCO script:
+
+```bash
+bash experiments/run_scripts/experiment_synthetic.sh
+```
 
 ### Setup for ENCO + LLM prompt experiments
 
@@ -84,7 +110,15 @@ Notes:
 
 ### Datasets
 
-To reproduce the experiments in the paper, we provide datasets of causal graphs for the synthetic, confounder, and real-world experiments. The datasets can be download by executing `download_datasets.sh` (requires approx. 600MB disk space). Alternatively, the datasets can be accessed through [this link](https://drive.google.com/file/d/1mJXJpvkG8Ol4w6QlbzW4EETjpXmHPlMX/view?usp=sharing) (unzip the file in the `causal_graphs` folder).
+To reproduce the experiments in the paper, we provide datasets of causal graphs for the synthetic, confounder, and real-world experiments. The datasets can be downloaded by running:
+
+```bash
+bash download_datasets.sh
+```
+
+This requires approximately 600 MB of disk space.
+
+Alternatively, download the archive through [this link](https://drive.google.com/file/d/1mJXJpvkG8Ol4w6QlbzW4EETjpXmHPlMX/view?usp=sharing) and unzip it into `causal_graphs/`.
 
 ## Running experiments
 

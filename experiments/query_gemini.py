@@ -11,6 +11,9 @@ from multiprocessing import get_context
 from queue import Empty as QueueEmpty  # <-- correct exception
 import numpy as np
 
+FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
+
 # ---- OpenAI token counting helper ----
 try:
     import tiktoken  # type: ignore
@@ -450,6 +453,7 @@ def build_hf_pipeline(
     trust_remote_code: bool = True,
     device_map: Optional[str] = None,
     torch_dtype: Optional[str] = None,
+    clear_length_cap: bool = True,
 ):
     """
     Build a Hugging Face text-generation pipeline for the given model name.
@@ -515,6 +519,18 @@ def build_hf_pipeline(
         except Exception:
             pass
 
+        # Optional: remove model-default generation caps so "no explicit cap"
+        # means generation is not length-limited by max_new_tokens/max_length.
+        if clear_length_cap:
+            try:
+                gen_cfg = model.generation_config
+                if hasattr(gen_cfg, "max_new_tokens"):
+                    gen_cfg.max_new_tokens = None
+                if hasattr(gen_cfg, "max_length"):
+                    gen_cfg.max_length = None
+            except Exception:
+                pass
+
         pipe = TextGenerationPipeline(model=model, tokenizer=tok)
         return pipe
     except Exception as e:
@@ -523,17 +539,18 @@ def build_hf_pipeline(
         ) from e
 
 
-def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_tokens: int = 512) -> str:
+def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_tokens: Optional[int] = None) -> str:
     """Generate text using a HF text-generation pipeline."""
     try:
         do_sample = temperature and temperature > 0.0
-        outputs = pipe(
-            prompt,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=bool(do_sample),
-            temperature=float(temperature),
-            return_full_text=False,
-        )
+        gen_kwargs: Dict[str, Any] = {
+            "do_sample": bool(do_sample),
+            "temperature": float(temperature),
+            "return_full_text": False,
+        }
+        if max_new_tokens is not None and int(max_new_tokens) > 0:
+            gen_kwargs["max_new_tokens"] = int(max_new_tokens)
+        outputs = pipe(prompt, **gen_kwargs)
         if isinstance(outputs, list) and outputs:
             text = outputs[0].get("generated_text", "")
             return text if isinstance(text, str) else str(text)
@@ -544,7 +561,7 @@ def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_toke
         return f"[ERROR] {type(e).__name__}: {e}"
 
 def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
-                          max_new_tokens: int = 512, batch_size: int = 1) -> list[str]:
+                          max_new_tokens: Optional[int] = None, batch_size: int = 1) -> list[str]:
     """
     Generate text for a batch of prompts using a HF text-generation pipeline.
 
@@ -554,10 +571,11 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
         do_sample = temperature and temperature > 0.0
 
         gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": int(max_new_tokens),
             "return_full_text": False,
             "batch_size": int(batch_size),
         }
+        if max_new_tokens is not None and int(max_new_tokens) > 0:
+            gen_kwargs["max_new_tokens"] = int(max_new_tokens)
         if do_sample:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = float(temperature)
@@ -593,6 +611,27 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
         print(tb, file=sys.stderr)
         # propagate an explicit error string for each prompt
         return [f"[ERROR] {type(e).__name__}: {e}"] * len(prompts)
+
+
+def _extract_answer_text(text: str) -> str:
+    m = ANSWER_RE.search(text or "")
+    return m.group(1) if m else (text or "")
+
+
+def _format_ok(text: str) -> int:
+    return int(bool(FORMAT_RE.match(text or "")))
+
+
+def _truncation_suspected(text: str, *, output_tokens: int, max_new_tokens_hint: int | None) -> int:
+    t = text or ""
+    missing_close_tags = (
+        ("<think>" in t and "</think>" not in t)
+        or ("<answer>" in t and "</answer>" not in t)
+    )
+    near_limit = False
+    if max_new_tokens_hint is not None and max_new_tokens_hint > 0 and output_tokens >= 0:
+        near_limit = output_tokens >= int(0.98 * max_new_tokens_hint)
+    return int(missing_close_tags or near_limit)
 
 
 def extract_adjacency_matrix(text: str, *, fallback_variables: Optional[list[str]] = None) -> Optional[np.ndarray]:
@@ -1174,13 +1213,9 @@ def main():
     if not in_path.exists():
         sys.exit(f"CSV not found: {in_path}")
 
-    # If user did not explicitly set --max-new-tokens, choose based on filename
+    # Keep max_new_tokens optional: None/<=0 means no explicit cap passed to HF generate.
     if args.max_new_tokens is None:
-        if "_steps" in in_path.stem:
-            args.max_new_tokens = 8192
-        else:
-            args.max_new_tokens = 1024
-        print(f"[info] Using max_new_tokens={args.max_new_tokens} for {in_path.name}")
+        print(f"[info] Using model/default generation length (no explicit --max-new-tokens) for {in_path.name}")
 
     # --------- 1. Read input CSV once ---------
     with in_path.open("r", encoding="utf-8", newline="") as fin:
@@ -1191,7 +1226,7 @@ def main():
 
     # Ensure output columns
     fieldnames = orig_fieldnames[:]
-    for extra in ["raw_response", "prediction", "valid", "prompt_tokens", "error_type"]:
+    for extra in ["raw_response", "prediction", "valid", "format_ok", "truncation_suspected", "prompt_tokens", "error_type"]:
         if extra not in fieldnames:
             fieldnames.append(extra)
 
@@ -1260,6 +1295,19 @@ def main():
     # --------- 2. Determine resume vs overwrite ---------
     resume = out_path.exists() and not args.overwrite
 
+    def _is_row_complete_and_valid(r: dict) -> bool:
+        raw = (r.get("raw_response") or "").lstrip()
+        pred = (r.get("prediction") or "").strip()
+        if raw.startswith("[ERROR]"):
+            return False
+        valid_str = str(r.get("valid", "")).strip()
+        try:
+            valid = int(valid_str) == 1
+        except Exception:
+            # Backward-compatible fallback for older files without valid column.
+            valid = bool(pred)
+        return bool(raw.strip()) and bool(pred) and valid
+
     existing_rows = []
     if resume:
         with out_path.open("r", encoding="utf-8", newline="") as f_existing:
@@ -1267,21 +1315,21 @@ def main():
             for r in r_existing:
                 existing_rows.append(r)
 
-        # Find first row whose raw_response starts with [ERROR]
-        first_error_idx = None
+        # Find first row that should be retried:
+        # [ERROR], invalid parse (valid!=1), or missing prediction/response.
+        first_retry_idx = None
         for i, r in enumerate(existing_rows):
-            raw = (r.get("raw_response") or "").lstrip()
-            if raw.startswith("[ERROR]") or 'rate limit' in raw.lower() or 'ratelimit' in raw.lower():
-                first_error_idx = i
+            if not _is_row_complete_and_valid(r):
+                first_retry_idx = i
                 break
 
-        if first_error_idx is None:
+        if first_retry_idx is None:
             already_done = len(existing_rows)
-            print(f"[info] Resuming: {already_done} rows already present in {out_path.name}, no [ERROR] rows.")
+            print(f"[info] Resuming: {already_done} rows already present in {out_path.name}, no retry-needed rows.")
         else:
-            already_done = first_error_idx
+            already_done = first_retry_idx
             print(
-                f"[info] Resuming from row {already_done} (first [ERROR] at index {first_error_idx}) "
+                f"[info] Resuming from row {already_done} (first retry-needed row at index {first_retry_idx}) "
                 f"in {out_path.name}"
             )
     else:
@@ -1380,7 +1428,14 @@ def main():
         )
         for row_obj, resp in zip(hf_batch_rows, outputs):
             row_obj["raw_response"] = resp
-            adj = extract_adjacency_matrix(resp)
+            row_obj["format_ok"] = _format_ok(resp)
+            out_tok = count_openai_tokens(args.model, resp)
+            row_obj["truncation_suspected"] = _truncation_suspected(
+                resp,
+                output_tokens=out_tok,
+                max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
+            )
+            adj = extract_adjacency_matrix(_extract_answer_text(resp))
             if adj is not None:
                 row_obj["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                 row_obj["valid"] = 1
@@ -1411,11 +1466,17 @@ def main():
                 # prompt = current.get(args.prompt_col, "") or "
                 prompt_path_str = current.get(args.prompt_col, "") or ""
                 prompt = Path(prompt_path_str).read_text(encoding="utf-8")
-                raw    = current.get("raw_response", "") or ""
-                pred   = current.get("prediction", "") or ""
+                raw = current.get("raw_response", "") or ""
+                pred = current.get("prediction", "") or ""
+                valid_str = str(current.get("valid", "")).strip()
+                try:
+                    is_valid = int(valid_str) == 1
+                except Exception:
+                    is_valid = bool(pred.strip())
 
                 # Treat [ERROR] responses as invalid and eligible for retry
                 is_error_resp = raw.lstrip().startswith("[ERROR]")
+                is_invalid_resp = (not pred.strip()) or (not is_valid)
 
                 # 2) Respect max_rows: don't make new model calls past this,
                 #    but still write the row as-is so the file stays consistent.
@@ -1425,9 +1486,8 @@ def main():
                     skipped_new += 1
                     continue
 
-                # 3) If we already have a non-error raw_response **and** a prediction,
-                #    just reuse it (no new model call).
-                if raw.strip() and not is_error_resp and pred.strip():
+                # 3) If we already have a non-error, valid response, reuse it.
+                if raw.strip() and not is_error_resp and pred.strip() and is_valid:
                     writer.writerow(current)
                     # jf.write(json.dumps(current, ensure_ascii=False) + "\n")
                     skipped_new += 1
@@ -1437,7 +1497,7 @@ def main():
                 need_call = (
                     need_model_calls
                     and bool(prompt)
-                    and (args.overwrite or not raw.strip() or is_error_resp)
+                    and (args.overwrite or not raw.strip() or is_error_resp or is_invalid_resp)
                 )
 
                 if need_call:
@@ -1448,7 +1508,14 @@ def main():
                             temperature=args.temperature,
                         )
                         current["raw_response"] = resp
-                        adj = extract_adjacency_matrix(resp)
+                        current["format_ok"] = _format_ok(resp)
+                        out_tok = count_openai_tokens(args.model, resp)
+                        current["truncation_suspected"] = _truncation_suspected(
+                            resp,
+                            output_tokens=out_tok,
+                            max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
+                        )
+                        adj = extract_adjacency_matrix(_extract_answer_text(resp))
                         if adj is not None:
                             current["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             current["valid"] = 1
@@ -1477,7 +1544,14 @@ def main():
                             request_timeout=6000.0,   # tune as you like
                         )
                         row["raw_response"] = resp
-                        adj = extract_adjacency_matrix(resp)
+                        row["format_ok"] = _format_ok(resp)
+                        out_tok = count_openai_tokens(args.model, resp)
+                        row["truncation_suspected"] = _truncation_suspected(
+                            resp,
+                            output_tokens=out_tok,
+                            max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
+                        )
+                        adj = extract_adjacency_matrix(_extract_answer_text(resp))
                         if adj is not None:
                             row["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             row["valid"] = 1

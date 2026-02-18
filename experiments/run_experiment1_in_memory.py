@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,41 @@ from query_gemini import (
     extract_adjacency_matrix,
     count_openai_tokens,
 )
+
+FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
+
+
+def _extract_answer_text(text: str) -> str:
+    m = ANSWER_RE.search(text or "")
+    return m.group(1) if m else (text or "")
+
+
+def _format_ok(text: str) -> int:
+    return int(bool(FORMAT_RE.match(text or "")))
+
+
+def _compose_prompt(prompt_text: str, extra_output_instruction: str) -> str:
+    if extra_output_instruction and extra_output_instruction.strip():
+        return (
+            (prompt_text or "").rstrip()
+            + "\n\n"
+            + extra_output_instruction.strip()
+            + "\n"
+        )
+    return prompt_text or ""
+
+
+def _truncation_suspected(text: str, *, output_tokens: int, max_new_tokens_hint: int | None) -> int:
+    t = text or ""
+    missing_close_tags = (
+        ("<think>" in t and "</think>" not in t)
+        or ("<answer>" in t and "</answer>" not in t)
+    )
+    near_limit = False
+    if max_new_tokens_hint is not None and max_new_tokens_hint > 0 and output_tokens >= 0:
+        near_limit = output_tokens >= int(0.98 * max_new_tokens_hint)
+    return int(missing_close_tags or near_limit)
 
 
 def _safe_model_tag(model: str) -> str:
@@ -95,6 +131,74 @@ def _select_provider(model: str, provider: str) -> str:
     return "hf"
 
 
+def _load_configs_from_file(
+    *,
+    config_file: Path,
+    style_aliases: dict[str, str],
+    allowed_styles: set[str],
+    allowed_row_orders: set[str],
+    allowed_col_orders: set[str],
+) -> list[tuple[str, bool, int, int, str, str, int]]:
+    try:
+        payload = json.loads(config_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise SystemExit(f"Failed to read --config-file {config_file}: {e}") from e
+
+    if isinstance(payload, dict):
+        raw_configs = payload.get("configs")
+    elif isinstance(payload, list):
+        raw_configs = payload
+    else:
+        raise SystemExit("--config-file must contain either a JSON list or an object with key 'configs'.")
+
+    if not isinstance(raw_configs, list) or not raw_configs:
+        raise SystemExit("--config-file contains no configs.")
+
+    out: list[tuple[str, bool, int, int, str, str, int]] = []
+    for i, item in enumerate(raw_configs):
+        if not isinstance(item, dict):
+            raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
+
+        style_raw = str(item.get("prompt_style", item.get("style", "cases"))).strip().lower()
+        style = style_aliases.get(style_raw, style_raw)
+        if style not in allowed_styles:
+            raise SystemExit(
+                f"Config #{i}: unknown prompt_style '{style_raw}' (normalized '{style}'). "
+                f"Allowed: {sorted(allowed_styles)}"
+            )
+
+        row_ord = str(item.get("row_order", "random")).strip().lower()
+        col_ord = str(item.get("col_order", "original")).strip().lower()
+        if row_ord not in allowed_row_orders:
+            raise SystemExit(f"Config #{i}: invalid row_order '{row_ord}'. Allowed: {sorted(allowed_row_orders)}")
+        if col_ord not in allowed_col_orders:
+            raise SystemExit(f"Config #{i}: invalid col_order '{col_ord}'. Allowed: {sorted(allowed_col_orders)}")
+
+        try:
+            obs_n = int(item.get("obs_per_prompt", item.get("obs", 0)))
+            int_n = int(item.get("int_per_combo", item.get("int", 0)))
+            shuf_n = int(item.get("shuffles_per_graph", item.get("shuffle", item.get("shuf", 1))))
+        except Exception as e:
+            raise SystemExit(f"Config #{i}: obs/int/shuf must be integers: {e}") from e
+
+        if shuf_n <= 0:
+            raise SystemExit(f"Config #{i}: shuffles_per_graph must be > 0.")
+
+        anon_raw = item.get("anonymize", False)
+        if isinstance(anon_raw, bool):
+            anon = anon_raw
+        elif isinstance(anon_raw, str):
+            anon = anon_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+        elif isinstance(anon_raw, (int, float)):
+            anon = bool(int(anon_raw))
+        else:
+            anon = False
+
+        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n))
+
+    return out
+
+
 def _load_completed(out_path: Path, overwrite: bool) -> tuple[set[tuple[int, int]], list[dict[str, Any]]]:
     if overwrite or not out_path.exists():
         return set(), []
@@ -109,16 +213,21 @@ def _load_completed(out_path: Path, overwrite: bool) -> tuple[set[tuple[int, int
         for row in reader:
             raw = (row.get("raw_response") or "").lstrip()
             pred = (row.get("prediction") or "").strip()
+            valid_str = str(row.get("valid", "")).strip()
+            try:
+                valid = int(valid_str) == 1
+            except Exception:
+                valid = bool(pred)
             is_error = raw.startswith("[ERROR]")
-            if raw and not is_error and pred:
+            if raw and not is_error and pred and valid:
                 try:
                     key = (int(row.get("data_idx", -1)), int(row.get("shuffle_idx", -1)))
                     completed.add(key)
                     rows.append(row)
                 except Exception:
                     continue
-            elif not is_error and pred:
-                # keep non-error rows even if raw is empty (should be rare)
+            elif not is_error and pred and valid:
+                # keep non-error, valid rows even if raw is empty (should be rare)
                 rows.append(row)
     return completed, rows
 
@@ -190,6 +299,8 @@ def _run_model_for_config(
     progress_every: int,
     log_calls: bool,
     hf_pipe: Any = None,
+    hf_max_new_tokens: int = 0,
+    extra_output_instruction: str = "",
 ) -> None:
     out_path = _default_response_path(responses_root, dataset, base_name + ".csv", model)
     completed, existing_rows = _load_completed(out_path, overwrite)
@@ -202,6 +313,8 @@ def _run_model_for_config(
         "raw_response",
         "prediction",
         "valid",
+        "format_ok",
+        "truncation_suspected",
         "prompt_tokens",
         "output_tokens",
         "total_tokens",
@@ -230,7 +343,7 @@ def _run_model_for_config(
                 skipped += 1
                 continue
 
-            prompt = row["prompt_text"]
+            prompt = _compose_prompt(row["prompt_text"], extra_output_instruction)
             prompt_tokens = count_openai_tokens(model, prompt)
             print(
                 f"[prompt_tokens] key={key} prompt_tokens={prompt_tokens} model={model}",
@@ -273,7 +386,12 @@ def _run_model_for_config(
                 t0 = time.monotonic()
                 if log_calls:
                     print(f"[call:start] key={key} provider=hf model={model}", file=sys.stderr, flush=True)
-                resp = call_hf_textgen(hf_pipe, prompt, temperature=temperature, max_new_tokens=1024)
+                resp = call_hf_textgen(
+                    hf_pipe,
+                    prompt,
+                    temperature=temperature,
+                    max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
+                )
                 if log_calls:
                     dt = time.monotonic() - t0
                     print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
@@ -291,9 +409,20 @@ def _run_model_for_config(
                     flush=True,
                 )
 
-            adj = extract_adjacency_matrix(resp, fallback_variables=variables_for_parse)
+            answer_text = _extract_answer_text(resp)
+            adj = extract_adjacency_matrix(answer_text, fallback_variables=variables_for_parse)
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
             valid = 1 if adj is not None else 0
+            format_ok = _format_ok(resp)
+            truncation_suspected = _truncation_suspected(
+                resp,
+                output_tokens=output_tokens,
+                max_new_tokens_hint=(
+                    int(hf_max_new_tokens)
+                    if provider == "hf" and int(hf_max_new_tokens) > 0
+                    else None
+                ),
+            )
 
             out_row = {
                 "data_idx": row["data_idx"],
@@ -303,6 +432,8 @@ def _run_model_for_config(
                 "raw_response": resp,
                 "prediction": pred,
                 "valid": valid,
+                "format_ok": format_ok,
+                "truncation_suspected": truncation_suspected,
                 "prompt_tokens": prompt_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
@@ -341,6 +472,33 @@ def main() -> None:
     ap.add_argument("--model", action="append", default=[])
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--provider", default="auto", choices=["auto", "gemini", "openai", "hf"])
+    ap.add_argument(
+        "--hf-max-new-tokens",
+        type=int,
+        default=0,
+        help="HF generation max_new_tokens. Set <=0 for no explicit cap (default: 0).",
+    )
+    ap.add_argument(
+        "--hf-dtype",
+        default="auto",
+        help="HF torch dtype for model load (auto, bf16, fp16, fp32).",
+    )
+    ap.add_argument(
+        "--hf-device-map",
+        default="auto",
+        help='HF device_map for model load (e.g. "auto", "cuda:0", "none").',
+    )
+    ap.add_argument(
+        "--extra-output-instruction",
+        default=(
+            "First write your reasoning inside <think>...</think>, then provide only the final "
+            "JSON adjacency matrix inside <answer>...</answer>. Do not put JSON outside <answer>."
+        ),
+        help=(
+            "Extra instruction appended to every prompt before querying. "
+            "Use empty string to disable."
+        ),
+    )
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
@@ -398,6 +556,15 @@ def main() -> None:
     ap.add_argument("--give-steps", action="store_true")
     ap.add_argument("--single-config", action="store_true")
     ap.add_argument(
+        "--config-file",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file listing explicit configs to run. "
+            "Format: either a list of config objects or {\"configs\": [...]}."
+        ),
+    )
+    ap.add_argument(
         "--print-one-prompt",
         action="store_true",
         help="Generate and print a single prompt (first row) for debugging, then exit.",
@@ -425,7 +592,10 @@ def main() -> None:
         "summary_join": "summary_joint",
     }
 
-    styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    all_styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    styles = list(all_styles)
+    allowed_row_orders = {"random", "sorted", "reverse"}
+    allowed_col_orders = {"original", "reverse", "random", "topo", "reverse_topo"}
     if args.styles:
         requested_raw = [s.strip().lower() for s in args.styles if s.strip()]
         requested = [style_aliases.get(s, s) for s in requested_raw]
@@ -447,6 +617,9 @@ def main() -> None:
     print(f"--- Starting Experiment 1 In-Memory Run ---")
     print(f"BIF File: {args.bif_file}")
 
+    if args.single_config and args.config_file is not None:
+        raise SystemExit("Use either --single-config or --config-file, not both.")
+
     if args.single_config:
         configs = [(
             args.prompt_style,
@@ -457,6 +630,14 @@ def main() -> None:
             args.col_order,
             int(shuf_values[0] if shuf_values else 1),
         )]
+    elif args.config_file is not None:
+        configs = _load_configs_from_file(
+            config_file=args.config_file,
+            style_aliases=style_aliases,
+            allowed_styles=set(all_styles),
+            allowed_row_orders=allowed_row_orders,
+            allowed_col_orders=allowed_col_orders,
+        )
     else:
         configs = [
             (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n)
@@ -468,6 +649,8 @@ def main() -> None:
             for col_ord in col_order_opts
             for shuf_n in shuf_values
         ]
+
+    hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
 
     for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n in configs:
                                 is_names_only = (obs_n == 0 and int_n == 0)
@@ -569,8 +752,12 @@ def main() -> None:
                                             indent=2,
                                         )
                                     )
-                                    print("\n=== PROMPT (first row) ===")
-                                    print(first["prompt_text"])
+                                    final_prompt = _compose_prompt(
+                                        str(first.get("prompt_text", "")),
+                                        str(args.extra_output_instruction),
+                                    )
+                                    print("\n=== PROMPT (first row; exact text sent) ===")
+                                    print(final_prompt)
                                     return
 
                                 for model in args.model:
@@ -625,7 +812,27 @@ def main() -> None:
                                     provider = _select_provider(model, args.provider)
                                     hf_pipe = None
                                     if provider == "hf":
-                                        hf_pipe = build_hf_pipeline(model)
+                                        dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
+                                        hf_key = (model, dm, str(args.hf_dtype))
+                                        hf_pipe = hf_pipe_cache.get(hf_key)
+                                        if hf_pipe is None:
+                                            print(
+                                                f"[hf:init] loading HF pipeline once for model={model} device_map={dm} dtype={args.hf_dtype}",
+                                                file=sys.stderr,
+                                                flush=True,
+                                            )
+                                            hf_pipe = build_hf_pipeline(
+                                                model,
+                                                device_map=dm,
+                                                torch_dtype=args.hf_dtype,
+                                            )
+                                            hf_pipe_cache[hf_key] = hf_pipe
+                                        else:
+                                            print(
+                                                f"[hf:init] reusing cached HF pipeline for model={model}",
+                                                file=sys.stderr,
+                                                flush=True,
+                                            )
                                     if provider == "gemini":
                                         if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
                                             raise SystemExit("Missing API key: set GOOGLE_API_KEY or GEMINI_API_KEY.")
@@ -663,6 +870,8 @@ def main() -> None:
                                         progress_every=int(args.progress_every),
                                         log_calls=bool(args.log_calls),
                                         hf_pipe=hf_pipe,
+                                        hf_max_new_tokens=int(args.hf_max_new_tokens),
+                                        extra_output_instruction=str(args.extra_output_instruction),
                                     )
 
                                 count += 1
