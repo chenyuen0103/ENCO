@@ -307,3 +307,36 @@ def build_cd_graph_reward(
 
     cd_graph_reward.__name__ = "cd_graph_reward"
     return cd_graph_reward
+
+
+def build_length_penalty_reward(
+    tokenizer: Any,
+    coef: float = 0.0,
+    target_tokens: int = 0,
+    max_abs: float = 1.0,
+):
+    if coef < 0:
+        raise ValueError("coef must be >= 0")
+    if target_tokens < 0:
+        raise ValueError("target_tokens must be >= 0")
+
+    def length_penalty_reward(completions, **kwargs):
+        texts = [completion_to_text(c) for c in completions]
+        tokenized = tokenizer(
+            texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+        )["input_ids"]
+        rewards: List[float] = []
+        for ids in tokenized:
+            over = max(0, len(ids) - target_tokens)
+            penalty = float(coef) * float(over)
+            reward = -penalty
+            if max_abs > 0:
+                reward = max(reward, -float(max_abs))
+            rewards.append(float(reward))
+        return rewards
+
+    length_penalty_reward.__name__ = "length_penalty_reward"
+    return length_penalty_reward

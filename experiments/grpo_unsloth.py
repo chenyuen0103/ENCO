@@ -9,6 +9,7 @@ import sys
 import subprocess
 import csv
 import io
+import inspect
 from contextlib import redirect_stdout, redirect_stderr
 import torch
 from pathlib import Path
@@ -38,6 +39,14 @@ except Exception:
     parse = None
     verify = None
     _HAS_MATH_VERIFY = False
+
+try:
+    from unsloth import FastLanguageModel, PatchFastRL
+    _HAS_UNSLOTH = True
+except Exception:
+    FastLanguageModel = None
+    PatchFastRL = None
+    _HAS_UNSLOTH = False
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
@@ -84,7 +93,7 @@ class CompactMetricsCallback(TrainerCallback):
 
 
 def build_argparser():
-    p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
+    p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode (Unsloth-ready)")
     p.add_argument("--mode", type=str, default="train", choices=["train", "ab_eval"])
     p.add_argument(
         "--task",
@@ -109,6 +118,57 @@ def build_argparser():
     p.add_argument("--num_train_epochs", type=float, default=1.0)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    p.add_argument("--use-unsloth", dest="use_unsloth", action="store_true")
+    p.add_argument("--no-use-unsloth", dest="use_unsloth", action="store_false")
+    p.set_defaults(use_unsloth=True)
+    p.add_argument("--unsloth-load-in-4bit", action="store_true", help="Load base model in 4-bit via Unsloth.")
+    p.add_argument(
+        "--unsloth-fast-inference",
+        dest="unsloth_fast_inference",
+        action="store_true",
+        help="Enable Unsloth fast-inference path where available.",
+    )
+    p.add_argument("--no-unsloth-fast-inference", dest="unsloth_fast_inference", action="store_false")
+    p.set_defaults(unsloth_fast_inference=True)
+    p.add_argument(
+        "--unsloth-gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization hint for Unsloth+vLLM integrations.",
+    )
+    p.add_argument(
+        "--unsloth-max-seq-length",
+        type=int,
+        default=0,
+        help=(
+            "Max sequence length used for Unsloth model loading. "
+            "0 means auto-derive from prompt+completion limits when possible."
+        ),
+    )
+    p.add_argument(
+        "--unsloth-vllm-standby",
+        dest="unsloth_vllm_standby",
+        action="store_true",
+        help=(
+            "Set UNSLOTH_VLLM_STANDBY=1 before training setup for shared-memory rollout/training flows."
+        ),
+    )
+    p.add_argument("--no-unsloth-vllm-standby", dest="unsloth_vllm_standby", action="store_false")
+    p.set_defaults(unsloth_vllm_standby=True)
+    p.add_argument(
+        "--grpo-loss-type",
+        type=str,
+        default="auto",
+        choices=["auto", "grpo", "dapo", "dr_grpo"],
+        help="Optional GRPO loss variant if supported by the installed TRL.",
+    )
+    p.add_argument(
+        "--grpo-importance-sampling-level",
+        type=str,
+        default="auto",
+        choices=["auto", "token", "sequence"],
+        help="Optional importance-sampling level if supported by the installed TRL.",
+    )
     p.add_argument(
         "--length_penalty_coef",
         type=float,
@@ -236,6 +296,14 @@ def build_argparser():
     p.add_argument("--ab_debug_csv", type=str, default=None)
 
     return p
+
+
+def _filter_supported_kwargs(callable_obj, kwargs: dict) -> dict:
+    try:
+        params = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def build_prompt(problem: str) -> str:
@@ -950,27 +1018,74 @@ def run_train(args):
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
 
     # ---- Model + LoRA
+    if args.use_unsloth and args.unsloth_vllm_standby:
+        os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
+
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    model_load_kwargs = {
-        "dtype": "auto",
-    }
-    # `device_map="auto"` is incompatible with distributed Accelerate launches.
-    if distributed_world_size == 1:
-        model_load_kwargs["device_map"] = "auto"
+    if args.use_unsloth:
+        if not _HAS_UNSLOTH:
+            raise RuntimeError(
+                "--use-unsloth was requested, but unsloth is not installed in this environment."
+            )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        **model_load_kwargs,
-    )
+        if PatchFastRL is not None:
+            try:
+                PatchFastRL("GRPO", FastLanguageModel)
+            except Exception:
+                # Some versions may already patch or not require explicit patching.
+                pass
 
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"],
-    )
-    model = get_peft_model(model, lora_config)
+        unsloth_max_seq_length = int(args.unsloth_max_seq_length)
+        if unsloth_max_seq_length <= 0:
+            if args.max_prompt_tokens > 0 and args.max_completion_length > 0:
+                unsloth_max_seq_length = int(args.max_prompt_tokens + args.max_completion_length)
+            else:
+                unsloth_max_seq_length = 2048
+
+        load_kwargs = {
+            "model_name": args.model_id,
+            "max_seq_length": unsloth_max_seq_length,
+            "dtype": None,
+            "load_in_4bit": bool(args.unsloth_load_in_4bit),
+            "fast_inference": bool(args.unsloth_fast_inference),
+            "gpu_memory_utilization": float(args.unsloth_gpu_memory_utilization),
+        }
+        load_kwargs = _filter_supported_kwargs(FastLanguageModel.from_pretrained, load_kwargs)
+        model, unsloth_tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+        tokenizer = unsloth_tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        lora_kwargs = {
+            "r": 8,
+            "lora_alpha": 32,
+            "lora_dropout": 0.1,
+            "target_modules": ["q_proj", "v_proj"],
+            "use_gradient_checkpointing": "unsloth",
+        }
+        lora_kwargs = _filter_supported_kwargs(FastLanguageModel.get_peft_model, lora_kwargs)
+        model = FastLanguageModel.get_peft_model(model, **lora_kwargs)
+    else:
+        model_load_kwargs = {
+            "dtype": "auto",
+        }
+        # `device_map="auto"` is incompatible with distributed Accelerate launches.
+        if distributed_world_size == 1:
+            model_load_kwargs["device_map"] = "auto"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            **model_load_kwargs,
+        )
+
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "v_proj"],
+        )
+        model = get_peft_model(model, lora_config)
 
     # ---- Reward functions
     def format_reward_math(completions, **kwargs):
@@ -1043,34 +1158,32 @@ def run_train(args):
             }
         )
 
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        remove_unused_columns=False,
-        num_train_epochs=args.num_train_epochs,
-
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-
-        bf16=torch.cuda.is_available(),
-
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-
-        report_to=report_to,
-        run_name=args.run_name,
-        logging_steps=args.logging_steps,
-        dataloader_num_workers=args.dataloader_num_workers,
-        dataloader_pin_memory=True,
-
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        push_to_hub=False,
-
-        # vLLM integration (server mode)
-        use_vllm=args.use_vllm,
+    config_kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "remove_unused_columns": False,
+        "num_train_epochs": args.num_train_epochs,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "bf16": torch.cuda.is_available(),
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "report_to": report_to,
+        "run_name": args.run_name,
+        "logging_steps": args.logging_steps,
+        "dataloader_num_workers": args.dataloader_num_workers,
+        "dataloader_pin_memory": True,
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "push_to_hub": False,
+        "use_vllm": args.use_vllm,
         **grpo_kwargs,
-    )
+    }
+    if args.grpo_loss_type != "auto":
+        config_kwargs["loss_type"] = args.grpo_loss_type
+    if args.grpo_importance_sampling_level != "auto":
+        config_kwargs["importance_sampling_level"] = args.grpo_importance_sampling_level
+    training_args = GRPOConfig(**_filter_supported_kwargs(GRPOConfig.__init__, config_kwargs))
 
     try:
         trainer = GRPOTrainer(
