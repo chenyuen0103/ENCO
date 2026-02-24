@@ -98,8 +98,8 @@ def build_argparser():
     p.add_argument("--output_dir", type=str, default="Qwen2-0.5B-GRPO-vLLM-server")
 
     # Prompt / generation
-    p.add_argument("--max_prompt_tokens", type=int, default=2048)
-    p.add_argument("--max_completion_length", type=int, default=64)
+    p.add_argument("--max_prompt_tokens", type=int, default=0)
+    p.add_argument("--max_completion_length", type=int, default=0)
     p.add_argument("--num_generations", type=int, default=4)
 
     # Train
@@ -174,7 +174,12 @@ def build_argparser():
     )
     p.add_argument("--vllm_server_startup_timeout", type=float, default=120.0)
     p.add_argument("--vllm_server_gpu_memory_utilization", type=float, default=0.2)
-    p.add_argument("--vllm_server_max_model_len", type=int, default=2048)
+    p.add_argument(
+        "--vllm_server_max_model_len",
+        type=int,
+        default=None,
+        help="Max model length for auto-launched vLLM server (<=0 lets vLLM pick a default).",
+    )
     p.add_argument("--vllm_server_log_file", type=str, default="vllm_server.log")
 
     # Logging
@@ -605,9 +610,11 @@ def _parse_visible_cuda_devices():
     return []
 
 
-def _wait_for_health(url: str, timeout_s: float):
+def _wait_for_health(url: str, timeout_s: float, proc=None):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             with request.urlopen(url, timeout=2.0) as resp:
                 if resp.status < 400:
@@ -620,7 +627,7 @@ def _wait_for_health(url: str, timeout_s: float):
 
 def _build_trl_vllm_serve_cmd(args, host: str, port: int):
     model_id = args.vllm_server_model_id or args.model_id
-    return [
+    cmd = [
         "trl",
         "vllm-serve",
         "--model",
@@ -631,9 +638,11 @@ def _build_trl_vllm_serve_cmd(args, host: str, port: int):
         str(port),
         "--gpu-memory-utilization",
         str(args.vllm_server_gpu_memory_utilization),
-        "--max-model-len",
-        str(args.vllm_server_max_model_len),
     ]
+    # <=0 is treated as "unset" so vLLM can choose a safe default.
+    if args.vllm_server_max_model_len > 0:
+        cmd.extend(["--max-model-len", str(args.vllm_server_max_model_len)])
+    return cmd
 
 
 def _maybe_launch_local_vllm_and_reexec_train(args):
@@ -681,8 +690,14 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
         ) from exc
 
     try:
-        ready = _wait_for_health(health_url, args.vllm_server_startup_timeout)
+        ready = _wait_for_health(health_url, args.vllm_server_startup_timeout, proc=server_proc)
         if not ready:
+            exit_code = server_proc.poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    "Auto-launched vLLM server exited before becoming healthy "
+                    f"(exit code {exit_code}). Check logs: {args.vllm_server_log_file}"
+                )
             raise RuntimeError(
                 "Auto-launched vLLM server did not become healthy in time. "
                 f"Check logs: {args.vllm_server_log_file}"
@@ -1035,9 +1050,19 @@ def run_train(args):
             ) from e
         raise
 
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    print("Saved to:", args.output_dir)
+    try:
+        trainer.train()
+        trainer.save_model(args.output_dir)
+        print("Saved to:", args.output_dir)
+    finally:
+        # Avoid NCCL resource-leak warnings on normal/early exits in distributed runs.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception as e:
+                rank = int(os.environ.get("RANK", "0"))
+                if rank == 0:
+                    print(f"[warn] destroy_process_group failed: {e}")
 
 
 def main():

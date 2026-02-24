@@ -30,6 +30,47 @@ def _load_graph_file(path: str):  # type: ignore
     return load_graph_file(path)
 
 
+def _build_output_contract_lines(
+    *,
+    output_edge_list: bool,
+    require_think_answer_blocks: bool = False,
+) -> List[str]:
+    """
+    Shared output contract to avoid contradictory instructions across prompt styles.
+    """
+    if output_edge_list:
+        json_key = "edges"
+        json_field_desc = (
+            '- "edges": a list of directed edges as ["source","target"], '
+            "using EXACT variable names from the prompt."
+        )
+    else:
+        json_key = "adjacency_matrix"
+        json_field_desc = (
+            '- "adjacency_matrix": an N x N list of lists of 0/1 integers in the declared variable order, '
+            "where [i][j] = 1 iff variables[i] -> variables[j], else 0."
+        )
+
+    if require_think_answer_blocks:
+        return [
+            "Respond using exactly two XML-style blocks and nothing else.",
+            "First block: <think>...</think> for reasoning.",
+            "Second block: <answer>...</answer> containing exactly one valid JSON object.",
+            f'The JSON object inside <answer> must have exactly one key: "{json_key}".',
+            json_field_desc,
+            "Do not include any text before <think>, between </think> and <answer>, or after </answer>.",
+            'The JSON object inside <answer> must start with "{" and end with "}".',
+        ]
+
+    return [
+        "Respond with a single valid JSON object and nothing else.",
+        f'The object must have exactly one key: "{json_key}".',
+        json_field_desc,
+        'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
+        'Your first character MUST be "{" and your last character MUST be "}".',
+    ]
+
+
 # ------------------------ Utility: variable names ------------------------ #
 
 def get_topological_sort(adj_matrix: List[List[int]]) -> List[int]:
@@ -148,6 +189,7 @@ def iter_prompts_in_memory(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
+    thinking_tags: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate prompts in-memory (no prompt files, no prompt CSV).
@@ -221,7 +263,9 @@ def iter_prompts_in_memory(
         tags.append("rules")
     if give_steps:
         tags.append("steps")
-    if prompt_style in {"matrix", "summary", "summary_probs", "summary_joint", "summary_hist_full", "summary_hist_rows", "payload", "payload_topk"}:
+    if thinking_tags:
+        tags.append("thinktags")
+    if prompt_style in {"matrix", "summary_joint"}:
         tags.append(prompt_style)
     if row_order != "random":
         tags.append(f"row{row_order}")
@@ -337,36 +381,6 @@ def iter_prompts_in_memory(
                     prompt_text = format_names_only_prompt(
                         variables_out, dataset_name, causal_rules, output_edge_list=use_edge_list_output
                     )
-                elif prompt_style == "summary":
-                    prompt_text = format_prompt_summary_stats(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        include_causal_rules=causal_rules,
-                        include_give_steps=give_steps,
-                        include_def_int=include_def_int,
-                        output_edge_list=use_edge_list_output,
-                    )
-                elif prompt_style == "summary_probs":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-                    prompt_text = format_prompt_summary_probs(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        include_causal_rules=causal_rules,
-                        include_give_steps=give_steps,
-                        include_def_int=include_def_int,
-                        output_edge_list=use_edge_list_output,
-                    )
                 elif prompt_style == "summary_joint":
                     state_names = []
                     for orig_name in permuted_real_names:
@@ -387,56 +401,21 @@ def iter_prompts_in_memory(
                         anonymize=anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
-                        output_edge_list=use_edge_list_output,
-                    )
-                elif prompt_style == "payload":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-                    prompt_text = format_prompt_payload_json(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        epsilon=0.02,
-                        anonymize=anonymize,
-                        output_edge_list=use_edge_list_output,
-                    )
-                elif prompt_style == "payload_topk":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-                    prompt_text = format_prompt_payload_topk_json(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        epsilon=0.02,
-                        decimals=4,
-                        top_k_effects=6,
-                        include_network_name=(not anonymize),
+                        require_think_answer_blocks=thinking_tags,
                         output_edge_list=use_edge_list_output,
                     )
                 elif prompt_style == "matrix":
                     prompt_text = format_prompt_cb_matrix(
                         variables_out, rows_text_source, dataset_name,
                         causal_rules, give_steps, include_def_int=include_def_int,
+                        require_think_answer_blocks=thinking_tags,
                         output_edge_list=use_edge_list_output,
                     )
                 else:
                     prompt_text = format_prompt_with_interventions(
                         variables_out, rows_text_source, vmap,
                         causal_rules, give_steps, include_def_int=include_def_int,
+                        require_think_answer_blocks=thinking_tags,
                         output_edge_list=use_edge_list_output,
                     )
 
@@ -587,6 +566,7 @@ def format_prompt_payload_json(
     epsilon: float = 0.02,
     decimals: int = 4,
     anonymize: bool = False,   # <-- add this
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -705,32 +685,27 @@ def format_prompt_payload_json(
 
     # ---------- wrap with strict output instructions + payload ----------
     # (Single-file prompt: include “system” guidance inline since you write .txt prompts)
+    method_header = (
+        "METHOD (write this reasoning in the <think>...</think> block):\n"
+        if require_think_answer_blocks else
+        "METHOD (follow internally, do not output reasoning):\n"
+    )
     method_block = (
         "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
         "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
-        "METHOD (follow internally, do not output reasoning):\n"
+        + method_header +
         "1) From each do(X=x), treat variables whose marginals change (TV > epsilon) as descendants of X.\n"
         "2) Use observational dependence only to suggest adjacencies (skeleton), not directions.\n"
         "3) Prefer X->Y if Y changes under do(X) but X does not change under do(Y).\n"
         "4) Enforce acyclicity and choose the sparsest graph consistent with the evidence.\n"
     )
 
-    if output_edge_list:
-        out_contract = (
-            "OUTPUT INSTRUCTIONS:\n"
-            "Respond with a single valid JSON object and nothing else.\n"
-            "The object must have exactly one key: \"edges\".\n"
-            "- \"edges\": list of directed edges [[source,target], ...] using exact names from the VARIABLES section.\n"
-            "Your first character MUST be \"{\" and your last character MUST be \"}\".\n"
+    out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
         )
-    else:
-        out_contract = (
-            "OUTPUT INSTRUCTIONS:\n"
-            "Respond with a single valid JSON object and nothing else.\n"
-            "The object must have exactly one key: \"adjacency_matrix\".\n"
-            "- \"adjacency_matrix\": NxN 0/1 ints in the VARIABLES order; [i][j]=1 iff variables[i] -> variables[j].\n"
-            "Your first character MUST be \"{\" and your last character MUST be \"}\".\n"
-        )
+    ) + "\n"
 
     return method_block + "\n" + out_contract + "\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
 
@@ -746,6 +721,7 @@ def format_prompt_payload_topk_json(
     decimals: int = 4,
     top_k_effects: int = 6,
     include_network_name: bool = True,
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -860,35 +836,30 @@ def format_prompt_payload_topk_json(
     if include_network_name:
         payload["network_name"] = dataset_name
 
+    method_header = (
+        "METHOD (write this reasoning in the <think>...</think> block):\n"
+        if require_think_answer_blocks else
+        "METHOD (follow internally; do not output reasoning):\n"
+    )
     method_block = (
         "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
         "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
         "EVIDENCE SEMANTICS:\n"
         "- For each intervention entry, `changed_vars` are variables whose marginals changed under do(X=v) (TV > epsilon).\n"
         "- Only descendants of X can change under do(X=v) in a perfect intervention setting.\n"
-        "METHOD (follow internally; do not output reasoning):\n"
+        + method_header +
         "1) For each intervention do(X=v), treat `changed_vars` as a superset of descendants of X.\n"
         "2) Prefer X->Y if Y appears in changed_vars under do(X=*) but X does NOT appear in changed_vars under do(Y=*).\n"
         "3) Do NOT infer direction from observational marginals alone.\n"
         "4) Output the sparsest DAG consistent with the intervention constraints.\n"
     )
 
-    if output_edge_list:
-        out_contract = (
-            "OUTPUT INSTRUCTIONS:\n"
-            "Respond with a single valid JSON object and nothing else.\n"
-            "The object must have exactly one key: \"edges\".\n"
-            "- \"edges\": list of directed edges [[source,target], ...] using exact names from the VARIABLES section.\n"
-            "Your first character MUST be \"{\" and your last character MUST be \"}\".\n"
+    out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
         )
-    else:
-        out_contract = (
-            "OUTPUT INSTRUCTIONS:\n"
-            "Respond with a single valid JSON object and nothing else.\n"
-            "The object must have exactly one key: \"adjacency_matrix\".\n"
-            "- \"adjacency_matrix\": NxN 0/1 ints in the VARIABLES order; [i][j]=1 iff variables[i] -> variables[j].\n"
-            "Your first character MUST be \"{\" and your last character MUST be \"}\".\n"
-        )
+    ) + "\n"
 
     return (
         method_block
@@ -1077,6 +1048,7 @@ def format_prompt_cb_matrix(
     include_def_int: bool = False,
     state_names: Optional[Dict[str, Dict[str, str]]] = None,  # optional: {var: {"0":"low","1":"high"}}
     anonymize: bool = False,  # controls whether to omit network_name
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -1118,38 +1090,12 @@ def format_prompt_cb_matrix(
 
     # --- Output contract ---
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    if output_edge_list:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLE ORDER section below.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLE ORDER section below.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), must appear at the end, and nothing may follow it.',
-            ])
-    else:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLE ORDER, where [i][j] = 1 iff variables[i] -> variables[j], else 0.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLE ORDER, where [i][j] = 1 iff variables[i] -> variables[j], else 0.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), must appear at the end, and nothing may follow it.',
-            ])
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     # --- Optional causal reminders ---
     if include_causal_rules:
@@ -1214,8 +1160,13 @@ def format_prompt_cb_matrix(
 
     # --- Minimal internal method (optional) ---
     if include_give_steps:
+        method_header = (
+            "\nMETHOD (write this reasoning in the <think>...</think> block):"
+            if require_think_answer_blocks else
+            "\nMETHOD (follow internally; do not output reasoning):"
+        )
         lines.extend([
-            "\nMETHOD (follow internally; do not output reasoning):",
+            method_header,
             "1) For each do(X=v) block, mark variables whose distributions differ from observational as descendants of X.",
             "2) Use asymmetry across interventions to orient: if Y changes under do(X) but X does not change under do(Y), prefer X -> Y.",
             "3) Use observational data only to suggest adjacency (avoid overfitting); interventions decide directions when possible.",
@@ -1292,6 +1243,7 @@ def format_prompt_summary_stats(
     include_give_steps: bool = False,
     include_def_int: bool = False,
     decimals: int = 4,
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -1318,42 +1270,12 @@ def format_prompt_summary_stats(
     lines.append("Infer the directed causal graph over the variables.")
 
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    if output_edge_list:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section below.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section below.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
-    else:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     if include_causal_rules:
         lines.extend([
@@ -1416,8 +1338,13 @@ def format_prompt_summary_stats(
 
     lines.append("\n--- END OF SUMMARY ---")
     if include_give_steps:
+        steps_header = (
+            "\n(Use this in your <think>...</think> block.)"
+            if require_think_answer_blocks else
+            "\n(You may follow these steps silently.)"
+        )
         lines.extend([
-            "\n(You may follow these steps silently.)",
+            steps_header,
             "1) Use obs_corr and intervention deltas to constrain and orient edges.",
             "2) Choose a directed acyclic graph consistent with the constraints.",
             "Then output the JSON as specified above.",
@@ -1589,6 +1516,7 @@ def format_prompt_summary_probs(
     include_def_int: bool = False,
     decimals: int = 4,
     top_k_effects: int = 5,
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -1614,42 +1542,12 @@ def format_prompt_summary_probs(
     lines.append("Infer the directed causal graph over the variables.")
 
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    if output_edge_list:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section below.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section below.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
-    else:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     if include_causal_rules:
         lines.extend([
@@ -1747,8 +1645,13 @@ def format_prompt_summary_probs(
 
     lines.append("\n--- END OF SUMMARY ---")
     if include_give_steps:
+        steps_header = (
+            "\n(Use this in your <think>...</think> block.)"
+            if require_think_answer_blocks else
+            "\n(You may follow these steps silently.)"
+        )
         lines.extend([
-            "\n(You may follow these steps silently.)",
+            steps_header,
             "1) Use obs_marginals, obs_corr, and intervention TV effects to constrain and orient edges.",
             "2) Choose a directed acyclic graph consistent with the constraints.",
             "Then output the JSON as specified above.",
@@ -1791,6 +1694,7 @@ def format_prompt_summary_full_joint(
     compact_array_keys: Tuple[str, ...] = ("hist", "marginals"),
     # NEW: make interventional payloads compact even when nested
     compact_interventions: bool = True,
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -1976,34 +1880,13 @@ def format_prompt_summary_full_joint(
     lines.append("Infer the directed causal graph over the variables.")
 
     lines.append("\n--- OUTPUT ---")
-    if output_edge_list:
-        if not include_give_steps:
-            lines.extend([
-                'Return ONE valid JSON object and nothing else.',
-                'Key: "edges".',
-                '"edges": list of directed edges as ["source","target"], using exact names in the VARIABLES section below.',
-                "Must be a DAG (acyclic).",
-            ])
-        else:
-            lines.extend([
-                "You may add a brief explanation.",
-                'End with ONE valid JSON object with key "edges", and nothing after it.',
-                "Must be a DAG (acyclic).",
-            ])
-    else:
-        if not include_give_steps:
-            lines.extend([
-                'Return ONE valid JSON object and nothing else.',
-                'Key: "adjacency_matrix".',
-                '"adjacency_matrix": N x N 0/1 list in VARIABLES order; [i][j]=1 iff variables[i] -> variables[j].',
-                "Must be a DAG (acyclic).",
-            ])
-        else:
-            lines.extend([
-                "You may add a brief explanation.",
-                'End with ONE valid JSON object with key "adjacency_matrix", and nothing after it.',
-                "Must be a DAG (acyclic).",
-            ])
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
+    lines.append("Must be a DAG (acyclic).")
 
     if include_causal_rules:
         lines.extend([
@@ -2091,7 +1974,7 @@ def format_prompt_summary_full_joint(
         lines.append("interventional_data=" + _dumps_interventional_hybrid(interventional_dict))
 
     if include_give_steps:
-        lines.append("\n--- (SILENT STEPS) ---")
+        lines.append("\n--- (THINKING STEPS) ---" if require_think_answer_blocks else "\n--- (SILENT STEPS) ---")
         lines.append("1) Use interventional shifts to identify descendants/orient edges; use joint patterns for colliders.")
         lines.append("2) Output a DAG as JSON.")
 
@@ -2107,6 +1990,7 @@ def format_prompt_with_interventions(
     given_edges: Optional[List[Tuple[str, str]]] = None,
     copula_mode: str = "auto",  # NEW: 'auto' | '=' | 'is'
     include_def_int: bool = False,
+    require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
     """
@@ -2149,42 +2033,12 @@ def format_prompt_with_interventions(
 
     # ---------- OUTPUT INSTRUCTIONS ----------
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    if output_edge_list:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the SYSTEM VARIABLES section below.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "edges".',
-                '- "edges": a list of directed edges as ["source","target"], using EXACT names from the SYSTEM VARIABLES section below.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
-    else:
-        if not include_give_steps:
-            lines.extend([
-                'Respond with a single valid JSON object and nothing else.',
-                'The object must have exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in SYSTEM VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-                'Your first character MUST be "{" and your last character MUST be "}".',
-            ])
-        else:
-            lines.extend([
-                'You may optionally include a brief explanation first.',
-                'At the end, you MUST output a single JSON object with exactly one key: "adjacency_matrix".',
-                '- "adjacency_matrix": an N x N list of lists of 0/1 integers in SYSTEM VARIABLES order, where [i][j] = 1 '
-                'iff there is a directed edge from variables[i] to variables[j], else 0.',
-                'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-                'must appear on its own line at the end of your answer, and nothing may follow it.',
-            ])
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     # ---------- Optional causal reminders ----------
     if include_causal_rules:
@@ -2243,22 +2097,27 @@ def format_prompt_with_interventions(
     has_obs = bool(obs_rows)
     has_interv = bool(interventions)
     if include_give_steps:
+        steps_header = (
+            "\n(Use this in your <think>...</think> block.)"
+            if require_think_answer_blocks else
+            "\n(You may follow these steps silently.)"
+        )
         if has_obs and has_interv:
             lines.extend([
-                "\n(You may follow these steps silently.)",
+                steps_header,
                 "1) Use observational data to infer a plausible Markov equivalence class.",
                 "2) Use interventional data to identify a single DAG within that class.",
                 "Then output the JSON as specified above.",
             ])
         elif has_obs:
             lines.extend([
-                "\n(You may follow these steps silently.)",
+                steps_header,
                 "1) Use observational conditional (in)dependencies to constrain the DAG.",
                 "Then output the JSON as specified above.",
             ])
         elif has_interv:
             lines.extend([
-                "\n(You may follow these steps silently.)",
+                steps_header,
                 "1) For each do(X=x), treat incoming edges into X as cut; use changes in other variables to orient edges.",
                 "2) Combine across interventions into a single DAG.",
                 "Then output the JSON as specified above.",
@@ -2344,12 +2203,17 @@ def main():
     ap.add_argument("--anonymize", action="store_true")
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument("--give-steps", action="store_true")
+    ap.add_argument(
+        "--thinking-tags",
+        action="store_true",
+        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+    )
     ap.add_argument("--def-int", action="store_true", help="Include a brief definition of interventions when interventional data are present.")
     ap.add_argument("--shuffles-per-graph", type=int, default=1)
     ap.add_argument("--given-edge-frac", type=float, default=0.0)
     ap.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary",  "summary_joint", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary_joint"],
         default="cases",
     )
     ap.add_argument(
@@ -2461,7 +2325,8 @@ def main():
     if args.anonymize: tags.append("anon")
     if getattr(args, "causal_rules", False): tags.append("rules")
     if getattr(args, "give_steps", False): tags.append("steps")
-    if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary", "summary_probs", "summary_joint", "summary_hist_full", "summary_hist_rows", "payload", "payload_topk"}:
+    if getattr(args, "thinking_tags", False): tags.append("thinktags")
+    if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary_joint"}:
         tags.append(args.prompt_style)
     
     # ROBUSTNESS TAGS (Explicitly added to filename)
@@ -2613,36 +2478,6 @@ def main():
                     prompt_text = format_names_only_prompt(
                         variables_out, dataset_name, args.causal_rules, output_edge_list=use_edge_list_output
                     )
-                elif args.prompt_style == "summary":
-                    prompt_text = format_prompt_summary_stats(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        include_causal_rules=args.causal_rules,
-                        include_give_steps=args.give_steps,
-                        include_def_int=include_def_int,
-                        output_edge_list=use_edge_list_output,
-                    )
-                elif args.prompt_style == "summary_probs":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if args.anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-                    prompt_text = format_prompt_summary_probs(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        include_causal_rules=args.causal_rules,
-                        include_give_steps=args.give_steps,
-                        include_def_int=include_def_int,
-                        output_edge_list=use_edge_list_output,
-                    )
                 elif args.prompt_style == "summary_joint":
                     state_names = []
                     for orig_name in permuted_real_names:
@@ -2663,6 +2498,7 @@ def main():
                         anonymize=args.anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
+                        require_think_answer_blocks=args.thinking_tags,
                         output_edge_list=use_edge_list_output,
                     )
                 elif args.prompt_style == "matrix":
@@ -2674,54 +2510,15 @@ def main():
                         include_give_steps=args.give_steps,
                         include_def_int=include_def_int,
                         anonymize=args.anonymize,
+                        require_think_answer_blocks=args.thinking_tags,
                         state_names=None,  # or build mapping if you want
                         output_edge_list=use_edge_list_output,
                     )
-                elif args.prompt_style == "payload":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if args.anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-
-                    prompt_text = format_prompt_payload_json(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        epsilon=0.02,
-                        anonymize=args.anonymize,   # <-- critical
-                        output_edge_list=use_edge_list_output,
-                    )
-                elif args.prompt_style == "payload_topk":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if args.anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
-
-                    prompt_text = format_prompt_payload_topk_json(
-                        variables_out,
-                        dataset_name=dataset_name,
-                        obs_rows_num=obs_rows_num,
-                        int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
-                        epsilon=0.02,
-                        decimals=4,
-                        top_k_effects=6,
-                        include_network_name=(not args.anonymize),
-                        output_edge_list=use_edge_list_output,
-                    )
-
                 else:
                     prompt_text = format_prompt_with_interventions(
                         variables_out, rows_text_source, vmap,
                         args.causal_rules, args.give_steps, include_def_int=include_def_int,
+                        require_think_answer_blocks=args.thinking_tags,
                         output_edge_list=use_edge_list_output,
                     )
                 

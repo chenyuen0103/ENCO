@@ -151,3 +151,5 @@ prompts/
 experiments/prompts*
 wandb/
 *.pid
+*.pth
+*.bin
