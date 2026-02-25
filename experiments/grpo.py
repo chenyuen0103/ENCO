@@ -20,6 +20,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
 from trl import GRPOConfig, GRPOTrainer
+try:
+    from torch.distributed.elastic.multiprocessing.errors import record as _elastic_record
+except Exception:
+    def _elastic_record(fn):
+        return fn
+
 from verifier_cd import (
     cd_format_reward,
     build_cd_graph_reward,
@@ -83,6 +89,39 @@ class CompactMetricsCallback(TrainerCallback):
             print("[train] " + " | ".join(parts))
 
 
+class JsonlMetricsCallback(TrainerCallback):
+    """Persist per-log training metrics as JSONL (one object per line)."""
+
+    def __init__(self, output_path: str):
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _to_jsonable(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return JsonlMetricsCallback._to_jsonable(value.item())
+            except Exception:
+                pass
+        return str(value)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = {
+            "global_step": int(state.global_step),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "time_unix": time.time(),
+        }
+        payload.update({k: self._to_jsonable(v) for k, v in logs.items()})
+
+        with self.output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+
+
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
     p.add_argument("--mode", type=str, default="train", choices=["train", "ab_eval"])
@@ -100,9 +139,27 @@ def build_argparser():
     p.add_argument("--output_dir", type=str, default="Qwen2-0.5B-GRPO-vLLM-server")
 
     # Prompt / generation
-    p.add_argument("--max_prompt_tokens", type=int, default=0)
-    p.add_argument("--max_completion_length", type=int, default=0)
+    p.add_argument("--max_prompt_tokens", type=int, default=2048)
+    p.add_argument("--max_completion_length", type=int, default=512)
     p.add_argument("--num_generations", type=int, default=4)
+    p.add_argument(
+        "--sample_completions_every",
+        type=int,
+        default=10,
+        help="Log sampled prompt/completion pairs every N reward calls (<=0 disables).",
+    )
+    p.add_argument(
+        "--sample_completions_k",
+        type=int,
+        default=2,
+        help="How many samples to print each completion log event.",
+    )
+    p.add_argument(
+        "--sample_completions_max_chars",
+        type=int,
+        default=320,
+        help="Max chars per logged prompt/completion sample.",
+    )
 
     # Train
     p.add_argument("--learning_rate", type=float, default=1e-5)
@@ -166,6 +223,17 @@ def build_argparser():
         action="store_true",
         help="Wrap causal prompt text using the generic system/user/assistant template.",
     )
+    p.add_argument("--cd-append-format-hint", dest="cd_append_format_hint", action="store_true")
+    p.add_argument("--no-cd-append-format-hint", dest="cd_append_format_hint", action="store_false")
+    p.set_defaults(cd_append_format_hint=True)
+    p.add_argument(
+        "--cd-format-hint-text",
+        type=str,
+        default=(
+            "Use exactly this structure: <think>...</think><answer>...</answer>. "
+            "Inside <answer>, output only the final graph answer."
+        ),
+    )
     p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
     p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
     p.add_argument("--cd-reward-require-dag", dest="cd_reward_require_dag", action="store_true")
@@ -220,6 +288,12 @@ def build_argparser():
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=50)
     p.add_argument("--dataloader_num_workers", type=int, default=4)
+    p.add_argument(
+        "--train_log_jsonl",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for per-step trainer logs (written by local rank 0 only).",
+    )
 
     # A/B eval (base vs GRPO on frozen set)
     p.add_argument("--ab_base_model", type=str, default="Qwen/Qwen2-0.5B-Instruct")
@@ -262,6 +336,39 @@ def _extract_answer_text(text: str) -> str:
     return m.group(1) if m else text
 
 
+def _sanitize_for_log(text: str, max_chars: int) -> str:
+    compact = " ".join(str(text).split())
+    if max_chars > 0 and len(compact) > max_chars:
+        return compact[:max_chars] + "...[truncated]"
+    return compact
+
+
+def _print_prompt_diagnostics(dataset: Dataset, *, split_name: str):
+    if "__prompt_orig_tokens" not in dataset.column_names:
+        return
+    total = len(dataset)
+    if total == 0:
+        print(f"[diag] {split_name}: empty dataset.")
+        return
+
+    orig = [int(x) for x in dataset["__prompt_orig_tokens"]]
+    after = [int(x) for x in dataset["__prompt_final_tokens"]]
+    truncated = [int(x) for x in dataset["__prompt_was_truncated"]]
+    has_tags = [int(x) for x in dataset["__prompt_has_format_tags"]]
+
+    trunc_count = sum(truncated)
+    trunc_ratio = trunc_count / total
+    fmt_ratio = sum(has_tags) / total
+    print(
+        "[diag] "
+        f"{split_name}: prompts={total} | "
+        f"orig_tokens(mean/min/max)={sum(orig)/total:.1f}/{min(orig)}/{max(orig)} | "
+        f"final_tokens(mean/min/max)={sum(after)/total:.1f}/{min(after)}/{max(after)} | "
+        f"truncated={trunc_count} ({trunc_ratio:.1%}) | "
+        f"prompts_with_<think>_<answer>={fmt_ratio:.1%}"
+    )
+
+
 def _require_math_verify():
     if not _HAS_MATH_VERIFY:
         raise RuntimeError(
@@ -289,7 +396,13 @@ def _resolve_existing_path(path_str: str, *, csv_path: Path) -> Path:
     )
 
 
-def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -> list[dict]:
+def _load_cd_rows_from_prompt_csv(
+    csv_path: Path,
+    *,
+    wrap_system_prompt: bool,
+    append_format_hint: bool = False,
+    format_hint_text: str = "",
+) -> list[dict]:
     rows: list[dict] = []
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -306,6 +419,11 @@ def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -
 
             if wrap_system_prompt:
                 prompt_text = build_prompt(prompt_text)
+            if append_format_hint and format_hint_text:
+                prompt_text = (
+                    f"{prompt_text}\n\n"
+                    f"Formatting requirement: {format_hint_text}"
+                )
 
             answer_raw = (row.get("answer") or "").strip()
             if not answer_raw:
@@ -327,13 +445,24 @@ def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -
     return rows
 
 
-def _dataset_from_cd_csvs(csv_paths: list[str], *, wrap_system_prompt: bool) -> Dataset:
+def _dataset_from_cd_csvs(
+    csv_paths: list[str],
+    *,
+    wrap_system_prompt: bool,
+    append_format_hint: bool = False,
+    format_hint_text: str = "",
+) -> Dataset:
     datasets_list = []
     for path_str in csv_paths:
         p = Path(path_str)
         if not p.exists():
             raise FileNotFoundError(f"--cd-train/test-csv file not found: {p}")
-        rows = _load_cd_rows_from_prompt_csv(p, wrap_system_prompt=wrap_system_prompt)
+        rows = _load_cd_rows_from_prompt_csv(
+            p,
+            wrap_system_prompt=wrap_system_prompt,
+            append_format_hint=append_format_hint,
+            format_hint_text=format_hint_text,
+        )
         if not rows:
             raise ValueError(f"No usable rows found in {p}")
         datasets_list.append(Dataset.from_list(rows))
@@ -550,6 +679,8 @@ def run_ab_eval(args):
         full_eval = _dataset_from_cd_csvs(
             eval_sources,
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            append_format_hint=bool(args.cd_append_format_hint),
+            format_hint_text=str(args.cd_format_hint_text),
         )
         n = min(args.ab_eval_n, len(full_eval))
         frozen_eval = full_eval.shuffle(seed=args.ab_eval_seed).select(range(n))
@@ -775,6 +906,12 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
 
 def run_train(args):
     args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
+    if args.max_prompt_tokens <= 0:
+        args.max_prompt_tokens = 2048
+        print("[warn] max_prompt_tokens <= 0; using safer default 2048.")
+    if args.max_completion_length <= 0:
+        args.max_completion_length = 512
+        print("[warn] max_completion_length <= 0; using safer default 512.")
 
     # Throughput-oriented defaults for Ampere/Hopper GPUs.
     if torch.cuda.is_available():
@@ -898,11 +1035,20 @@ def run_train(args):
 
         def add_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
             text = build_prompt(example["problem"])
+            orig_ids = tokenizer(text, truncation=False)["input_ids"]
             ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
-            return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
+            return {
+                "prompt": tokenizer.decode(ids, skip_special_tokens=True),
+                "__prompt_orig_tokens": len(orig_ids),
+                "__prompt_final_tokens": len(ids),
+                "__prompt_was_truncated": int(len(orig_ids) > len(ids)),
+                "__prompt_has_format_tags": int("<think>" in text and "<answer>" in text),
+            }
 
         train_dataset = train_dataset.map(add_prompt)
         test_dataset = test_dataset.map(add_prompt)
+        _print_prompt_diagnostics(train_dataset, split_name="train")
+        _print_prompt_diagnostics(test_dataset, split_name="test")
 
         # Keep only what GRPO + reward needs
         keep_cols = ["prompt", "solution"]
@@ -917,11 +1063,15 @@ def run_train(args):
         raw_train = _dataset_from_cd_csvs(
             args.cd_train_csv,
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            append_format_hint=bool(args.cd_append_format_hint),
+            format_hint_text=str(args.cd_format_hint_text),
         )
         if args.cd_test_csv:
             raw_test = _dataset_from_cd_csvs(
                 args.cd_test_csv,
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+                append_format_hint=bool(args.cd_append_format_hint),
+                format_hint_text=str(args.cd_format_hint_text),
             )
         else:
             split = raw_train.train_test_split(
@@ -940,11 +1090,20 @@ def run_train(args):
 
         def _truncate_cd_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
             text = str(example["prompt"])
+            orig_ids = tokenizer(text, truncation=False)["input_ids"]
             ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
-            return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
+            return {
+                "prompt": tokenizer.decode(ids, skip_special_tokens=True),
+                "__prompt_orig_tokens": len(orig_ids),
+                "__prompt_final_tokens": len(ids),
+                "__prompt_was_truncated": int(len(orig_ids) > len(ids)),
+                "__prompt_has_format_tags": int("<think>" in text and "<answer>" in text),
+            }
 
         train_dataset = raw_train.map(_truncate_cd_prompt)
         test_dataset = raw_test.map(_truncate_cd_prompt)
+        _print_prompt_diagnostics(train_dataset, split_name="train")
+        _print_prompt_diagnostics(test_dataset, split_name="test")
         keep_cols = ["prompt", "answer"]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
@@ -996,6 +1155,45 @@ def run_train(args):
         if args.task == "math"
         else [cd_format_reward, cd_graph_reward]
     )
+
+    completion_log_counter = {"calls": 0}
+
+    def _maybe_log_completion_samples(completions, **kwargs):
+        if args.sample_completions_every <= 0:
+            return
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if local_rank != 0:
+            return
+
+        completion_log_counter["calls"] += 1
+        if completion_log_counter["calls"] % int(args.sample_completions_every) != 0:
+            return
+
+        prompts = kwargs.get("prompt") or []
+        print(
+            f"[sample] reward_call={completion_log_counter['calls']} "
+            f"| batch={len(completions)} | showing={min(len(completions), args.sample_completions_k)}"
+        )
+        for i, completion in enumerate(completions[: max(int(args.sample_completions_k), 1)]):
+            completion_text = _completion_to_text(completion)
+            answer_text = _extract_answer_text(completion_text)
+            prompt_text = prompts[i] if i < len(prompts) else ""
+            format_ok = bool(FORMAT_RE.match(completion_text))
+            print(
+                f"[sample:{i}] format_ok={format_ok}\n"
+                f"  prompt={_sanitize_for_log(prompt_text, int(args.sample_completions_max_chars))}\n"
+                f"  completion={_sanitize_for_log(completion_text, int(args.sample_completions_max_chars))}\n"
+                f"  answer={_sanitize_for_log(answer_text, int(args.sample_completions_max_chars))}"
+            )
+
+    if reward_funcs:
+        first_reward = reward_funcs[0]
+
+        def _logged_first_reward(completions, **kwargs):
+            _maybe_log_completion_samples(completions, **kwargs)
+            return first_reward(completions, **kwargs)
+
+        reward_funcs = [_logged_first_reward, *reward_funcs[1:]]
 
     if args.length_penalty_coef < 0:
         raise ValueError("--length_penalty_coef must be >= 0")
@@ -1051,6 +1249,7 @@ def run_train(args):
 
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ddp_find_unused_parameters=False,
 
         bf16=torch.cuda.is_available(),
 
@@ -1073,13 +1272,18 @@ def run_train(args):
     )
 
     try:
+        callbacks = [CompactMetricsCallback()]
+        if args.train_log_jsonl:
+            callbacks.append(JsonlMetricsCallback(args.train_log_jsonl))
+            print(f"[train] JSONL logging enabled: {args.train_log_jsonl}")
+
         trainer = GRPOTrainer(
             model=model,
             processing_class=tokenizer,
             reward_funcs=reward_funcs,
             args=training_args,
             train_dataset=train_dataset,
-            callbacks=[CompactMetricsCallback()],
+            callbacks=callbacks,
         )
         trainer.remove_callback(PrinterCallback)
     except RuntimeError as e:
@@ -1108,6 +1312,7 @@ def run_train(args):
                     print(f"[warn] destroy_process_group failed: {e}")
 
 
+@_elastic_record
 def main():
     args = build_argparser().parse_args()
     _maybe_launch_local_vllm_and_reexec_train(args)
