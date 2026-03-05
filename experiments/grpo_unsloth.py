@@ -10,6 +10,7 @@ import subprocess
 import csv
 import io
 import inspect
+from typing import Any, Dict
 from contextlib import redirect_stdout, redirect_stderr
 import torch
 from pathlib import Path
@@ -23,6 +24,7 @@ from peft import LoraConfig, get_peft_model
 from trl import GRPOConfig, GRPOTrainer
 from verifier_cd import (
     cd_format_reward,
+    build_cd_partial_format_reward,
     build_cd_graph_reward,
     build_length_penalty_reward,
     completion_to_text as cd_completion_to_text,
@@ -66,6 +68,7 @@ class CompactMetricsCallback(TrainerCallback):
         ("loss", "loss"),
         ("reward", "reward"),
         ("rewards/accuracy_reward/mean", "acc"),
+        ("rewards/cd_partial_format_reward/mean", "pfmt"),
         ("rewards/cd_graph_reward/mean", "cd"),
         ("rewards/format_reward/mean", "fmt"),
         ("rewards/cd_format_reward/mean", "fmt"),
@@ -92,6 +95,39 @@ class CompactMetricsCallback(TrainerCallback):
             print("[train] " + " | ".join(parts))
 
 
+class JsonlMetricsCallback(TrainerCallback):
+    """Persist per-log training metrics as JSONL (one object per line)."""
+
+    def __init__(self, output_path: str):
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _to_jsonable(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return JsonlMetricsCallback._to_jsonable(value.item())
+            except Exception:
+                pass
+        return str(value)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = {
+            "global_step": int(state.global_step),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "time_unix": time.time(),
+        }
+        payload.update({k: self._to_jsonable(v) for k, v in logs.items()})
+
+        with self.output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+
+
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode (Unsloth-ready)")
     p.add_argument("--mode", type=str, default="train", choices=["train", "ab_eval"])
@@ -112,6 +148,15 @@ def build_argparser():
     p.add_argument("--max_prompt_tokens", type=int, default=0)
     p.add_argument("--max_completion_length", type=int, default=0)
     p.add_argument("--num_generations", type=int, default=4)
+    p.add_argument(
+        "--stop-sequence",
+        action="append",
+        default=None,
+        help=(
+            "Stop sequence for rollout generation (repeatable). "
+            "Default is </answer>. Use --stop-sequence '' to disable all stop sequences."
+        ),
+    )
 
     # Train
     p.add_argument("--learning_rate", type=float, default=1e-5)
@@ -226,8 +271,21 @@ def build_argparser():
         action="store_true",
         help="Wrap causal prompt text using the generic system/user/assistant template.",
     )
+    p.add_argument(
+        "--no-cd-wrap-system-prompt",
+        dest="cd_wrap_system_prompt",
+        action="store_false",
+        help="Disable wrapping causal prompt text using the generic system/user/assistant template.",
+    )
+    p.set_defaults(cd_wrap_system_prompt=True)
     p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
     p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
+    p.add_argument(
+        "--cd-partial-format-reward-scale",
+        type=float,
+        default=0.25,
+        help="Scale for dense partial-format shaping reward (0 disables).",
+    )
     p.add_argument("--cd-reward-require-dag", dest="cd_reward_require_dag", action="store_true")
     p.add_argument("--no-cd-reward-require-dag", dest="cd_reward_require_dag", action="store_false")
     p.set_defaults(cd_reward_require_dag=True)
@@ -279,7 +337,28 @@ def build_argparser():
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=50)
+    p.add_argument("--save_total_limit", type=int, default=1, help="Keep only the most recent N checkpoints.")
     p.add_argument("--dataloader_num_workers", type=int, default=4)
+    p.add_argument(
+        "--train_log_jsonl",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for per-step trainer logs (written by local rank 0 only).",
+    )
+    p.add_argument(
+        "--save-eval-responses",
+        dest="save_eval_responses",
+        action="store_true",
+        help="Persist every reward-evaluated completion to output_dir/grpo_log as JSONL.",
+    )
+    p.add_argument("--no-save-eval-responses", dest="save_eval_responses", action="store_false")
+    p.set_defaults(save_eval_responses=True)
+    p.add_argument(
+        "--eval-responses-max-chars",
+        type=int,
+        default=0,
+        help="Optional max chars for prompt/completion/answer fields in eval-response logs (0 = no truncation).",
+    )
 
     # A/B eval (base vs GRPO on frozen set)
     p.add_argument("--ab_base_model", type=str, default="Qwen/Qwen2-0.5B-Instruct")
@@ -306,7 +385,38 @@ def _filter_supported_kwargs(callable_obj, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in params}
 
 
-def build_prompt(problem: str) -> str:
+def build_prompt(problem: str, tokenizer: Any = None, enable_thinking: bool = True) -> str:
+    """
+    Build a chat-formatted prompt.
+    For Qwen3 tokenizers, use apply_chat_template(enable_thinking=...) when available.
+    Falls back to legacy plain-text format if chat templating is unavailable.
+    """
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": str(problem)},
+        ]
+        kwargs: Dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        try:
+            params = inspect.signature(tokenizer.apply_chat_template).parameters
+            if "enable_thinking" in params:
+                kwargs["enable_thinking"] = bool(enable_thinking)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return str(tokenizer.apply_chat_template(messages, **kwargs))
+        except TypeError:
+            # Older tokenizers may not accept some kwargs.
+            kwargs.pop("enable_thinking", None)
+            try:
+                return str(tokenizer.apply_chat_template(messages, **kwargs))
+            except Exception:
+                pass
+        except Exception:
+            pass
     return f"system\n{SYSTEM_PROMPT}\nuser\n{problem}\nassistant\n"
 
 
@@ -357,23 +467,34 @@ def _resolve_existing_path(path_str: str, *, csv_path: Path) -> Path:
     )
 
 
-def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -> list[dict]:
+def _load_cd_rows_from_prompt_csv(
+    csv_path: Path,
+    *,
+    wrap_system_prompt: bool,
+    tokenizer: Any = None,
+    enable_thinking: bool = True,
+) -> list[dict]:
     rows: list[dict] = []
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            prompt_text = (row.get("prompt_text") or "").strip()
-            if not prompt_text:
+            prompt_raw = (row.get("prompt_text") or "").strip()
+            if not prompt_raw:
                 prompt_path_raw = (row.get("prompt_path") or "").strip()
                 if not prompt_path_raw:
                     raise ValueError(
                         f"{csv_path}: row {i} missing both prompt_text and prompt_path."
                     )
                 prompt_path = _resolve_existing_path(prompt_path_raw, csv_path=csv_path)
-                prompt_text = prompt_path.read_text(encoding="utf-8", errors="ignore")
+                prompt_raw = prompt_path.read_text(encoding="utf-8", errors="ignore")
 
+            prompt_text = prompt_raw
             if wrap_system_prompt:
-                prompt_text = build_prompt(prompt_text)
+                prompt_text = build_prompt(
+                    prompt_text,
+                    tokenizer=tokenizer,
+                    enable_thinking=enable_thinking,
+                )
 
             answer_raw = (row.get("answer") or "").strip()
             if not answer_raw:
@@ -388,6 +509,7 @@ def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -
 
             rows.append(
                 {
+                    "prompt_raw": prompt_raw,
                     "prompt": prompt_text,
                     "answer": answer_raw,
                 }
@@ -395,13 +517,24 @@ def _load_cd_rows_from_prompt_csv(csv_path: Path, *, wrap_system_prompt: bool) -
     return rows
 
 
-def _dataset_from_cd_csvs(csv_paths: list[str], *, wrap_system_prompt: bool) -> Dataset:
+def _dataset_from_cd_csvs(
+    csv_paths: list[str],
+    *,
+    wrap_system_prompt: bool,
+    tokenizer: Any = None,
+    enable_thinking: bool = True,
+) -> Dataset:
     datasets_list = []
     for path_str in csv_paths:
         p = Path(path_str)
         if not p.exists():
             raise FileNotFoundError(f"--cd-train/test-csv file not found: {p}")
-        rows = _load_cd_rows_from_prompt_csv(p, wrap_system_prompt=wrap_system_prompt)
+        rows = _load_cd_rows_from_prompt_csv(
+            p,
+            wrap_system_prompt=wrap_system_prompt,
+            tokenizer=tokenizer,
+            enable_thinking=enable_thinking,
+        )
         if not rows:
             raise ValueError(f"No usable rows found in {p}")
         datasets_list.append(Dataset.from_list(rows))
@@ -508,7 +641,7 @@ def _eval_on_dataset(
 
     for idx, example in enumerate(eval_dataset):
         if task == "math":
-            prompt = build_prompt(example["problem"])
+            prompt = build_prompt(example["problem"], tokenizer=tokenizer, enable_thinking=True)
         else:
             prompt = str(example["prompt"])
         inputs = tokenizer(prompt, return_tensors="pt").to(input_device)
@@ -843,6 +976,15 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
 
 def run_train(args):
     args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
+    if args.max_prompt_tokens <= 0:
+        args.max_prompt_tokens = 2048
+        print("[warn] max_prompt_tokens <= 0; using safer default 2048.")
+    if args.max_completion_length <= 0:
+        args.max_completion_length = 512
+        print("[warn] max_completion_length <= 0; using safer default 512.")
+    if not args.stop_sequence:
+        args.stop_sequence = ["</answer>"]
+    args.stop_sequence = [s for s in args.stop_sequence if isinstance(s, str) and s]
 
     # Throughput-oriented defaults for Ampere/Hopper GPUs.
     if torch.cuda.is_available():
@@ -965,7 +1107,7 @@ def run_train(args):
         )
 
         def add_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
-            text = build_prompt(example["problem"])
+            text = build_prompt(example["problem"], tokenizer=tokenizer, enable_thinking=True)
             ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
             return {"prompt": tokenizer.decode(ids, skip_special_tokens=True)}
 
@@ -973,7 +1115,7 @@ def run_train(args):
         test_dataset = test_dataset.map(add_prompt)
 
         # Keep only what GRPO + reward needs
-        keep_cols = ["prompt", "solution"]
+        keep_cols = ["prompt", "prompt_raw", "solution"]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
     else:
@@ -985,11 +1127,15 @@ def run_train(args):
         raw_train = _dataset_from_cd_csvs(
             args.cd_train_csv,
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            tokenizer=tokenizer,
+            enable_thinking=True,
         )
         if args.cd_test_csv:
             raw_test = _dataset_from_cd_csvs(
                 args.cd_test_csv,
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+                tokenizer=tokenizer,
+                enable_thinking=True,
             )
         else:
             split = raw_train.train_test_split(
@@ -1013,7 +1159,7 @@ def run_train(args):
 
         train_dataset = raw_train.map(_truncate_cd_prompt)
         test_dataset = raw_test.map(_truncate_cd_prompt)
-        keep_cols = ["prompt", "answer"]
+        keep_cols = ["prompt", "prompt_raw", "answer"]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
 
@@ -1087,6 +1233,184 @@ def run_train(args):
         )
         model = get_peft_model(model, lora_config)
 
+    # ---- Reward logging
+    logs_dir = Path(args.output_dir) / "grpo_log"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        for p in logs_dir.glob("*.jsonl"):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        print(f"[log] cleared previous JSONL logs in {logs_dir}")
+    eval_response_log_path = logs_dir / f"reward_responses_rank{rank}.jsonl"
+    reward_call_counter = {"calls": 0}
+    generation_counter = {"calls": 0}
+    active_generation_id = {"id": -1}
+    pending_reward_rows = {}
+
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0 and args.save_eval_responses:
+        print(f"[log] saving reward-evaluated responses to {eval_response_log_path}")
+
+    def _truncate_text_for_log(text: str) -> str:
+        s = str(text)
+        max_chars = int(args.eval_responses_max_chars)
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "...[truncated]"
+        return s
+
+    def _value_at(values, idx: int):
+        if isinstance(values, (list, tuple)):
+            return values[idx] if idx < len(values) else None
+        return values
+
+    def _to_jsonable(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [_to_jsonable(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): _to_jsonable(v) for k, v in value.items()}
+        if hasattr(value, "item"):
+            try:
+                return _to_jsonable(value.item())
+            except Exception:
+                pass
+        return str(value)
+
+    def _normalize_prompt_item(item) -> str:
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            if "content" in item and isinstance(item.get("content"), str):
+                return str(item.get("content", ""))
+            if "prompt" in item and isinstance(item.get("prompt"), str):
+                return str(item.get("prompt", ""))
+            if "text" in item and isinstance(item.get("text"), str):
+                return str(item.get("text", ""))
+            try:
+                return json.dumps(item, ensure_ascii=False)
+            except Exception:
+                return str(item)
+        if isinstance(item, (list, tuple)):
+            if item and all(isinstance(x, dict) for x in item):
+                parts = []
+                for msg in item:
+                    role = str(msg.get("role", ""))
+                    content = str(msg.get("content", ""))
+                    if role:
+                        parts.append(f"{role}: {content}")
+                    else:
+                        parts.append(content)
+                return "\n".join(parts)
+            try:
+                return json.dumps(item, ensure_ascii=False)
+            except Exception:
+                return str(item)
+        return str(item)
+
+    def _extract_prompt_texts(kwargs: dict, batch_size: int):
+        candidate_keys = ("prompt", "prompts", "messages", "inputs", "input", "query", "queries", "text", "texts")
+        for key in candidate_keys:
+            value = kwargs.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                texts = [_normalize_prompt_item(v) for v in value]
+                if len(texts) == batch_size:
+                    return key, texts
+                if len(texts) == 1 and batch_size > 1:
+                    return key, texts * batch_size
+            else:
+                return key, [_normalize_prompt_item(value)] * batch_size
+        return "", [""] * batch_size
+
+    def _extract_raw_prompt_texts(kwargs: dict, batch_size: int):
+        value = kwargs.get("prompt_raw")
+        if value is None:
+            return "", [""] * batch_size
+        if isinstance(value, (list, tuple)):
+            texts = [_normalize_prompt_item(v) for v in value]
+            if len(texts) == batch_size:
+                return "prompt_raw", texts
+            if len(texts) == 1 and batch_size > 1:
+                return "prompt_raw", texts * batch_size
+            return "prompt_raw", [""] * batch_size
+        return "prompt_raw", [_normalize_prompt_item(value)] * batch_size
+
+    def _log_reward_evaluations(
+        generation_id: int,
+        reward_name: str,
+        completions,
+        rewards,
+        kwargs,
+        *,
+        flush: bool,
+    ):
+        if not args.save_eval_responses:
+            return
+
+        call_idx = reward_call_counter["calls"]
+        reward_call_counter["calls"] += 1
+        ts = time.time()
+        prompt_key, prompt_texts = _extract_prompt_texts(kwargs, len(completions))
+        _, prompt_raw_texts = _extract_raw_prompt_texts(kwargs, len(completions))
+        answers = kwargs.get("answer")
+        solutions = kwargs.get("solution")
+
+        for i, completion in enumerate(completions):
+            completion_text = _completion_to_text(completion)
+            answer_text = (
+                _extract_answer_text(completion_text)
+                if args.task == "math"
+                else cd_extract_answer_text(cd_completion_to_text(completion_text))
+            )
+            key = (generation_id, i)
+            row = pending_reward_rows.get(key)
+            if row is None:
+                row = {
+                    "time_unix": ts,
+                    "rank": rank,
+                    "generation_idx": generation_id,
+                    "last_reward_call_idx": call_idx,
+                    "sample_idx": i,
+                    "prompt_key": prompt_key,
+                    "format_ok": (
+                        int(bool(FORMAT_RE.match(completion_text)))
+                        if args.task == "math"
+                        else int(cd_format_ok(completion_text))
+                    ),
+                    "prompt": _truncate_text_for_log(
+                        (
+                            prompt_raw_texts[i]
+                            if i < len(prompt_raw_texts) and prompt_raw_texts[i]
+                            else (prompt_texts[i] if i < len(prompt_texts) else "")
+                        )
+                    ),
+                    "prompt_model_input": _truncate_text_for_log(prompt_texts[i] if i < len(prompt_texts) else ""),
+                    "completion": _truncate_text_for_log(completion_text),
+                    "answer_text": _truncate_text_for_log(answer_text),
+                    "target_answer": _truncate_text_for_log(_value_at(answers, i) or _value_at(solutions, i) or ""),
+                    "rewards": {},
+                }
+                pending_reward_rows[key] = row
+
+            row["time_unix"] = ts
+            row["last_reward_call_idx"] = call_idx
+            row["rewards"][reward_name] = float(_to_jsonable(_value_at(rewards, i)) or 0.0)
+
+        if flush and pending_reward_rows:
+            emit_keys = sorted(k for k in pending_reward_rows.keys() if k[0] == generation_id)
+            with eval_response_log_path.open("a", encoding="utf-8") as f:
+                for key in emit_keys:
+                    row = pending_reward_rows.pop(key)
+                    rewards_map = row.get("rewards", {})
+                    row["reward_total"] = float(sum(float(v) for v in rewards_map.values()))
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     # ---- Reward functions
     def format_reward_math(completions, **kwargs):
         texts = [_completion_to_text(c) for c in completions]
@@ -1106,11 +1430,11 @@ def run_train(args):
         dag_penalty=float(args.cd_reward_dag_penalty),
         shd_weight=float(args.cd_reward_shd_weight),
     )
-    reward_funcs = (
-        [format_reward_math, accuracy_reward_math]
-        if args.task == "math"
-        else [cd_format_reward, cd_graph_reward]
-    )
+    reward_funcs = [format_reward_math, accuracy_reward_math] if args.task == "math" else []
+    if args.task == "causal_discovery":
+        if float(args.cd_partial_format_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_partial_format_reward(scale=float(args.cd_partial_format_reward_scale)))
+        reward_funcs.extend([cd_format_reward, cd_graph_reward])
 
     if args.length_penalty_coef < 0:
         raise ValueError("--length_penalty_coef must be >= 0")
@@ -1125,6 +1449,39 @@ def run_train(args):
             max_abs=float(args.length_penalty_max_abs),
         )
         reward_funcs = [*reward_funcs, length_penalty_reward]
+
+    wrapped_reward_funcs = []
+
+    def _make_logged_reward(inner_fn, inner_name, is_first: bool, is_last: bool):
+        def _logged_reward(completions, **kwargs):
+            if is_first:
+                active_generation_id["id"] = generation_counter["calls"]
+                generation_counter["calls"] += 1
+            rewards = inner_fn(completions, **kwargs)
+            _log_reward_evaluations(
+                active_generation_id["id"],
+                inner_name,
+                completions,
+                rewards,
+                kwargs,
+                flush=is_last,
+            )
+            return rewards
+
+        _logged_reward.__name__ = inner_name
+        return _logged_reward
+
+    for idx, fn in enumerate(reward_funcs):
+        reward_name = getattr(fn, "__name__", fn.__class__.__name__)
+        wrapped_reward_funcs.append(
+            _make_logged_reward(
+                fn,
+                reward_name,
+                idx == 0,
+                idx == (len(reward_funcs) - 1),
+            )
+        )
+    reward_funcs = wrapped_reward_funcs
 
     # ---- GRPO config (TRL 0.28.0)
     report_to = ["wandb"] if args.report_to == "wandb" else "none"
@@ -1168,6 +1525,7 @@ def run_train(args):
         "bf16": torch.cuda.is_available(),
         "max_completion_length": args.max_completion_length,
         "num_generations": args.num_generations,
+        "generation_kwargs": {"stop": args.stop_sequence} if args.stop_sequence else None,
         "report_to": report_to,
         "run_name": args.run_name,
         "logging_steps": args.logging_steps,
@@ -1175,10 +1533,12 @@ def run_train(args):
         "dataloader_pin_memory": True,
         "save_strategy": "steps",
         "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
         "push_to_hub": False,
         "use_vllm": args.use_vllm,
         **grpo_kwargs,
     }
+    print(f"[train] generation stop sequences: {args.stop_sequence if args.stop_sequence else 'none'}")
     if args.grpo_loss_type != "auto":
         config_kwargs["loss_type"] = args.grpo_loss_type
     if args.grpo_importance_sampling_level != "auto":
@@ -1186,13 +1546,23 @@ def run_train(args):
     training_args = GRPOConfig(**_filter_supported_kwargs(GRPOConfig.__init__, config_kwargs))
 
     try:
+        callbacks = [CompactMetricsCallback()]
+        metrics_jsonl_path = (
+            Path(args.train_log_jsonl)
+            if args.train_log_jsonl
+            else (logs_dir / "train_metrics.jsonl")
+        )
+        metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
+        print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
+
         trainer = GRPOTrainer(
             model=model,
             processing_class=tokenizer,
             reward_funcs=reward_funcs,
             args=training_args,
             train_dataset=train_dataset,
-            callbacks=[CompactMetricsCallback()],
+            callbacks=callbacks,
         )
         trainer.remove_callback(PrinterCallback)
     except RuntimeError as e:

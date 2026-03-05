@@ -37,6 +37,72 @@ def cd_format_reward(completions, **kwargs):
     return [1.0 if format_ok(t) else 0.0 for t in texts]
 
 
+def build_cd_partial_format_reward(scale: float = 0.25):
+    """
+    Dense shaping reward for causal-discovery formatting progress.
+    Gives partial credit for structural progress even when strict format fails.
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def cd_partial_format_reward(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        rewards: List[float] = []
+        s = float(scale)
+
+        for i, completion in enumerate(completions):
+            text = completion_to_text(completion)
+            t = text or ""
+
+            # infer expected matrix size from target answer when possible
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+            target_adj = _cached_target(target_raw)
+            expected_n = len(target_adj) if target_adj is not None else None
+
+            base = 0.0
+            if "<answer>" in t:
+                base += 0.2
+            if "</answer>" in t:
+                base += 0.2
+            if "<think>" in t and "</think>" in t:
+                base += 0.1
+            if "adjacency_matrix" in t:
+                base += 0.1
+
+            # parse in answer block first, then full text fallback
+            ans_text = extract_answer_text(t)
+            parsed = extract_adjacency_matrix(ans_text, expected_n=expected_n)
+            if parsed is None:
+                parsed = extract_adjacency_matrix(t, expected_n=expected_n)
+
+            if parsed is not None:
+                base += 0.4
+
+            # keep shaping in [0, scale]
+            base = max(0.0, min(1.0, float(base)))
+            rewards.append(float(s * base))
+
+        return rewards
+
+    cd_partial_format_reward.__name__ = "cd_partial_format_reward"
+    return cd_partial_format_reward
+
+
 def _normalize_matrix(mat: Any, expected_n: Optional[int] = None) -> Optional[List[List[int]]]:
     if not isinstance(mat, list) or not mat:
         return None

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, sys, csv, time, json, argparse, tempfile, traceback
+import inspect
 from pathlib import Path
 from typing import Optional, Dict, Any
 from tqdm import tqdm
@@ -539,9 +540,44 @@ def build_hf_pipeline(
         ) from e
 
 
+def _prepare_hf_prompt(tokenizer: Any, prompt: str) -> str:
+    """
+    Apply model-native chat template when available.
+    For Qwen3 tokenizers, enable_thinking=True if supported.
+    Falls back to the raw prompt string for non-chat tokenizers.
+    """
+    text = str(prompt)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return text
+
+    messages = [{"role": "user", "content": text}]
+    kwargs: Dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        params = inspect.signature(tokenizer.apply_chat_template).parameters
+        if "enable_thinking" in params:
+            kwargs["enable_thinking"] = True
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return str(tokenizer.apply_chat_template(messages, **kwargs))
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        try:
+            return str(tokenizer.apply_chat_template(messages, **kwargs))
+        except Exception:
+            return text
+    except Exception:
+        return text
+
+
 def call_hf_textgen(pipe, prompt: str, *, temperature: float = 0.0, max_new_tokens: Optional[int] = None) -> str:
     """Generate text using a HF text-generation pipeline."""
     try:
+        prompt = _prepare_hf_prompt(getattr(pipe, "tokenizer", None), prompt)
         do_sample = temperature and temperature > 0.0
         gen_kwargs: Dict[str, Any] = {
             "do_sample": bool(do_sample),
@@ -568,6 +604,8 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
     Returns a list of strings (one per prompt).
     """
     try:
+        tok = getattr(pipe, "tokenizer", None)
+        prompts = [_prepare_hf_prompt(tok, p) for p in prompts]
         do_sample = temperature and temperature > 0.0
 
         gen_kwargs: Dict[str, Any] = {
@@ -622,7 +660,7 @@ def _format_ok(text: str) -> int:
     return int(bool(FORMAT_RE.match(text or "")))
 
 
-def _truncation_suspected(text: str, *, output_tokens: int, max_new_tokens_hint: int | None) -> int:
+def _truncation_suspected(text: str, *, output_tokens: int, max_new_tokens_hint: Optional[int]) -> int:
     t = text or ""
     missing_close_tags = (
         ("<think>" in t and "</think>" not in t)

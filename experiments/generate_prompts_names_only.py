@@ -57,6 +57,38 @@ def load_graph_file(filename: str) -> SimpleNamespace:
     return _load_graph_file_light(filename)
 
 
+def _build_output_contract_lines(
+    *,
+    output_edge_list: bool,
+    require_think_answer_blocks: bool = False,
+) -> List[str]:
+    """Shared output contract for consistent format instructions."""
+    if output_edge_list:
+        json_key = "edges"
+        json_field_desc = '- "edges": [["source","target"], ...] using exact variable names.'
+    else:
+        json_key = "adjacency_matrix"
+        json_field_desc = '- "adjacency_matrix": N x N 0/1 matrix in declared variable order.'
+
+    if require_think_answer_blocks:
+        return [
+            "Output exactly: <think>...</think><answer>...</answer>.",
+            "Keep <think> concise (minimal necessary reasoning only).",
+            f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
+            json_field_desc,
+            "No extra text before, between, or after the two blocks.",
+            'The JSON in <answer> must start with "{" and end with "}".',
+        ]
+
+    return [
+        "Output exactly one JSON object and nothing else.",
+        f'The object must contain exactly one key: "{json_key}".',
+        json_field_desc,
+        "No explanation, markdown, or extra text.",
+        'First char must be "{", last char must be "}".',
+    ]
+
+
 # # ------------------------ Utility: variable names ------------------------ #
 
 
@@ -546,6 +578,7 @@ def format_names_only_prompt(
     dataset_name: str,
     include_causal_rules: bool = False,
     output_edge_list: bool = False,
+    require_think_answer_blocks: bool = False,
 ) -> str:
     lines = []
     lines.append("You are a highly intelligent causal discovery expert.")
@@ -557,19 +590,17 @@ def format_names_only_prompt(
     lines.append(f"The variables in the system are: {', '.join(variables)}")
     
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.append('Respond with a single valid JSON object and nothing else.')
-    if output_edge_list:
-        lines.append('The object must have exactly one key: "edges".')
-        lines.append('- "edges": a list of directed edges as ["source","target"], using EXACT names from the VARIABLES section above.')
-    else:
-        lines.append('The object must have exactly one key: "adjacency_matrix".')
-        lines.append('- "adjacency_matrix": an N x N list of lists of 0/1 integers in the VARIABLES order shown above.')
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
     
     if include_causal_rules:
         lines.append("\n--- REMINDER ---")
         lines.append("Recall that X->Y implies a causal mechanism where manipulating X changes Y.")
 
-    lines.append("\nOutput the JSON now.")
     return "\n".join(lines)
 
 
@@ -581,6 +612,7 @@ def iter_names_only_prompts_in_memory(
     col_order: str,
     anonymize: bool,
     causal_rules: bool,
+    thinking_tags: bool = True,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate names-only prompts in-memory.
@@ -643,7 +675,11 @@ def iter_names_only_prompts_in_memory(
 
     dataset_name = os.path.splitext(os.path.basename(bif_file))[0]
     prompt_text = format_names_only_prompt(
-        variables_out, dataset_name, causal_rules, output_edge_list=use_edge_list_output
+        variables_out,
+        dataset_name,
+        causal_rules,
+        output_edge_list=use_edge_list_output,
+        require_think_answer_blocks=thinking_tags,
     )
 
     def _iter() -> Iterator[dict[str, Any]]:
@@ -670,6 +706,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--anonymize", action="store_true")
     ap.add_argument("--causal-rules", action="store_true")
+    ap.add_argument(
+        "--thinking-tags",
+        action="store_true",
+        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+    )
     
     # --- Dummy Arguments (Accepted to ignore) ---
     # These are passed by the orchestrator but irrelevant for names-only
@@ -766,7 +807,11 @@ def main():
     # 5. Generate Prompts (Since there's no data, the prompt is identical for all 'replicates')
     dataset_name = os.path.splitext(os.path.basename(args.bif_file))[0]
     prompt_text = format_names_only_prompt(
-        variables_out, dataset_name, args.causal_rules, output_edge_list=use_edge_list_output
+        variables_out,
+        dataset_name,
+        args.causal_rules,
+        output_edge_list=use_edge_list_output,
+        require_think_answer_blocks=args.thinking_tags,
     )
     
     print(f"Generating 'Names Only' prompts into {out_dir}...")

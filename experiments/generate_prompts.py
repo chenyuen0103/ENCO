@@ -33,41 +33,31 @@ def _load_graph_file(path: str):  # type: ignore
 def _build_output_contract_lines(
     *,
     output_edge_list: bool,
-    require_think_answer_blocks: bool = False,
+    require_think_answer_blocks: bool = True,
 ) -> List[str]:
-    """
-    Shared output contract to avoid contradictory instructions across prompt styles.
-    """
     if output_edge_list:
         json_key = "edges"
-        json_field_desc = (
-            '- "edges": a list of directed edges as ["source","target"], '
-            "using EXACT variable names from the prompt."
-        )
+        json_field_desc = '- "edges": [["source","target"], ...] using exact variable names.'
     else:
         json_key = "adjacency_matrix"
-        json_field_desc = (
-            '- "adjacency_matrix": an N x N list of lists of 0/1 integers in the declared variable order, '
-            "where [i][j] = 1 iff variables[i] -> variables[j], else 0."
-        )
+        json_field_desc = '- "adjacency_matrix": N x N 0/1 matrix in declared variable order.'
 
     if require_think_answer_blocks:
         return [
-            "Respond using exactly two XML-style blocks and nothing else.",
-            "First block: <think>...</think> for reasoning.",
-            "Second block: <answer>...</answer> containing exactly one valid JSON object.",
-            f'The JSON object inside <answer> must have exactly one key: "{json_key}".',
+            "Output exactly: <think>...</think><answer>...</answer>.",
+            "Keep <think> concise (minimal necessary reasoning only).",
+            f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
             json_field_desc,
-            "Do not include any text before <think>, between </think> and <answer>, or after </answer>.",
-            'The JSON object inside <answer> must start with "{" and end with "}".',
+            "No extra text before, between, or after the two blocks.",
+            'The JSON in <answer> must start with "{" and end with "}".',
         ]
 
     return [
-        "Respond with a single valid JSON object and nothing else.",
-        f'The object must have exactly one key: "{json_key}".',
+        "Output exactly one JSON object and nothing else.",
+        f'The object must contain exactly one key: "{json_key}".',
         json_field_desc,
-        'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-        'Your first character MUST be "{" and your last character MUST be "}".',
+        "No explanation, markdown, or extra text.",
+        'First char must be "{", last char must be "}".',
     ]
 
 
@@ -189,7 +179,7 @@ def iter_prompts_in_memory(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
-    thinking_tags: bool = False,
+    thinking_tags: bool = True,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate prompts in-memory (no prompt files, no prompt CSV).
@@ -707,7 +697,7 @@ def format_prompt_payload_json(
         )
     ) + "\n"
 
-    return method_block + "\n" + out_contract + "\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+    return method_block + "\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False) + "\n\n" + out_contract
 
 
 def format_prompt_payload_topk_json(
@@ -863,179 +853,11 @@ def format_prompt_payload_topk_json(
 
     return (
         method_block
-        + "\n"
-        + out_contract
         + "\nINPUT JSON:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
+        + out_contract
     )
-
-# def format_prompt_cb_matrix(
-#     variables: List[str],
-#     all_rows: List[Dict[str, Any]],
-#     dataset_name: str,
-#     include_causal_rules: bool = False,
-#     include_give_steps: bool = False,
-#     given_edges: Optional[List[Tuple[str, str]]] = None,
-#     include_def_int: bool = False,
-# ) -> str:
-#     """
-#     CausalBench-style prompt: variable names + training data matrix.
-
-#     - Variables are given as a header row: v1 | v2 | ... | vN
-#     - Observational samples are in a single matrix block.
-#     - Interventional samples are grouped by (variable, value) and
-#       shown as separate matrix blocks, with do(X = v) in the
-#       descriptive text (NOT in the column names).
-#     - We still ask for a JSON adjacency_matrix, so it's comparable to
-#       our other prompts.
-
-#     all_rows: list of dicts, each like
-#         {
-#             "intervened_variable": "Observational" or var_name,
-#             "intervened_value": None or value,
-#             v1: val1,
-#             v2: val2,
-#             ...
-#         }
-#     """
-
-#     # ---------- split into observational vs interventional ----------
-#     obs_rows: List[Dict[str, Any]] = []
-#     int_buckets: Dict[Tuple[str, Any], List[Dict[str, Any]]] = {}
-
-#     for row in all_rows:
-#         ivar = row.get("intervened_variable", "Observational")
-#         ival = row.get("intervened_value", None)
-#         if ivar == "Observational" or ivar is None:
-#             obs_rows.append(row)
-#         else:
-#             key = (ivar, ival)
-#             int_buckets.setdefault(key, []).append(row)
-
-#     lines: List[str] = []
-
-#     # --- High-level task description (CausalBench-style) ---
-#     lines.append(
-#         "You are a highly intelligent question-answering bot with profound "
-#         "knowledge of causal inference and causal discovery."
-#     )
-#     lines.append(
-#         f"The following matrices are training data sampled from a Bayesian "
-#         f"network named {dataset_name}. Columns denote variables and rows denote observed cases."
-#     )
-#     lines.append(
-#         "From these data, infer the directed causal graph over the variables."
-#     )
-
-#     # --- OUTPUT INSTRUCTIONS (same JSON spec as before) ---
-#     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-#     if not include_give_steps:
-#         lines.extend([
-#             'Respond with a single valid JSON object and nothing else.',
-#             'The object must have exactly two keys: "variables" and "adjacency_matrix".',
-#             '- "variables": the ordered list of variable names given in the VARIABLE ORDER section below.',
-#             '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
-#             'iff there is a directed edge from variables[i] to variables[j], else 0.',
-#             'Any text, explanation, or markdown outside this JSON object makes the answer invalid.',
-#             'Your first character MUST be "{" and your last character MUST be "}".',
-#         ])
-#     else:
-#         lines.extend([
-#             'You may optionally include a brief explanation first.',
-#             'At the end, you MUST output a single JSON object with exactly two keys: "variables" and "adjacency_matrix".',
-#             '- "variables": the ordered list of variable names given in the VARIABLE ORDER section below.',
-#             '- "adjacency_matrix": an N x N list of lists of 0/1 integers, where [i][j] = 1 '
-#             'iff there is a directed edge from variables[i] to variables[j], else 0.',
-#             'The JSON must be syntactically valid (starts with "{" and ends with "}"), '
-#             'must appear on its own line at the end of your answer, and nothing may follow it.',
-#         ])
-
-#     # --- Optional causal reminders ---
-#     if include_causal_rules:
-#         lines.extend([
-#             "\n--- CAUSAL INFERENCE REMINDERS ---",
-#             "- Confounder: a variable that causes two others.",
-#             "- Mediator: lies on a path X -> M -> Y.",
-#             "- Collider: a common effect of two variables; avoid conditioning on colliders.",
-#             "- Use (conditional) independencies in the data to constrain the DAG.",
-#             "- The final output must be a DAG (no directed cycles).",
-#         ])
-
-#     if include_def_int:
-#         lines.extend([
-#             "\n--- INTERVENTION NOTES ---",
-#             "- An intervention do(X = v) sets X externally and replaces its usual causal mechanism.",
-#             "- In the intervened causal graph, all incoming edges into X are removed.",
-#             "- Only descendants of X can be causally affected by this intervention; non-descendants are not causally affected (though statistical associations may remain).",
-#         ])
-
-#     # --- Known edges (optional) ---
-#     if given_edges:
-#         lines.append("\n--- KNOWN DIRECT CAUSAL EDGES ---")
-#         lines.append("The following directed causal edges are guaranteed to be present in the true graph:")
-#         for src, dst in given_edges:
-#             lines.append(f"- {src} -> {dst}")
-#         lines.append(
-#             "In your adjacency_matrix output, the entry [i][j] MUST be 1 whenever "
-#             "variables[i] = src and variables[j] = dst for one of these edges."
-#         )
-
-#     # --- Variable order (for adjacency_matrix and matrices) ---
-#     # lines.append("\n--- VARIABLE ORDER (columns of every matrix) ---")
-#     # for i, v in enumerate(variables):
-#     #     lines.append(f"{i}: {v}")
-
-#     # Common header row
-#     header = " | ".join(variables)
-
-#     # --- Observational matrix ---
-#     if obs_rows:
-#         lines.append("\n--- TRAINING DATA MATRIX (observational samples) ---")
-#         lines.append(
-#             "Each row is one observed case without intervention."
-#         )
-#         lines.append(header)
-#         for row in obs_rows:
-#             vals = [str(row[v]) for v in variables]
-#             lines.append(" | ".join(vals))
-
-#     # --- Interventional matrices (grouped by do(X = value)) ---
-#     if int_buckets:
-#         lines.append("\n--- TRAINING DATA MATRICES (interventional samples) ---")
-#         lines.append(
-#             "Each block below corresponds to samples collected under a specific intervention do(X = value)."
-#         )
-
-#         # deterministic order for reproducibility
-#         for (ivar, ival) in sorted(int_buckets.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
-#             rows = int_buckets[(ivar, ival)]
-#             lines.append(
-#                 f"\n[Intervention: do({ivar} = {ival})]"
-#             )
-#             lines.append(
-#                 "Columns follow the VARIABLE ORDER above. Each row is one observed case under this intervention."
-#             )
-#             lines.append(header)
-#             for row in rows:
-#                 vals = [str(row[v]) for v in variables]
-#                 lines.append(" | ".join(vals))
-
-#     lines.append("\n--- END OF DATA ---")
-
-#     # Optional internal reasoning hints
-#     if include_give_steps:
-#         lines.extend([
-#             "\n(You may follow these steps silently.)",
-#             "1) Use patterns of dependence/independence between columns in the observational matrix.",
-#             "2) Use differences between observational and interventional blocks do(X = value) "
-#             "to orient edges and distinguish causes from effects.",
-#             "3) Choose a directed acyclic graph consistent with all these constraints.",
-#             "Then output the JSON as specified above.",
-#         ])
-#     else:
-#         lines.append("\nBased on all of these data (observational and interventional), output the required JSON.")
-
-#     return "\n".join(lines)
 
 
 def format_prompt_cb_matrix(
@@ -1087,15 +909,6 @@ def format_prompt_cb_matrix(
     lines.append("- The true graph is a DAG (no directed cycles).")
     lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
     lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
-
-    # --- Output contract ---
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
 
     # --- Optional causal reminders ---
     if include_causal_rules:
@@ -1172,6 +985,15 @@ def format_prompt_cb_matrix(
             "3) Use observational data only to suggest adjacency (avoid overfitting); interventions decide directions when possible.",
             "4) Choose the sparsest DAG consistent with all blocks and known edges.",
         ])
+
+    # Put strict formatting constraints at the very end for stronger adherence.
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     return "\n".join(lines)
 
@@ -1269,14 +1091,6 @@ def format_prompt_summary_stats(
     )
     lines.append("Infer the directed causal graph over the variables.")
 
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
-
     if include_causal_rules:
         lines.extend([
             "\n--- CAUSAL INFERENCE REMINDERS ---",
@@ -1349,6 +1163,14 @@ def format_prompt_summary_stats(
             "2) Choose a directed acyclic graph consistent with the constraints.",
             "Then output the JSON as specified above.",
         ])
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     return "\n".join(lines)
 
@@ -1541,14 +1363,6 @@ def format_prompt_summary_probs(
     )
     lines.append("Infer the directed causal graph over the variables.")
 
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
-
     if include_causal_rules:
         lines.extend([
             "\n--- CAUSAL INFERENCE REMINDERS ---",
@@ -1656,6 +1470,14 @@ def format_prompt_summary_probs(
             "2) Choose a directed acyclic graph consistent with the constraints.",
             "Then output the JSON as specified above.",
         ])
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
 
     return "\n".join(lines)
 
@@ -1879,15 +1701,6 @@ def format_prompt_summary_full_joint(
         lines.append(f"The following are empirical distributions computed from data sampled from a Bayesian network named {dataset_name}.")
     lines.append("Infer the directed causal graph over the variables.")
 
-    lines.append("\n--- OUTPUT ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
-    lines.append("Must be a DAG (acyclic).")
-
     if include_causal_rules:
         lines.extend([
             "\n--- REMINDERS ---",
@@ -1978,6 +1791,15 @@ def format_prompt_summary_full_joint(
         lines.append("1) Use interventional shifts to identify descendants/orient edges; use joint patterns for colliders.")
         lines.append("2) Output a DAG as JSON.")
 
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
+    lines.append("Must be a DAG (acyclic).")
+
     lines.append("\n--- END ---")
     return "\n".join(lines)
 
@@ -2029,15 +1851,6 @@ def format_prompt_with_interventions(
     lines.append(
         "You are a causal discovery assistant. From the data below, infer a directed causal graph "
         "over the given variables."
-    )
-
-    # ---------- OUTPUT INSTRUCTIONS ----------
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
     )
 
     # ---------- Optional causal reminders ----------
@@ -2134,6 +1947,14 @@ def format_prompt_with_interventions(
         else:
             lines.append("\nOutput the required JSON.")
 
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.extend(
+        _build_output_contract_lines(
+            output_edge_list=output_edge_list,
+            require_think_answer_blocks=require_think_answer_blocks,
+        )
+    )
+
     return "\n".join(lines)
 
 
@@ -2208,6 +2029,13 @@ def main():
         action="store_true",
         help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
     )
+    ap.add_argument(
+        "--no-thinking-tags",
+        dest="thinking_tags",
+        action="store_false",
+        help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
+    )
+    ap.set_defaults(thinking_tags=True)
     ap.add_argument("--def-int", action="store_true", help="Include a brief definition of interventions when interventional data are present.")
     ap.add_argument("--shuffles-per-graph", type=int, default=1)
     ap.add_argument("--given-edge-frac", type=float, default=0.0)

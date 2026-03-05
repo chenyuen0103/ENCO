@@ -153,3 +153,4 @@ wandb/
 *.pid
 *.pth
 *.bin
+unsloth_compiled_cache/*
