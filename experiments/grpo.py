@@ -191,8 +191,7 @@ def build_argparser():
         type=int,
         default=0,
         help=(
-            "Free completion-token budget before penalty applies. "
-            "Only tokens above this threshold are penalized."
+            "Deprecated/ignored. Length penalty now regularizes total completion length."
         ),
     )
     p.add_argument(
@@ -1450,6 +1449,11 @@ def run_train(args):
         raise ValueError("--length_penalty_coef must be >= 0")
     if args.length_penalty_target_tokens < 0:
         raise ValueError("--length_penalty_target_tokens must be >= 0")
+    if args.length_penalty_target_tokens != 0:
+        print(
+            "[warn] --length_penalty_target_tokens is ignored; "
+            "length penalty now applies to total completion length."
+        )
 
     if args.length_penalty_coef > 0.0:
         length_penalty_reward = build_length_penalty_reward(

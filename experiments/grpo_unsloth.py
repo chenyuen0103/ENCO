@@ -17,6 +17,14 @@ from pathlib import Path
 from urllib import request, error
 from urllib.parse import urlparse
 
+try:
+    from unsloth import FastLanguageModel, PatchFastRL
+    _HAS_UNSLOTH = True
+except Exception:
+    FastLanguageModel = None
+    PatchFastRL = None
+    _HAS_UNSLOTH = False
+
 from datasets import Dataset, concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.trainer_callback import PrinterCallback
@@ -41,14 +49,6 @@ except Exception:
     parse = None
     verify = None
     _HAS_MATH_VERIFY = False
-
-try:
-    from unsloth import FastLanguageModel, PatchFastRL
-    _HAS_UNSLOTH = True
-except Exception:
-    FastLanguageModel = None
-    PatchFastRL = None
-    _HAS_UNSLOTH = False
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
@@ -228,8 +228,7 @@ def build_argparser():
         type=int,
         default=0,
         help=(
-            "Free completion-token budget before penalty applies. "
-            "Only tokens above this threshold are penalized."
+            "Deprecated/ignored. Length penalty now regularizes total completion length."
         ),
     )
     p.add_argument(
@@ -1440,6 +1439,11 @@ def run_train(args):
         raise ValueError("--length_penalty_coef must be >= 0")
     if args.length_penalty_target_tokens < 0:
         raise ValueError("--length_penalty_target_tokens must be >= 0")
+    if args.length_penalty_target_tokens != 0:
+        print(
+            "[warn] --length_penalty_target_tokens is ignored; "
+            "length penalty now applies to total completion length."
+        )
 
     if args.length_penalty_coef > 0.0:
         length_penalty_reward = build_length_penalty_reward(
@@ -1522,6 +1526,8 @@ def run_train(args):
         "num_train_epochs": args.num_train_epochs,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        # Avoid DDP autograd hook conflicts with checkpointed LoRA paths.
+        "ddp_find_unused_parameters": False,
         "bf16": torch.cuda.is_available(),
         "max_completion_length": args.max_completion_length,
         "num_generations": args.num_generations,
