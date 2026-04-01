@@ -251,6 +251,10 @@ def run_grpo(
     cmd.extend(extra_args)
     print("[run]", " ".join(cmd))
     env = os.environ.copy()
+    # Unsloth GRPO can hit TorchDynamo fake-tensor shape failures in some stacks.
+    # Default to eager mode unless the caller explicitly overrides it.
+    env.setdefault("TORCHDYNAMO_DISABLE", "1")
+    print(f"[run] TORCHDYNAMO_DISABLE={env.get('TORCHDYNAMO_DISABLE')}")
     subprocess.run(cmd, env=env, check=True)
 
 

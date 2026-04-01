@@ -12,18 +12,34 @@ import io
 import inspect
 from typing import Any, Dict
 from contextlib import redirect_stdout, redirect_stderr
+
+# Unsloth GRPO can fail in TorchDynamo fake-tensor tracing on some stacks.
+# Default to eager mode unless user explicitly overrides the env var.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 import torch
 from pathlib import Path
 from urllib import request, error
 from urllib.parse import urlparse
 
+FastLanguageModel = None
+PatchFastRL = None
+_HAS_UNSLOTH = False
+_UNSLOTH_IMPORT_ERROR = None
+
 try:
-    from unsloth import FastLanguageModel, PatchFastRL
+    # Import Unsloth before TRL/Transformers/PEFT when available.
+    import unsloth  # noqa: F401
+    from unsloth import FastLanguageModel
     _HAS_UNSLOTH = True
+except Exception as e:
+    _UNSLOTH_IMPORT_ERROR = e
+
+try:
+    # Optional in some Unsloth versions.
+    from unsloth import PatchFastRL
 except Exception:
-    FastLanguageModel = None
     PatchFastRL = None
-    _HAS_UNSLOTH = False
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
@@ -1169,8 +1185,10 @@ def run_train(args):
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if args.use_unsloth:
         if not _HAS_UNSLOTH:
+            detail = f" Import error: {_UNSLOTH_IMPORT_ERROR}" if _UNSLOTH_IMPORT_ERROR is not None else ""
             raise RuntimeError(
-                "--use-unsloth was requested, but unsloth is not installed in this environment."
+                "--use-unsloth was requested, but unsloth is not available in this environment."
+                + detail
             )
 
         if PatchFastRL is not None:
@@ -1231,6 +1249,18 @@ def run_train(args):
             target_modules=["q_proj", "v_proj"],
         )
         model = get_peft_model(model, lora_config)
+
+    # Some compiled Unsloth trainer variants call model.for_training()/for_inference().
+    if not hasattr(model, "for_training"):
+        def _for_training(*args, **kwargs):
+            model.train()
+            return model
+        setattr(model, "for_training", _for_training)
+    if not hasattr(model, "for_inference"):
+        def _for_inference(*args, **kwargs):
+            model.eval()
+            return model
+        setattr(model, "for_inference", _for_inference)
 
     # ---- Reward logging
     logs_dir = Path(args.output_dir) / "grpo_log"
