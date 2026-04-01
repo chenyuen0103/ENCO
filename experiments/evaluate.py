@@ -527,6 +527,20 @@ def extract_answer_text(text: str) -> str:
     return m.group(1) if m else (text or "")
 
 
+def extract_adjacency_from_response(
+    text: str,
+    *,
+    fallback_variables: Optional[List[str]] = None,
+) -> Optional[np.ndarray]:
+    answer_text = extract_answer_text(text)
+    mat = extract_adjacency_matrix(answer_text, fallback_variables=fallback_variables)
+    if mat is not None:
+        return mat
+    if answer_text != (text or ""):
+        return extract_adjacency_matrix(text, fallback_variables=fallback_variables)
+    return None
+
+
 def is_format_ok(text: str) -> int:
     return int(bool(FORMAT_RE.match(text or "")))
 
@@ -752,8 +766,20 @@ def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
     m = _RESP_META_RE.match(stem)
     model = ""
     try:
-        # Most response CSVs end with ..._<model>.csv, e.g. "..._gpt-5-mini.csv"
-        model = stem.split("_")[-1]
+        # Names-only: responses_names_only_p5_<model>
+        m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+        if m_names:
+            model = m_names.group("model")
+        else:
+            # Regular prompts: responses_obs..._thinktags_<style>_<model>
+            m_resp = re.match(
+                r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
+                r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            if m_resp:
+                model = m_resp.group("model")
     except Exception:
         model = ""
 
@@ -857,7 +883,7 @@ def main():
             row["format_ok"] = is_format_ok(raw)
             ans_s = row.get(answer_col, "") or ""
             _A_true_for_vars, vars_for_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
-            mat = extract_adjacency_matrix(extract_answer_text(raw), fallback_variables=vars_for_this)
+            mat = extract_adjacency_from_response(raw, fallback_variables=vars_for_this)
             if mat is not None:
                 row[args.pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
                 row["valid"] = 1
@@ -885,6 +911,7 @@ def main():
     orient_acc_list: List[Optional[float]] = []
 
     valid_rows = 0
+    shape_mismatch_rows = 0
     pred_edges_list: List[int] = []
     format_ok_rows = 0
     format_scored_rows = 0
@@ -914,6 +941,13 @@ def main():
 
         if variables_first is None and vars_from_this is not None:
             variables_first = vars_from_this
+
+        if A_true is not None and A_pred is not None and A_true.shape != A_pred.shape:
+            # Treat wrong-size predictions as invalid rows instead of aborting the entire run.
+            shape_mismatch_rows += 1
+            row[args.pred_col] = ""
+            row["valid"] = 0
+            A_pred = None
 
         if A_true is None or A_pred is None:
             met = {k: None for k in [
@@ -976,6 +1010,11 @@ def main():
     # Continue even if graph parsing failed, so format metrics are still reported.
     if valid_rows == 0:
         print(f"[info] No valid rows in {csv_path}. Graph metrics will be null; format metrics will still be reported.")
+    if shape_mismatch_rows > 0:
+        print(
+            f"[warn] Ignored {shape_mismatch_rows} row(s) with prediction shape != GT shape in {csv_path}.",
+            file=sys.stderr,
+        )
 
     # --- Global averages (existing flow) ---
     if valid_rows > 0:

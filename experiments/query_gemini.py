@@ -656,6 +656,20 @@ def _extract_answer_text(text: str) -> str:
     return m.group(1) if m else (text or "")
 
 
+def _extract_adjacency_from_response(
+    text: str,
+    *,
+    fallback_variables: Optional[list[str]] = None,
+) -> Optional[np.ndarray]:
+    answer_text = _extract_answer_text(text)
+    mat = extract_adjacency_matrix(answer_text, fallback_variables=fallback_variables)
+    if mat is not None:
+        return mat
+    if answer_text != (text or ""):
+        return extract_adjacency_matrix(text, fallback_variables=fallback_variables)
+    return None
+
+
 def _format_ok(text: str) -> int:
     return int(bool(FORMAT_RE.match(text or "")))
 
@@ -1473,7 +1487,7 @@ def main():
                 output_tokens=out_tok,
                 max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
             )
-            adj = extract_adjacency_matrix(_extract_answer_text(resp))
+            adj = _extract_adjacency_from_response(resp)
             if adj is not None:
                 row_obj["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                 row_obj["valid"] = 1
@@ -1553,7 +1567,7 @@ def main():
                             output_tokens=out_tok,
                             max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
                         )
-                        adj = extract_adjacency_matrix(_extract_answer_text(resp))
+                        adj = _extract_adjacency_from_response(resp)
                         if adj is not None:
                             current["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             current["valid"] = 1
@@ -1589,7 +1603,7 @@ def main():
                             output_tokens=out_tok,
                             max_new_tokens_hint=int(args.max_new_tokens) if args.max_new_tokens is not None else None,
                         )
-                        adj = extract_adjacency_matrix(_extract_answer_text(resp))
+                        adj = _extract_adjacency_from_response(resp)
                         if adj is not None:
                             row["prediction"] = json.dumps(adj.tolist(), ensure_ascii=False)
                             row["valid"] = 1

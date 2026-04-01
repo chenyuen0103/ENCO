@@ -35,6 +35,16 @@ def _extract_answer_text(text: str) -> str:
     return m.group(1) if m else (text or "")
 
 
+def _extract_adjacency_from_response(text: str, *, fallback_variables: list[str] | None = None):
+    answer_text = _extract_answer_text(text)
+    mat = extract_adjacency_matrix(answer_text, fallback_variables=fallback_variables)
+    if mat is not None:
+        return mat
+    if answer_text != (text or ""):
+        return extract_adjacency_matrix(text, fallback_variables=fallback_variables)
+    return None
+
+
 def _format_ok(text: str) -> int:
     t = text or ""
     if FORMAT_RE.match(t):
@@ -290,22 +300,16 @@ def _load_completed(out_path: Path, overwrite: bool) -> tuple[set[tuple[int, int
         reader = csv.DictReader(f)
         for row in reader:
             raw = (row.get("raw_response") or "").lstrip()
-            pred = (row.get("prediction") or "").strip()
-            valid_str = str(row.get("valid", "")).strip()
-            try:
-                valid = int(valid_str) == 1
-            except Exception:
-                valid = bool(pred)
             is_error = raw.startswith("[ERROR]")
-            if raw and not is_error and pred and valid:
-                try:
-                    key = (int(row.get("data_idx", -1)), int(row.get("shuffle_idx", -1)))
-                    completed.add(key)
-                    rows.append(row)
-                except Exception:
-                    continue
-            elif not is_error and pred and valid:
-                # keep non-error, valid rows even if raw is empty (should be rare)
+            if is_error:
+                # Rerun only explicit error rows.
+                continue
+            try:
+                key = (int(row.get("data_idx", -1)), int(row.get("shuffle_idx", -1)))
+                completed.add(key)
+                rows.append(row)
+            except Exception:
+                # Keep malformed-key rows in the output file, but do not mark as completed.
                 rows.append(row)
     return completed, rows
 
@@ -454,7 +458,7 @@ def _run_model_for_config(
                 )
 
             answer_text = _extract_answer_text(resp)
-            adj = extract_adjacency_matrix(answer_text, fallback_variables=variables_for_parse)
+            adj = _extract_adjacency_from_response(resp, fallback_variables=variables_for_parse)
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
             valid = 1 if adj is not None else 0
             format_ok = _format_ok(resp)
@@ -637,6 +641,11 @@ def _run_model_for_config(
         if provider == "hf":
             _flush_hf_batch()
 
+    print(
+        f"[summary] wrote={wrote} skipped={skipped} kept_existing={len(existing_rows)} out={out_path.name}",
+        file=sys.stderr,
+        flush=True,
+    )
     print(f"[info] Wrote responses: {out_path}")
 
 
@@ -665,7 +674,7 @@ def main() -> None:
     ap.add_argument(
         "--hf-max-new-tokens",
         type=int,
-        default=0,
+        default=8192,
         help="HF generation max_new_tokens. Set <=0 for no explicit cap (default: 0).",
     )
     ap.add_argument(

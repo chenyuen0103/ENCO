@@ -154,3 +154,6 @@ wandb/
 *.pth
 *.bin
 unsloth_compiled_cache/*
+experiments/unsloth_compiled_cache/*
+.codex
+*.png

@@ -24,7 +24,7 @@ def _context_window_for(model: str) -> int:
 
 
 _RESP_RE = re.compile(
-    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>[^_]+))?$",
+    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>.+))?$",
     flags=re.IGNORECASE,
 )
 
@@ -94,11 +94,18 @@ def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -
 
 
 def _infer_model_from_stem(stem: str) -> str:
-    # query_gemini.py appends args.model.split("/")[-1] to the stem
-    # if not already present, so the model is typically the last underscore token.
-    parts = stem.split("_")
-    if parts:
-        return parts[-1]
+    # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
+    m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+    if m_names:
+        return m_names.group("model")
+    m_resp = re.match(
+        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
+        r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_resp:
+        return m_resp.group("model")
     return "unknown"
 
 
@@ -443,6 +450,71 @@ def _ensure_parent(path: Path, *, dry_run: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _add_metric_spread_columns(row: dict[str, Any]) -> None:
+    """
+    Add explicit per-metric SD/SE columns for downstream plotting.
+
+    Inputs are expected from evaluate.py summary keys:
+      - averages: avg_*
+      - variability SDs: var_*_sd
+      - row counts: valid_rows / num_rows
+    """
+    n = _safe_int(row.get("valid_rows"))
+    if not n or n <= 0:
+        n = _safe_int(row.get("num_rows"))
+    if not n or n <= 0:
+        n = 1
+
+    metric_to_var_sd = {
+        "avg_shd": "var_shd_sd",
+        "avg_accuracy": "var_accuracy_sd",
+        "avg_precision": "var_precision_sd",
+        "avg_recall": "var_recall_sd",
+        "avg_f1": "var_f1_sd",
+        "num_pred_edges": "var_num_pred_edges_sd",
+    }
+
+    # Promote evaluate.py's var_*_sd into explicit <metric>_sd and <metric>_se.
+    for metric_key, var_sd_key in metric_to_var_sd.items():
+        metric_val = _safe_float(row.get(metric_key))
+        sd_val = _safe_float(row.get(var_sd_key))
+        if metric_val is None or sd_val is None:
+            row[f"{metric_key}_sd"] = None
+            row[f"{metric_key}_se"] = None
+            continue
+        row[f"{metric_key}_sd"] = float(sd_val)
+        row[f"{metric_key}_se"] = float(sd_val / (n ** 0.5))
+
+    # NHD fields already use *_sd names; add matching *_se.
+    for metric_key, sd_key in (("nhd_mean", "nhd_sd"), ("nhd_ratio_mean", "nhd_ratio_sd")):
+        metric_val = _safe_float(row.get(metric_key))
+        sd_val = _safe_float(row.get(sd_key))
+        if metric_val is None or sd_val is None:
+            row[f"{metric_key}_se"] = None
+            continue
+        row[f"{metric_key}_se"] = float(sd_val / (n ** 0.5))
+
+    row["spread_n"] = int(n)
+
+
 def _ordering_bias_from_csv(csv_path: Path) -> dict[str, Any]:
     """
     Estimate ordering sensitivity by grouping rows by data_idx and measuring the spread
@@ -582,6 +654,12 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                         "context_exceeded_by_tokens_rows": 0,
                         "context_exceeded_by_error_rows": 0,
                         "context_exceeded_any": 0,
+                        # ENCO rows are single-run point estimates.
+                        "avg_f1_sd": 0.0,
+                        "avg_f1_se": 0.0,
+                        "avg_shd_sd": 0.0,
+                        "avg_shd_se": 0.0,
+                        "spread_n": 1,
                     }
                 )
         return out
@@ -613,6 +691,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         }
         row.update(summary)
         row.update(pt_stats)
+        _add_metric_spread_columns(row)
         summary_rows.append(row)
 
         # 2) Ordering bias analysis (only makes sense if shuffle_idx varies)
