@@ -42,23 +42,30 @@ def _build_output_contract_lines(
         json_key = "adjacency_matrix"
         json_field_desc = '- "adjacency_matrix": N x N 0/1 matrix in declared variable order.'
 
-    if require_think_answer_blocks:
-        return [
-            "Output exactly: <think>...</think><answer>...</answer>.",
-            "Keep <think> concise (minimal necessary reasoning only).",
-            f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
-            json_field_desc,
-            "No extra text before, between, or after the two blocks.",
-            'The JSON in <answer> must start with "{" and end with "}".',
-        ]
 
+    _ = require_think_answer_blocks
     return [
-        "Output exactly one JSON object and nothing else.",
-        f'The object must contain exactly one key: "{json_key}".',
+        "Output exactly: <think>...</think><answer>...</answer>.",
+        "Keep <think> concise (minimal necessary reasoning only).",
+        f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
         json_field_desc,
-        "No explanation, markdown, or extra text.",
-        'First char must be "{", last char must be "}".',
+        "No extra text before, between, or after the two blocks.",
+        'The JSON in <answer> must start with "{" and end with "}".',
     ]
+
+
+def _build_descendants_output_contract_lines() -> List[str]:
+    return [
+        "Output exactly: <think>...</think><answer>...</answer>.",
+        "Keep <think> concise (minimal necessary reasoning only).",
+        'Inside <answer>, output exactly one JSON object with keys "target" and "descendants".',
+        '- "target": the intervened variable name.',
+        '- "descendants": a JSON list of variable names that are descendants of "target".',
+        "Use exact variable names from the prompt and exclude the target itself from descendants.",
+        "No extra text before, between, or after the two blocks.",
+        'The JSON in <answer> must start with "{" and end with "}".',
+    ]
+
 
 
 # ------------------------ Utility: variable names ------------------------ #
@@ -238,6 +245,13 @@ def iter_prompts_in_memory(
     else:
         intervene_var_idxs = []
     include_def_int = bool(def_int and int_per_combo > 0)
+    state_names_out: List[List[str]] = []
+    for orig_name in permuted_real_names:
+        states = codebook.get(orig_name, []) or []
+        if anonymize:
+            state_names_out.append([str(i) for i in range(len(states))] if states else [])
+        else:
+            state_names_out.append([str(s) for s in states] if states else [])
 
     def value_for_display(var_original_name: str, idx: int) -> str:
         idx = int(idx)
@@ -369,22 +383,19 @@ def iter_prompts_in_memory(
                     # (obs=0,int=0) should always use the names-only prompt format, regardless of style.
                     from generate_prompts_names_only import format_names_only_prompt
                     prompt_text = format_names_only_prompt(
-                        variables_out, dataset_name, causal_rules, output_edge_list=use_edge_list_output
+                        variables_out,
+                        dataset_name,
+                        causal_rules,
+                        output_edge_list=use_edge_list_output,
+                        anonymize=anonymize,
                     )
                 elif prompt_style == "summary_joint":
-                    state_names = []
-                    for orig_name in permuted_real_names:
-                        states = codebook.get(orig_name, []) or []
-                        if anonymize:
-                            state_names.append([str(i) for i in range(len(states))] if states else [])
-                        else:
-                            state_names.append([str(s) for s in states] if states else [])
                     prompt_text = format_prompt_summary_full_joint(
                         variables_out,
                         dataset_name=dataset_name,
                         obs_rows_num=obs_rows_num,
                         int_groups_num=int_groups_num,
-                        state_names=state_names if state_names else None,
+                        state_names=state_names_out if state_names_out else None,
                         include_causal_rules=causal_rules,
                         include_give_steps=give_steps,
                         include_def_int=include_def_int,
@@ -402,11 +413,9 @@ def iter_prompts_in_memory(
                         output_edge_list=use_edge_list_output,
                     )
                 else:
-                    prompt_text = format_prompt_with_interventions(
-                        variables_out, rows_text_source, vmap,
-                        causal_rules, give_steps, include_def_int=include_def_int,
-                        require_think_answer_blocks=thinking_tags,
-                        output_edge_list=use_edge_list_output,
+                    raise ValueError(
+                        f"Unsupported prompt_style={prompt_style!r}. "
+                        "Only 'matrix' and 'summary_joint' are enabled."
                     )
 
                 yield {
@@ -414,6 +423,12 @@ def iter_prompts_in_memory(
                     "shuffle_idx": rep,
                     "prompt_text": prompt_text,
                     "given_edges": None,
+                    "variables": variables_out,
+                    "dataset_name": dataset_name,
+                    "obs_rows_num": obs_rows_num,
+                    "int_groups_num": int_groups_num,
+                    "state_names": state_names_out,
+                    "anonymize": anonymize,
                 }
 
     return base_name, answer_obj, _iter()
@@ -544,320 +559,320 @@ def _try_sample_interventional_api(
     )
 
 
-# ------------------------ Prompt formatter ------------------------ #
+# # ------------------------ Prompt formatter ------------------------ #
 
-def format_prompt_payload_json(
-    variables: List[str],
-    *,
-    dataset_name: str,
-    obs_rows_num: List[List[float]],
-    int_groups_num: Dict[Tuple[str, str], List[List[float]]],
-    state_names: Optional[List[List[str]]] = None,
-    epsilon: float = 0.02,
-    decimals: int = 4,
-    anonymize: bool = False,   # <-- add this
-    require_think_answer_blocks: bool = False,
-    output_edge_list: bool = False,
-) -> str:
-    """
-    New prompt format:
-      - One JSON payload under 'INPUT JSON:'.
-      - Includes full observational marginals + corr.
-      - Includes full do-marginals for each intervention group.
-      - Includes TV distance-to-observational for ALL variables (excluding intervened var).
-    """
-    import json
+# def format_prompt_payload_json(
+#     variables: List[str],
+#     *,
+#     dataset_name: str,
+#     obs_rows_num: List[List[float]],
+#     int_groups_num: Dict[Tuple[str, str], List[List[float]]],
+#     state_names: Optional[List[List[str]]] = None,
+#     epsilon: float = 0.02,
+#     decimals: int = 4,
+#     anonymize: bool = False,   # <-- add this
+#     require_think_answer_blocks: bool = False,
+#     output_edge_list: bool = False,
+# ) -> str:
+#     """
+#     New prompt format:
+#       - One JSON payload under 'INPUT JSON:'.
+#       - Includes full observational marginals + corr.
+#       - Includes full do-marginals for each intervention group.
+#       - Includes TV distance-to-observational for ALL variables (excluding intervened var).
+#     """
+#     import json
 
-    # ---------- build variable specs ----------
-    # Determine number of states per variable (prefer state_names if provided)
-    m = len(variables)
-    num_states: List[int] = []
-    for j in range(m):
-        if state_names and j < len(state_names) and state_names[j]:
-            num_states.append(len(state_names[j]))
-        else:
-            # infer from data
-            max_seen = -1
-            for r in obs_rows_num:
-                if j < len(r):
-                    max_seen = max(max_seen, int(round(float(r[j]))))
-            for rows in int_groups_num.values():
-                for r in rows:
-                    if j < len(r):
-                        max_seen = max(max_seen, int(round(float(r[j]))))
-            num_states.append(max(2, max_seen + 1))
+#     # ---------- build variable specs ----------
+#     # Determine number of states per variable (prefer state_names if provided)
+#     m = len(variables)
+#     num_states: List[int] = []
+#     for j in range(m):
+#         if state_names and j < len(state_names) and state_names[j]:
+#             num_states.append(len(state_names[j]))
+#         else:
+#             # infer from data
+#             max_seen = -1
+#             for r in obs_rows_num:
+#                 if j < len(r):
+#                     max_seen = max(max_seen, int(round(float(r[j]))))
+#             for rows in int_groups_num.values():
+#                 for r in rows:
+#                     if j < len(r):
+#                         max_seen = max(max_seen, int(round(float(r[j]))))
+#             num_states.append(max(2, max_seen + 1))
 
-    variables_spec = []
-    for j, v in enumerate(variables):
-        if state_names and j < len(state_names) and state_names[j]:
-            mapping = {str(s): str(name) for s, name in enumerate(state_names[j])}
-        else:
-            mapping = {str(s): str(s) for s in range(num_states[j])}
-        variables_spec.append({"name": v, "states": mapping, "index": j})
+#     variables_spec = []
+#     for j, v in enumerate(variables):
+#         if state_names and j < len(state_names) and state_names[j]:
+#             mapping = {str(s): str(name) for s, name in enumerate(state_names[j])}
+#         else:
+#             mapping = {str(s): str(s) for s in range(num_states[j])}
+#         variables_spec.append({"name": v, "states": mapping, "index": j})
 
-    # ---------- observational summaries ----------
-    if not obs_rows_num:
-        raise ValueError("obs_rows_num is empty; cannot build observational summary payload.")
+#     # ---------- observational summaries ----------
+#     if not obs_rows_num:
+#         raise ValueError("obs_rows_num is empty; cannot build observational summary payload.")
 
-    obs_marginals_list = _marginals_py(obs_rows_num, num_states)
-    obs_marginals_list_r = [[round(float(x), decimals) for x in row] for row in obs_marginals_list]
-    obs_marginals = {variables[j]: obs_marginals_list_r[j] for j in range(m)}
+#     obs_marginals_list = _marginals_py(obs_rows_num, num_states)
+#     obs_marginals_list_r = [[round(float(x), decimals) for x in row] for row in obs_marginals_list]
+#     obs_marginals = {variables[j]: obs_marginals_list_r[j] for j in range(m)}
 
-    obs_corr = _corr_matrix_py(obs_rows_num) if len(obs_rows_num) >= 2 else None
-    obs_corr_r = (
-        [[round(float(x), decimals) for x in row] for row in obs_corr] if obs_corr is not None else None
-    )
+#     obs_corr = _corr_matrix_py(obs_rows_num) if len(obs_rows_num) >= 2 else None
+#     obs_corr_r = (
+#         [[round(float(x), decimals) for x in row] for row in obs_corr] if obs_corr is not None else None
+#     )
 
-    # ---------- interventions: full marginals + full TV dict ----------
-    interventions_payload = []
-    for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
-        rows = int_groups_num[(ivar, ival)]
-        do_marginals_list = _marginals_py(rows, num_states)
-        do_marginals_list_r = [[round(float(x), decimals) for x in row] for row in do_marginals_list]
-        do_marginals = {variables[j]: do_marginals_list_r[j] for j in range(m)}
+#     # ---------- interventions: full marginals + full TV dict ----------
+#     interventions_payload = []
+#     for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
+#         rows = int_groups_num[(ivar, ival)]
+#         do_marginals_list = _marginals_py(rows, num_states)
+#         do_marginals_list_r = [[round(float(x), decimals) for x in row] for row in do_marginals_list]
+#         do_marginals = {variables[j]: do_marginals_list_r[j] for j in range(m)}
 
-        # TV distance of each variable's marginal vs observational
-        tv_dict: Dict[str, float] = {}
-        for j in range(m):
-            vname = variables[j]
-            if vname == ivar:
-                continue
-            p = obs_marginals_list_r[j]
-            q = do_marginals_list_r[j]
-            tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
-            tv_dict[vname] = round(float(tv), decimals)
+#         # TV distance of each variable's marginal vs observational
+#         tv_dict: Dict[str, float] = {}
+#         for j in range(m):
+#             vname = variables[j]
+#             if vname == ivar:
+#                 continue
+#             p = obs_marginals_list_r[j]
+#             q = do_marginals_list_r[j]
+#             tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
+#             tv_dict[vname] = round(float(tv), decimals)
 
-        interventions_payload.append({
-            "do": {"var": ivar, "value": ival},
-            "n": len(rows),
-            "marginals": do_marginals,
-            "distance_to_observational_marginals": tv_dict,
-            "distance_metric": "total_variation_on_marginals",
-        })
+#         interventions_payload.append({
+#             "do": {"var": ivar, "value": ival},
+#             "n": len(rows),
+#             "marginals": do_marginals,
+#             "distance_to_observational_marginals": tv_dict,
+#             "distance_metric": "total_variation_on_marginals",
+#         })
 
-    # ---------- final payload ----------
-    payload: Dict[str, Any] = {
-        "assumptions": {
-            "causal_sufficiency": True,
-            "dag": True,
-            "perfect_do_interventions": True,
-        },
-        "variables": variables_spec,
-        "observational": {
-            "n": len(obs_rows_num),
-            "marginals": obs_marginals,
-        },
-        "interventions": interventions_payload,
-        "hyperparams_for_decisions": {
-            "marginal_change_epsilon": epsilon,
-            "prefer_sparse_graph": True,
-        },
-        "output_format": {
-            "variables_key_order": variables,
-            "adjacency_matrix_definition": "[i][j]=1 iff variables[i] -> variables[j]",
-        },
-    }
-    if output_edge_list:
-        payload["output_format"] = {
-            "variables_key_order": variables,
-            "edges_definition": "[[source,target], ...] using exact variable names",
-        }
+#     # ---------- final payload ----------
+#     payload: Dict[str, Any] = {
+#         "assumptions": {
+#             "causal_sufficiency": True,
+#             "dag": True,
+#             "perfect_do_interventions": True,
+#         },
+#         "variables": variables_spec,
+#         "observational": {
+#             "n": len(obs_rows_num),
+#             "marginals": obs_marginals,
+#         },
+#         "interventions": interventions_payload,
+#         "hyperparams_for_decisions": {
+#             "marginal_change_epsilon": epsilon,
+#             "prefer_sparse_graph": True,
+#         },
+#         "output_format": {
+#             "variables_key_order": variables,
+#             "adjacency_matrix_definition": "[i][j]=1 iff variables[i] -> variables[j]",
+#         },
+#     }
+#     if output_edge_list:
+#         payload["output_format"] = {
+#             "variables_key_order": variables,
+#             "edges_definition": "[[source,target], ...] using exact variable names",
+#         }
 
-    if not anonymize:
-        payload["network_name"] = dataset_name
+#     if not anonymize:
+#         payload["network_name"] = dataset_name
 
-    if obs_corr_r is not None:
-        payload["observational"]["dependence"] = {
-            "type": "pearson_corr_on_numeric_codes",
-            "numeric_code_definition": "state index as listed above (0/1/...)",
-            "matrix": obs_corr_r,
-        }
+#     if obs_corr_r is not None:
+#         payload["observational"]["dependence"] = {
+#             "type": "pearson_corr_on_numeric_codes",
+#             "numeric_code_definition": "state index as listed above (0/1/...)",
+#             "matrix": obs_corr_r,
+#         }
 
-    # ---------- wrap with strict output instructions + payload ----------
-    # (Single-file prompt: include “system” guidance inline since you write .txt prompts)
-    method_header = (
-        "METHOD (write this reasoning in the <think>...</think> block):\n"
-        if require_think_answer_blocks else
-        "METHOD (follow internally, do not output reasoning):\n"
-    )
-    method_block = (
-        "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
-        "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
-        + method_header +
-        "1) From each do(X=x), treat variables whose marginals change (TV > epsilon) as descendants of X.\n"
-        "2) Use observational dependence only to suggest adjacencies (skeleton), not directions.\n"
-        "3) Prefer X->Y if Y changes under do(X) but X does not change under do(Y).\n"
-        "4) Enforce acyclicity and choose the sparsest graph consistent with the evidence.\n"
-    )
+#     # ---------- wrap with strict output instructions + payload ----------
+#     # (Single-file prompt: include “system” guidance inline since you write .txt prompts)
+#     method_header = (
+#         "METHOD (write this reasoning in the <think>...</think> block):\n"
+#         if require_think_answer_blocks else
+#         "METHOD (follow internally, do not output reasoning):\n"
+#     )
+#     method_block = (
+#         "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
+#         "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
+#         + method_header +
+#         "1) From each do(X=x), treat variables whose marginals change (TV > epsilon) as descendants of X.\n"
+#         "2) Use observational dependence only to suggest adjacencies (skeleton), not directions.\n"
+#         "3) Prefer X->Y if Y changes under do(X) but X does not change under do(Y).\n"
+#         "4) Enforce acyclicity and choose the sparsest graph consistent with the evidence.\n"
+#     )
 
-    out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    ) + "\n"
+#     out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
+#         _build_output_contract_lines(
+#             output_edge_list=output_edge_list,
+#             require_think_answer_blocks=require_think_answer_blocks,
+#         )
+#     ) + "\n"
 
-    return method_block + "\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False) + "\n\n" + out_contract
+#     return method_block + "\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False) + "\n\n" + out_contract
 
 
-def format_prompt_payload_topk_json(
-    variables: List[str],
-    *,
-    dataset_name: str,
-    obs_rows_num: List[List[float]],
-    int_groups_num: Dict[Tuple[str, str], List[List[float]]],
-    state_names: Optional[List[List[str]]] = None,
-    epsilon: float = 0.02,
-    decimals: int = 4,
-    top_k_effects: int = 6,
-    include_network_name: bool = True,
-    require_think_answer_blocks: bool = False,
-    output_edge_list: bool = False,
-) -> str:
-    """
-    Compact payload prompt (v2):
-      - No Pearson correlation matrix (can be misleading on discrete numeric codes).
-      - Observational: marginals only.
-      - Each do-block: TV top-K effects + list of changed vars + marginals only for top-K vars.
-      - Includes explicit method text telling the model to use precomputed fields only.
-    """
-    import json
+# def format_prompt_payload_topk_json(
+#     variables: List[str],
+#     *,
+#     dataset_name: str,
+#     obs_rows_num: List[List[float]],
+#     int_groups_num: Dict[Tuple[str, str], List[List[float]]],
+#     state_names: Optional[List[List[str]]] = None,
+#     epsilon: float = 0.02,
+#     decimals: int = 4,
+#     top_k_effects: int = 6,
+#     include_network_name: bool = True,
+#     require_think_answer_blocks: bool = False,
+#     output_edge_list: bool = False,
+# ) -> str:
+#     """
+#     Compact payload prompt (v2):
+#       - No Pearson correlation matrix (can be misleading on discrete numeric codes).
+#       - Observational: marginals only.
+#       - Each do-block: TV top-K effects + list of changed vars + marginals only for top-K vars.
+#       - Includes explicit method text telling the model to use precomputed fields only.
+#     """
+#     import json
 
-    m = len(variables)
+#     m = len(variables)
 
-    # ---------- infer number of states per variable ----------
-    num_states: List[int] = []
-    for j in range(m):
-        if state_names and j < len(state_names) and state_names[j]:
-            num_states.append(len(state_names[j]))
-            continue
+#     # ---------- infer number of states per variable ----------
+#     num_states: List[int] = []
+#     for j in range(m):
+#         if state_names and j < len(state_names) and state_names[j]:
+#             num_states.append(len(state_names[j]))
+#             continue
 
-        max_seen = -1
-        for r in obs_rows_num:
-            if j < len(r):
-                max_seen = max(max_seen, int(round(float(r[j]))))
-        for rows in int_groups_num.values():
-            for r in rows:
-                if j < len(r):
-                    max_seen = max(max_seen, int(round(float(r[j]))))
-        num_states.append(max(2, max_seen + 1))
+#         max_seen = -1
+#         for r in obs_rows_num:
+#             if j < len(r):
+#                 max_seen = max(max_seen, int(round(float(r[j]))))
+#         for rows in int_groups_num.values():
+#             for r in rows:
+#                 if j < len(r):
+#                     max_seen = max(max_seen, int(round(float(r[j]))))
+#         num_states.append(max(2, max_seen + 1))
 
-    # ---------- variable specs ----------
-    variables_spec: List[Dict[str, Any]] = []
-    for j, v in enumerate(variables):
-        if state_names and j < len(state_names) and state_names[j]:
-            mapping = {str(s): str(name) for s, name in enumerate(state_names[j])}
-        else:
-            mapping = {str(s): str(s) for s in range(num_states[j])}
-        variables_spec.append({"name": v, "states": mapping, "index": j})
+#     # ---------- variable specs ----------
+#     variables_spec: List[Dict[str, Any]] = []
+#     for j, v in enumerate(variables):
+#         if state_names and j < len(state_names) and state_names[j]:
+#             mapping = {str(s): str(name) for s, name in enumerate(state_names[j])}
+#         else:
+#             mapping = {str(s): str(s) for s in range(num_states[j])}
+#         variables_spec.append({"name": v, "states": mapping, "index": j})
 
-    if not obs_rows_num:
-        raise ValueError("obs_rows_num is empty; cannot build payload.")
+#     if not obs_rows_num:
+#         raise ValueError("obs_rows_num is empty; cannot build payload.")
 
-    # ---------- observational marginals ----------
-    obs_marginals_list = _marginals_py(obs_rows_num, num_states)
-    obs_marginals_list_r = [[round(float(x), decimals) for x in row] for row in obs_marginals_list]
-    obs_marginals = {variables[j]: obs_marginals_list_r[j] for j in range(m)}
+#     # ---------- observational marginals ----------
+#     obs_marginals_list = _marginals_py(obs_rows_num, num_states)
+#     obs_marginals_list_r = [[round(float(x), decimals) for x in row] for row in obs_marginals_list]
+#     obs_marginals = {variables[j]: obs_marginals_list_r[j] for j in range(m)}
 
-    # ---------- interventions: compute TV for all vars, surface top-K ----------
-    interventions_payload: List[Dict[str, Any]] = []
-    k = max(0, int(top_k_effects))
-    for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
-        rows = int_groups_num[(ivar, ival)]
-        do_marginals_list = _marginals_py(rows, num_states)
-        do_marginals_list_r = [[round(float(x), decimals) for x in row] for row in do_marginals_list]
+#     # ---------- interventions: compute TV for all vars, surface top-K ----------
+#     interventions_payload: List[Dict[str, Any]] = []
+#     k = max(0, int(top_k_effects))
+#     for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
+#         rows = int_groups_num[(ivar, ival)]
+#         do_marginals_list = _marginals_py(rows, num_states)
+#         do_marginals_list_r = [[round(float(x), decimals) for x in row] for row in do_marginals_list]
 
-        tv_scores: List[Tuple[str, float]] = []
-        for j in range(m):
-            vname = variables[j]
-            if vname == ivar:
-                continue
-            p = obs_marginals_list_r[j]
-            q = do_marginals_list_r[j]
-            tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
-            tv_scores.append((vname, round(float(tv), decimals)))
+#         tv_scores: List[Tuple[str, float]] = []
+#         for j in range(m):
+#             vname = variables[j]
+#             if vname == ivar:
+#                 continue
+#             p = obs_marginals_list_r[j]
+#             q = do_marginals_list_r[j]
+#             tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
+#             tv_scores.append((vname, round(float(tv), decimals)))
 
-        tv_scores.sort(key=lambda t: t[1], reverse=True)
-        changed_vars = [v for (v, tv) in tv_scores if tv > float(epsilon)]
+#         tv_scores.sort(key=lambda t: t[1], reverse=True)
+#         changed_vars = [v for (v, tv) in tv_scores if tv > float(epsilon)]
 
-        top = tv_scores[:k]
-        tv_top_effects = [[v, tv] for (v, tv) in top]
-        do_marginals_top = {v: do_marginals_list_r[variables.index(v)] for (v, _) in top}
+#         top = tv_scores[:k]
+#         tv_top_effects = [[v, tv] for (v, tv) in top]
+#         do_marginals_top = {v: do_marginals_list_r[variables.index(v)] for (v, _) in top}
 
-        interventions_payload.append(
-            {
-                "do": {"var": ivar, "value": ival},
-                "n": len(rows),
-                "tv_top_effects": tv_top_effects,
-                "changed_vars": changed_vars,
-                "do_marginals_top": do_marginals_top,
-                "tv_metric": "total_variation_on_marginals",
-            }
-        )
+#         interventions_payload.append(
+#             {
+#                 "do": {"var": ivar, "value": ival},
+#                 "n": len(rows),
+#                 "tv_top_effects": tv_top_effects,
+#                 "changed_vars": changed_vars,
+#                 "do_marginals_top": do_marginals_top,
+#                 "tv_metric": "total_variation_on_marginals",
+#             }
+#         )
 
-    payload: Dict[str, Any] = {
-        "assumptions": {
-            "causal_sufficiency": True,
-            "dag": True,
-            "perfect_do_interventions": True,
-        },
-        "variables": variables_spec,
-        "observational": {
-            "n": len(obs_rows_num),
-            "marginals": obs_marginals,
-        },
-        "interventions": interventions_payload,
-        "hyperparams_for_decisions": {
-            "marginal_change_epsilon": float(epsilon),
-            "prefer_sparse_graph": True,
-            "top_k_effects": k,
-        },
-        "output_format": {
-            "variables_key_order": variables,
-            "adjacency_matrix_definition": "[i][j]=1 iff variables[i] -> variables[j]",
-        },
-    }
-    if output_edge_list:
-        payload["output_format"] = {
-            "variables_key_order": variables,
-            "edges_definition": "[[source,target], ...] using exact variable names",
-        }
+#     payload: Dict[str, Any] = {
+#         "assumptions": {
+#             "causal_sufficiency": True,
+#             "dag": True,
+#             "perfect_do_interventions": True,
+#         },
+#         "variables": variables_spec,
+#         "observational": {
+#             "n": len(obs_rows_num),
+#             "marginals": obs_marginals,
+#         },
+#         "interventions": interventions_payload,
+#         "hyperparams_for_decisions": {
+#             "marginal_change_epsilon": float(epsilon),
+#             "prefer_sparse_graph": True,
+#             "top_k_effects": k,
+#         },
+#         "output_format": {
+#             "variables_key_order": variables,
+#             "adjacency_matrix_definition": "[i][j]=1 iff variables[i] -> variables[j]",
+#         },
+#     }
+#     if output_edge_list:
+#         payload["output_format"] = {
+#             "variables_key_order": variables,
+#             "edges_definition": "[[source,target], ...] using exact variable names",
+#         }
 
-    if include_network_name:
-        payload["network_name"] = dataset_name
+#     if include_network_name:
+#         payload["network_name"] = dataset_name
 
-    method_header = (
-        "METHOD (write this reasoning in the <think>...</think> block):\n"
-        if require_think_answer_blocks else
-        "METHOD (follow internally; do not output reasoning):\n"
-    )
-    method_block = (
-        "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
-        "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
-        "EVIDENCE SEMANTICS:\n"
-        "- For each intervention entry, `changed_vars` are variables whose marginals changed under do(X=v) (TV > epsilon).\n"
-        "- Only descendants of X can change under do(X=v) in a perfect intervention setting.\n"
-        + method_header +
-        "1) For each intervention do(X=v), treat `changed_vars` as a superset of descendants of X.\n"
-        "2) Prefer X->Y if Y appears in changed_vars under do(X=*) but X does NOT appear in changed_vars under do(Y=*).\n"
-        "3) Do NOT infer direction from observational marginals alone.\n"
-        "4) Output the sparsest DAG consistent with the intervention constraints.\n"
-    )
+#     method_header = (
+#         "METHOD (write this reasoning in the <think>...</think> block):\n"
+#         if require_think_answer_blocks else
+#         "METHOD (follow internally; do not output reasoning):\n"
+#     )
+#     method_block = (
+#         "ROLE: You are an expert in causal discovery from observational and interventional data.\n"
+#         "ASSUMPTIONS: causal sufficiency, DAG, perfect do-interventions.\n"
+#         "EVIDENCE SEMANTICS:\n"
+#         "- For each intervention entry, `changed_vars` are variables whose marginals changed under do(X=v) (TV > epsilon).\n"
+#         "- Only descendants of X can change under do(X=v) in a perfect intervention setting.\n"
+#         + method_header +
+#         "1) For each intervention do(X=v), treat `changed_vars` as a superset of descendants of X.\n"
+#         "2) Prefer X->Y if Y appears in changed_vars under do(X=*) but X does NOT appear in changed_vars under do(Y=*).\n"
+#         "3) Do NOT infer direction from observational marginals alone.\n"
+#         "4) Output the sparsest DAG consistent with the intervention constraints.\n"
+#     )
 
-    out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    ) + "\n"
+#     out_contract = "OUTPUT INSTRUCTIONS:\n" + "\n".join(
+#         _build_output_contract_lines(
+#             output_edge_list=output_edge_list,
+#             require_think_answer_blocks=require_think_answer_blocks,
+#         )
+#     ) + "\n"
 
-    return (
-        method_block
-        + "\nINPUT JSON:\n"
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + "\n\n"
-        + out_contract
-    )
+#     return (
+#         method_block
+#         + "\nINPUT JSON:\n"
+#         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+#         + "\n\n"
+#         + out_contract
+#     )
 
 
 def format_prompt_cb_matrix(
@@ -1068,6 +1083,7 @@ def format_prompt_summary_stats(
     require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
+    # Legacy formatter: not used in current pipeline (matrix/summary_joint only).
     """
     Summary-statistics prompt: small token footprint.
 
@@ -1341,6 +1357,7 @@ def format_prompt_summary_probs(
     require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
+    # Legacy formatter: not used in current pipeline (matrix/summary_joint only).
     """
     Probability-based summary prompt (token-efficient, more informative than means).
 
@@ -1482,8 +1499,134 @@ def format_prompt_summary_probs(
     return "\n".join(lines)
 
 
+def format_prompt_descendants_summary(
+    variables: List[str],
+    *,
+    dataset_name: str,
+    intervention_target: str,
+    intervention_value: str,
+    intervention_rows_num: List[List[float]],
+    obs_rows_num: List[List[float]],
+    state_names: Optional[List[List[str]]] = None,
+    include_causal_rules: bool = False,
+    include_def_int: bool = False,
+    decimals: int = 6,
+    anonymize: bool = True,
+) -> str:
+    """
+    Prompt for a simpler subtask: infer descendants of a single intervened variable.
+    """
+    if not intervention_rows_num:
+        raise ValueError("intervention_rows_num must be non-empty")
 
+    lines: List[str] = []
+    lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
+    lines.append(
+        f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
+    )
+    if anonymize:
+        lines.append("The following are empirical summaries from an anonymized Bayesian network.")
+    else:
+        lines.append(f"The following are empirical summaries from a Bayesian network named {dataset_name}.")
 
+    lines.append("ASSUMPTIONS:")
+    lines.append("- The true graph is a DAG (no directed cycles).")
+    lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
+    lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
+    lines.append("- Only descendants of the intervened variable can change because of the intervention, up to sampling noise.")
+
+    if include_causal_rules:
+        lines.extend(
+            [
+                "\n--- CAUSAL DISCOVERY REMINDERS ---",
+                "- Variables whose distributions shift under do(X=v) are candidates for being descendants of X.",
+                "- Ancestors and non-descendants of X should remain invariant up to sampling noise.",
+                "- Descendants include indirect downstream effects, not only direct children.",
+            ]
+        )
+
+    if include_def_int:
+        lines.extend(
+            [
+                "\n--- INTERVENTION SEMANTICS ---",
+                f"- In do({intervention_target} = {intervention_value}), {intervention_target} is externally fixed.",
+                f"- The intervention removes all incoming edges into {intervention_target}.",
+                f"- Downstream variables may change; upstream variables should not change because of this intervention.",
+            ]
+        )
+
+    lines.append("\n--- VARIABLE ORDER ---")
+    for i, v in enumerate(variables):
+        if state_names and i < len(state_names) and state_names[i]:
+            mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
+            lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
+        else:
+            lines.append(f"{i}: {v}")
+
+    m = len(variables)
+    num_states: List[int] = []
+    for j in range(m):
+        if state_names and j < len(state_names) and state_names[j]:
+            num_states.append(len(state_names[j]))
+            continue
+        max_seen = -1
+        for rows in (obs_rows_num, intervention_rows_num):
+            for r in rows:
+                if j < len(r):
+                    max_seen = max(max_seen, int(round(float(r[j]))))
+        num_states.append(max(2, max_seen + 1))
+
+    lines.append("\n--- OBSERVATIONAL SUMMARY ---")
+    if obs_rows_num:
+        obs_probs = _marginals_py(obs_rows_num, num_states)
+        obs_probs_r = [[round(float(x), decimals) for x in row] for row in obs_probs]
+        lines.append(f"obs_n={len(obs_rows_num)}")
+        lines.append(
+            "obs_marginals="
+            + json.dumps(
+                {variables[j]: obs_probs_r[j] for j in range(m)},
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
+    else:
+        obs_probs_r = None
+        lines.append("obs_n=0")
+        lines.append("obs_marginals={}")
+
+    do_probs = _marginals_py(intervention_rows_num, num_states)
+    do_probs_r = [[round(float(x), decimals) for x in row] for row in do_probs]
+    tv_scores: List[Tuple[str, float]] = []
+    if obs_probs_r is not None:
+        for j, var_name in enumerate(variables):
+            if var_name == intervention_target:
+                continue
+            p = obs_probs_r[j]
+            q = do_probs_r[j]
+            tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
+            tv_scores.append((var_name, round(float(tv), decimals)))
+        tv_scores.sort(key=lambda item: item[1], reverse=True)
+
+    lines.append("\n--- INTERVENTION OF INTEREST ---")
+    lines.append(f"intervention=do({intervention_target}={intervention_value})")
+    lines.append(f"do_n={len(intervention_rows_num)}")
+    lines.append(
+        "do_marginals="
+        + json.dumps(
+            {variables[j]: do_probs_r[j] for j in range(m)},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    )
+    lines.append("tv_change_vs_obs=" + json.dumps(tv_scores, separators=(",", ":"), ensure_ascii=False))
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.append(
+        f"Return the descendants of {intervention_target}: the variables whose distributions indicate they are downstream of the intervention."
+    )
+    lines.extend(_build_descendants_output_contract_lines())
+
+    return "\n".join(lines)
 
 
 def format_prompt_summary_full_joint(
@@ -1815,6 +1958,7 @@ def format_prompt_with_interventions(
     require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
 ) -> str:
+    # Legacy formatter for old "cases" style; style is disabled in argparse.
     """
     Build a prompt that presents mixed observational + interventional data
     and asks for a JSON adjacency matrix over `variables`.
@@ -2041,8 +2185,8 @@ def main():
     ap.add_argument("--given-edge-frac", type=float, default=0.0)
     ap.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary_joint"],
-        default="cases",
+        choices=["matrix", "summary_joint"],
+        default="summary_joint",
     )
     ap.add_argument(
         "--out-dir",
@@ -2304,7 +2448,11 @@ def main():
                     # (obs=0,int=0) should always use the names-only prompt format, regardless of style.
                     from generate_prompts_names_only import format_names_only_prompt
                     prompt_text = format_names_only_prompt(
-                        variables_out, dataset_name, args.causal_rules, output_edge_list=use_edge_list_output
+                        variables_out,
+                        dataset_name,
+                        args.causal_rules,
+                        output_edge_list=use_edge_list_output,
+                        anonymize=args.anonymize,
                     )
                 elif args.prompt_style == "summary_joint":
                     state_names = []
@@ -2343,11 +2491,9 @@ def main():
                         output_edge_list=use_edge_list_output,
                     )
                 else:
-                    prompt_text = format_prompt_with_interventions(
-                        variables_out, rows_text_source, vmap,
-                        args.causal_rules, args.give_steps, include_def_int=include_def_int,
-                        require_think_answer_blocks=args.thinking_tags,
-                        output_edge_list=use_edge_list_output,
+                    raise ValueError(
+                        f"Unsupported prompt_style={args.prompt_style!r}. "
+                        "Only 'matrix' and 'summary_joint' are enabled."
                     )
                 
                 # Write Prompt File

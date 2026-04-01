@@ -3,12 +3,21 @@ import argparse
 import csv
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def _set_csv_field_limit() -> None:
+    # Large inlined prompts/answers can exceed Python csv's default field cap.
+    try:
+        csv.field_size_limit(sys.maxsize)
+    except OverflowError:
+        csv.field_size_limit(10_000_000)
 
 
 def _read_text_from_row(row: dict[str, Any], key_text: str, key_path: str) -> str:
@@ -27,9 +36,19 @@ def _load_answer_obj(raw: Any) -> Any:
     s = str(raw or "").strip()
     if not s:
         return None
-    p = Path(s)
-    if p.exists() and p.is_file():
-        return json.loads(p.read_text(encoding="utf-8"))
+    # Prefer inline JSON first; large JSON strings can exceed filename limits
+    # if interpreted as a filesystem path.
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        p = Path(s)
+        if p.exists() and p.is_file():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except OSError:
+        # Not a usable path; keep the original JSON error semantics.
+        pass
     return json.loads(s)
 
 
@@ -57,6 +76,46 @@ def _extract_adjacency_matrix(answer_payload: Any) -> list[list[int]]:
     return rows
 
 
+def _build_format_check_prompt(
+    prompt_text: str,
+    *,
+    tokenizer: Any,
+    enable_thinking: bool,
+) -> str:
+    if not enable_thinking:
+        return prompt_text
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return prompt_text
+
+    messages = [{"role": "user", "content": str(prompt_text)}]
+    kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        params = inspect.signature(tokenizer.apply_chat_template).parameters
+        if "enable_thinking" in params:
+            kwargs["enable_thinking"] = True
+    except Exception:
+        pass
+
+    try:
+        rendered = tokenizer.apply_chat_template(messages, **kwargs)
+        if isinstance(rendered, str):
+            return rendered
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        try:
+            rendered = tokenizer.apply_chat_template(messages, **kwargs)
+            if isinstance(rendered, str):
+                return rendered
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return prompt_text
+
+
 def build_sft_jsonl(
     *,
     in_csv: Path,
@@ -67,6 +126,7 @@ def build_sft_jsonl(
     answer_col: str,
     answer_path_col: str,
 ) -> tuple[int, int]:
+    _set_csv_field_limit()
     rows = list(csv.DictReader(in_csv.open("r", encoding="utf-8", newline="")))
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
@@ -91,7 +151,11 @@ def build_sft_jsonl(
                     f"<think>{think_text}</think>"
                     f"<answer>{json.dumps(target, ensure_ascii=False)}</answer>"
                 )
-                rec = {"text": prompt + "\n\n" + completion}
+                rec = {
+                    "prompt": prompt,
+                    "answer": completion,
+                    "text": prompt + "\n\n" + completion,  # backward-compatible fallback
+                }
                 fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 wrote += 1
             except Exception as exc:
@@ -115,9 +179,10 @@ def run_sft(
     sft_load_in_4bit: bool,
     sft_use_unsloth_gc: bool,
 ) -> None:
-    from unsloth import FastLanguageModel
     from datasets import load_dataset
+    from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
     from trl import SFTConfig, SFTTrainer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     def _filter_supported(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -127,11 +192,30 @@ def run_sft(
         except Exception:
             return dict(kwargs)
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
-        max_seq_length=int(sft_max_seq_length),
-        load_in_4bit=bool(sft_load_in_4bit),
-    )
+    is_adapter = (Path(base_model) / "adapter_config.json").exists()
+    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    model_load_kwargs: dict[str, Any] = {
+        "dtype": "auto",
+    }
+    # Match grpo.py: avoid device_map='auto' when Accelerate sees distributed mode.
+    if distributed_world_size == 1:
+        model_load_kwargs["device_map"] = "auto"
+    if bool(sft_load_in_4bit):
+        print(
+            "[sft] note: ignoring sft_load_in_4bit and loading with dtype='auto' "
+            "to match grpo.py model setup and avoid device_map/distributed issues."
+        )
+    if is_adapter:
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            base_model,
+            **model_load_kwargs,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            **model_load_kwargs,
+        )
     # Some tokenizer variants expose placeholder EOS tokens in config.
     # Resolve to an actual in-vocab token before building SFTConfig.
     vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
@@ -154,22 +238,70 @@ def run_sft(
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None):
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"],
-        use_gradient_checkpointing=("unsloth" if sft_use_unsloth_gc else True),
-    )
+    if not is_adapter:
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "v_proj"],
+        )
+        model = get_peft_model(model, lora_config)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "config"):
+        try:
+            model.config.use_cache = False
+        except Exception:
+            pass
 
     ds = load_dataset("json", data_files=str(sft_jsonl), split="train")
+    # Prefer chat-template formatted SFT text when prompt/answer fields are present.
+    # This enables tokenizer-specific formatting and thinking mode for Qwen-style tokenizers.
+    def _to_sft_text(ex: dict[str, Any]) -> dict[str, str]:
+        prompt = ex.get("prompt")
+        answer = ex.get("answer")
+        if isinstance(prompt, str) and isinstance(answer, str):
+            if hasattr(tokenizer, "apply_chat_template"):
+                messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                ]
+                kwargs: dict[str, Any] = {
+                    "tokenize": False,
+                    "add_generation_prompt": False,
+                }
+                try:
+                    params = inspect.signature(tokenizer.apply_chat_template).parameters
+                    if "enable_thinking" in params:
+                        kwargs["enable_thinking"] = True
+                except Exception:
+                    pass
+                try:
+                    text = tokenizer.apply_chat_template(messages, **kwargs)
+                    if isinstance(text, str):
+                        return {"text": text}
+                except Exception:
+                    # Fall through to plain concatenation fallback.
+                    pass
+            return {"text": prompt + "\n\n" + answer}
+
+        # Backward compatibility for older JSONL files that only contain "text".
+        text0 = ex.get("text")
+        return {"text": text0 if isinstance(text0, str) else ""}
+
+    ds = ds.map(
+        _to_sft_text,
+        desc="Formatting SFT data with chat template",
+        remove_columns=ds.column_names,
+    )
     cfg_kwargs = {
         "output_dir": str(sft_output_dir),
         "num_train_epochs": float(sft_epochs),
         "learning_rate": float(sft_lr),
         "per_device_train_batch_size": int(sft_batch_size),
         "gradient_accumulation_steps": int(sft_grad_accum),
+        "disable_tqdm": False,
         "logging_steps": int(sft_logging_steps),
         "save_steps": int(sft_save_steps),
         "bf16": torch_cuda_available(),
@@ -233,6 +365,7 @@ def run_grpo(
     grpo_output_dir: Path,
     grpo_train_csv: Path,
     extra_args: list[str],
+    env: dict[str, str] | None = None,
 ) -> None:
     cmd = [
         "torchrun",
@@ -250,11 +383,15 @@ def run_grpo(
     ]
     cmd.extend(extra_args)
     print("[run]", " ".join(cmd))
-    env = os.environ.copy()
-    subprocess.run(cmd, env=env, check=True)
+    child_env = os.environ.copy()
+    if env:
+        child_env.update(env)
+    subprocess.run(cmd, env=child_env, check=True)
 
 
-FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+# For format-check inference, allow free-form reasoning before the final answer
+# and require only that the completion ends with <answer>...</answer>.
+FORMAT_RE = re.compile(r"(?s)^.*<answer>.*?</answer>\s*$")
 
 
 def run_format_check(
@@ -270,11 +407,18 @@ def run_format_check(
     output_path: Path,
     sft_max_seq_length: int,
     sft_load_in_4bit: bool,
+    format_check_enable_thinking: bool,
 ) -> None:
     import torch
     from unsloth import FastLanguageModel
+    from transformers import StoppingCriteria, StoppingCriteriaList
     from verifier_cd import extract_adjacency_matrix
 
+    # Transformers 5.2 + Unsloth can emit a malformed warning log call from
+    # modeling_attn_mask_utils; suppress that module's warning-level logs here.
+    logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
+
+    _set_csv_field_limit()
     rows = list(csv.DictReader(train_csv.open("r", encoding="utf-8", newline="")))
     if max_rows > 0:
         rows = rows[: max_rows]
@@ -294,8 +438,40 @@ def run_format_check(
     fmt_ok = 0
     parse_ok = 0
     with output_path.open("w", encoding="utf-8") as fout:
+        class _StopOnTokenSuffix(StoppingCriteria):
+            def __init__(self, suffixes: list[list[int]]):
+                super().__init__()
+                self.suffixes = [s for s in suffixes if s]
+
+            def __call__(self, input_ids, scores, **kwargs):  # type: ignore[override]
+                if input_ids is None or input_ids.numel() == 0:
+                    return False
+                # run_format_check generates one sample at a time
+                seq = input_ids[0].tolist()
+                for suf in self.suffixes:
+                    if len(seq) >= len(suf) and seq[-len(suf):] == suf:
+                        return True
+                return False
+
+        stop_phrases = ["</answer>", "\n</answer>", "\n\n</answer>", " </answer>"]
+        stop_token_suffixes: list[list[int]] = []
+        for phrase in stop_phrases:
+            ids = tokenizer.encode(phrase, add_special_tokens=False)
+            if ids:
+                stop_token_suffixes.append(ids)
+        stopping_criteria = (
+            StoppingCriteriaList([_StopOnTokenSuffix(stop_token_suffixes)])
+            if stop_token_suffixes
+            else None
+        )
+
         for i, row in enumerate(rows):
             prompt = _read_text_from_row(row, prompt_text_col, prompt_path_col).strip()
+            prompt_for_model = _build_format_check_prompt(
+                prompt,
+                tokenizer=tokenizer,
+                enable_thinking=bool(format_check_enable_thinking),
+            )
             answer_raw = row.get(answer_col)
             if not answer_raw:
                 answer_raw = row.get(answer_path_col)
@@ -307,18 +483,20 @@ def run_format_check(
             except Exception:
                 expected_n = None
 
-            inputs = tokenizer(prompt, return_tensors="pt")
+            inputs = tokenizer(prompt_for_model, return_tensors="pt")
             if torch.cuda.is_available():
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
             with torch.no_grad():
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=int(max_new_tokens),
-                    do_sample=False,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+                gen_kwargs = {
+                    "max_new_tokens": int(max_new_tokens),
+                    "do_sample": False,
+                    "eos_token_id": tokenizer.eos_token_id,
+                    "pad_token_id": tokenizer.eos_token_id,
+                }
+                if stopping_criteria is not None:
+                    gen_kwargs["stopping_criteria"] = stopping_criteria
+                out = model.generate(**inputs, **gen_kwargs)
 
             prompt_len = int(inputs["input_ids"].shape[-1])
             gen_ids = out[0][prompt_len:]
@@ -336,6 +514,7 @@ def run_format_check(
                 "row_idx": i,
                 "data_idx": row.get("data_idx"),
                 "shuffle_idx": row.get("shuffle_idx"),
+                "prompt_tokens": prompt_len,
                 "format_ok": is_fmt_ok,
                 "parse_ok": is_parse_ok,
                 "response_chars": len(resp),
@@ -385,6 +564,11 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--nproc-per-node", type=int, default=4)
     ap.add_argument("--python-exe", default=sys.executable)
+    ap.add_argument(
+        "--cuda-visible-devices",
+        default="0",
+        help="CUDA_VISIBLE_DEVICES for GPU stages (default: 0).",
+    )
 
     ap.add_argument("--prompt-text-col", default="prompt_text")
     ap.add_argument("--prompt-path-col", default="prompt_path")
@@ -415,6 +599,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-format-check", action="store_true", help="Skip post-SFT format check.")
     ap.add_argument("--format-check-rows", type=int, default=32, help="Rows to probe after SFT (0=all).")
     ap.add_argument("--format-check-max-new-tokens", type=int, default=1024)
+    ap.add_argument(
+        "--format-check-enable-thinking",
+        dest="format_check_enable_thinking",
+        action="store_true",
+        help="For post-SFT format checks, render prompts via chat template with enable_thinking=True when supported.",
+    )
+    ap.add_argument(
+        "--no-format-check-enable-thinking",
+        dest="format_check_enable_thinking",
+        action="store_false",
+    )
+    ap.set_defaults(format_check_enable_thinking=False)
     ap.add_argument(
         "--format-check-out",
         type=Path,
@@ -448,20 +644,28 @@ def main() -> None:
             return
 
     if args.stage in ("all", "sft"):
-        run_sft(
-            base_model=args.base_model,
-            sft_jsonl=args.sft_jsonl,
-            sft_output_dir=args.sft_output_dir,
-            sft_epochs=args.sft_epochs,
-            sft_lr=args.sft_lr,
-            sft_batch_size=args.sft_batch_size,
-            sft_grad_accum=args.sft_grad_accum,
-            sft_max_seq_length=args.sft_max_seq_length,
-            sft_save_steps=args.sft_save_steps,
-            sft_logging_steps=args.sft_logging_steps,
-            sft_load_in_4bit=args.sft_load_in_4bit,
-            sft_use_unsloth_gc=args.sft_use_unsloth_gc,
-        )
+        prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+        try:
+            run_sft(
+                base_model=args.base_model,
+                sft_jsonl=args.sft_jsonl,
+                sft_output_dir=args.sft_output_dir,
+                sft_epochs=args.sft_epochs,
+                sft_lr=args.sft_lr,
+                sft_batch_size=args.sft_batch_size,
+                sft_grad_accum=args.sft_grad_accum,
+                sft_max_seq_length=args.sft_max_seq_length,
+                sft_save_steps=args.sft_save_steps,
+                sft_logging_steps=args.sft_logging_steps,
+                sft_load_in_4bit=args.sft_load_in_4bit,
+                sft_use_unsloth_gc=args.sft_use_unsloth_gc,
+            )
+        finally:
+            if prev_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
         print(f"[sft] saved -> {args.sft_output_dir}")
         if args.stage == "sft":
             return
@@ -484,6 +688,7 @@ def main() -> None:
             output_path=format_out,
             sft_max_seq_length=args.sft_max_seq_length,
             sft_load_in_4bit=args.sft_load_in_4bit,
+            format_check_enable_thinking=bool(args.format_check_enable_thinking),
         )
         if args.stage == "check":
             return
@@ -500,6 +705,7 @@ def main() -> None:
             grpo_output_dir=args.grpo_output_dir,
             grpo_train_csv=args.train_csv,
             extra_args=extra,
+            env={"CUDA_VISIBLE_DEVICES": str(args.cuda_visible_devices)},
         )
         print(f"[grpo] saved -> {args.grpo_output_dir}")
 
