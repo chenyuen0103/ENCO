@@ -946,11 +946,13 @@ def _load_eval_model(model_id_or_path: str):
     if is_adapter:
         from peft import AutoPeftModelForCausalLM
 
-        return AutoPeftModelForCausalLM.from_pretrained(
+        model = AutoPeftModelForCausalLM.from_pretrained(
             model_id_or_path,
             dtype="auto",
-            device_map="auto",
         ).eval()
+        if torch.cuda.is_available():
+            model = model.to(f"cuda:{torch.cuda.current_device()}")
+        return model
 
     return AutoModelForCausalLM.from_pretrained(
         model_id_or_path,

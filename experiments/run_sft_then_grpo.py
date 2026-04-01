@@ -2,6 +2,7 @@
 import argparse
 import csv
 import inspect
+import importlib
 import json
 import logging
 import os
@@ -74,6 +75,38 @@ def _extract_adjacency_matrix(answer_payload: Any) -> list[list[int]]:
             if x not in (0, 1):
                 raise ValueError("adjacency_matrix must be binary")
     return rows
+
+
+def _import_trl_sft() -> tuple[Any, Any]:
+    """
+    Import TRL SFT classes without letting TRL's vLLM compatibility shim probe NVML.
+
+    Some TRL builds import `trl._compat` eagerly, which in turn patches vLLM by
+    importing it at module import time. On machines with a broken/unavailable NVML
+    stack, that crashes even though SFT does not use vLLM at all.
+    """
+    from transformers.utils import import_utils as tf_import_utils
+
+    orig_is_pkg_available = tf_import_utils._is_package_available
+
+    def _patched_is_package_available(package_name: str, *args: Any, **kwargs: Any) -> Any:
+        return_version = kwargs.get("return_version", args[0] if args else False)
+        if package_name in {"vllm", "vllm_ascend"}:
+            return (False, "0.0.0") if return_version else False
+        return orig_is_pkg_available(package_name, *args, **kwargs)
+
+    tf_import_utils._is_package_available = _patched_is_package_available
+    try:
+        if "trl" in sys.modules:
+            # Clear partially imported TRL modules so the patched availability check
+            # is used consistently on retry after an earlier failed import.
+            stale = [name for name in sys.modules if name == "trl" or name.startswith("trl.")]
+            for name in stale:
+                sys.modules.pop(name, None)
+        trl = importlib.import_module("trl")
+        return trl.SFTConfig, trl.SFTTrainer
+    finally:
+        tf_import_utils._is_package_available = orig_is_pkg_available
 
 
 def _build_format_check_prompt(
@@ -181,8 +214,9 @@ def run_sft(
 ) -> None:
     from datasets import load_dataset
     from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
-    from trl import SFTConfig, SFTTrainer
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    SFTConfig, SFTTrainer = _import_trl_sft()
 
     def _filter_supported(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
         try:

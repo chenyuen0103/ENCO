@@ -29,15 +29,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.trainer_callback import PrinterCallback
 from peft import LoraConfig, get_peft_model
 try:
-    from trl import GRPOConfig, GRPOTrainer
-except Exception as e:
-    msg = str(e)
-    if "GuidedDecodingParams" not in msg and "vllm" not in msg:
-        raise
-    trl_import_utils = importlib.import_module("trl.import_utils")
-    setattr(trl_import_utils, "_vllm_available", False)
-    from trl import GRPOConfig, GRPOTrainer
-try:
     from torch.distributed.elastic.multiprocessing.errors import record as _elastic_record
 except Exception:
     def _elastic_record(fn):
@@ -77,6 +68,25 @@ SYSTEM_PROMPT = (
 
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+
+
+def _import_trl_grpo():
+    try:
+        from trl import GRPOConfig, GRPOTrainer
+        return GRPOConfig, GRPOTrainer
+    except Exception as e:
+        msg = str(e)
+        # Some TRL installs try to initialize vLLM during import and fail on
+        # systems where NVML/CUDA visibility is unstable. Retry with vLLM disabled.
+        if not any(token in msg for token in ("GuidedDecodingParams", "vllm", "NVMLError", "NVML")):
+            raise
+        try:
+            trl_import_utils = importlib.import_module("trl.import_utils")
+            setattr(trl_import_utils, "_vllm_available", False)
+            from trl import GRPOConfig, GRPOTrainer
+            return GRPOConfig, GRPOTrainer
+        except Exception:
+            raise e
 
 
 def _load_graph_num_nodes(graph_path: str) -> int | None:
@@ -304,7 +314,7 @@ class TrainStateSnapshotCallback(TrainerCallback):
 
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
-    p.add_argument("--mode", type=str, default="train", choices=["train", "eval"])
+    p.add_argument("--mode", type=str, default="train", choices=["train", "eval", "export_cd_csv"])
     p.add_argument(
         "--task",
         type=str,
@@ -627,6 +637,18 @@ def build_argparser():
     p.add_argument("--eval_debug_csv", type=str, default=None)
     p.add_argument("--eval_model", type=str, default=None)
     p.add_argument("--eval_output_json", type=str, default=None)
+    p.add_argument(
+        "--export_csv",
+        type=str,
+        default=None,
+        help="Output CSV path for --mode export_cd_csv.",
+    )
+    p.add_argument(
+        "--export_limit",
+        type=int,
+        default=0,
+        help="Optional max number of exported rows for --mode export_cd_csv (0 = no cap).",
+    )
 
     return p
 
@@ -1022,11 +1044,16 @@ def _load_eval_model(model_id_or_path: str):
     if is_adapter:
         from peft import AutoPeftModelForCausalLM
 
+        # Avoid Accelerate's balanced-memory auto-sharding path for PEFT eval loads.
+        # In this environment it can fail inside get_balanced_memory() with
+        # "TypeError: unhashable type: 'set'". For eval we can place the adapter
+        # model on a single CUDA device when available.
         model = AutoPeftModelForCausalLM.from_pretrained(
             model_id_or_path,
             dtype="auto",
-            device_map="auto",
         ).eval()
+        if torch.cuda.is_available():
+            model = model.to(f"cuda:{torch.cuda.current_device()}")
         _apply_explicit_generation_config(model)
         return model
 
@@ -1388,6 +1415,75 @@ def run_eval(args):
         print("Saved debug CSV to:", args.eval_debug_csv)
 
 
+def run_export_cd_csv(args) -> None:
+    if args.task not in {"causal_discovery", "cd_descendants"}:
+        raise ValueError("--mode export_cd_csv only supports --task causal_discovery or cd_descendants.")
+    if not args.export_csv:
+        raise ValueError("--export_csv is required when --mode export_cd_csv.")
+
+    if args.cd_config_file and args.cd_train_csv:
+        raise ValueError(
+            "Use either --cd-config-file (in-memory generation) or --cd-train-csv, not both."
+        )
+
+    if args.cd_config_file:
+        if not args.cd_bif_file:
+            raise ValueError("--cd-bif-file is required when --cd-config-file is set.")
+        dataset = _dataset_from_cd_config_file(
+            config_file=args.cd_config_file,
+            bif_file=args.cd_bif_file,
+            num_prompts=int(args.cd_config_num_prompts),
+            seed=int(args.cd_config_seed),
+            task=str(args.task),
+            wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            append_format_hint=bool(args.cd_append_format_hint),
+            format_hint_text=str(args.cd_format_hint_text),
+            causal_rules=bool(args.cd_config_causal_rules),
+            give_steps=bool(args.cd_config_give_steps),
+            def_int=bool(args.cd_config_def_int),
+            intervene_vars=str(args.cd_config_intervene_vars),
+            thinking_tags=bool(args.cd_config_thinking_tags),
+        )
+    else:
+        if not args.cd_train_csv:
+            raise ValueError(
+                f"For --task {args.task}, pass --cd-config-file + --cd-bif-file "
+                "or --cd-train-csv."
+            )
+        dataset = _dataset_from_cd_csvs(
+            args.cd_train_csv,
+            wrap_system_prompt=bool(args.cd_wrap_system_prompt),
+            append_format_hint=bool(args.cd_append_format_hint),
+            format_hint_text=str(args.cd_format_hint_text),
+        )
+
+    if args.export_limit and args.export_limit > 0:
+        dataset = dataset.select(range(min(int(args.export_limit), len(dataset))))
+
+    out_path = Path(args.export_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = dataset.to_list()
+    fieldnames = list(dataset.column_names)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    print(
+        json.dumps(
+            {
+                "mode": "export_cd_csv",
+                "task": args.task,
+                "rows": len(rows),
+                "columns": fieldnames,
+                "output_csv": str(out_path.resolve()),
+            },
+            indent=2,
+        )
+    )
+
+
 def _parse_visible_cuda_devices():
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None and cvd.strip():
@@ -1533,6 +1629,7 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
 
 def run_train(args, argv: list[str] | None = None):
     argv = list(argv or [])
+    GRPOConfig, GRPOTrainer = _import_trl_grpo()
     _patch_ddp_config_attr()
     _suppress_transformers_attn_mask_warning_bug()
 
@@ -2283,6 +2380,9 @@ def main():
     _maybe_launch_local_vllm_and_reexec_train(args)
     if args.mode == "eval":
         run_eval(args)
+        return
+    if args.mode == "export_cd_csv":
+        run_export_cd_csv(args)
         return
     run_train(args, argv)
 

@@ -40,7 +40,7 @@ Use the repo conda env.
 ```bash
 mkdir -p experiments/prompts/cancer_debug
 
-/home/yuen_chen/.conda/envs/enco/bin/python experiments/export_cd_train_eval_csv.py \
+python experiments/export_cd_train_eval_csv.py \
   --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
   --config-file experiments/cancer_summary_joint_matrix_obs100_int10_nonanon.json \
   --num-prompts 2 \
@@ -49,7 +49,7 @@ mkdir -p experiments/prompts/cancer_debug
   --train-csv experiments/prompts/cancer_debug/cancer_obs100_int10_train.csv \
   --eval-csv experiments/prompts/cancer_debug/cancer_obs100_int10_eval.csv
 
-/home/yuen_chen/.conda/envs/enco/bin/python experiments/export_cd_train_eval_csv.py \
+python experiments/export_cd_train_eval_csv.py \
   --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
   --config-file experiments/cancer_summary_joint_matrix_obs500_int20_nonanon.json \
   --num-prompts 2 \
@@ -61,7 +61,7 @@ mkdir -p experiments/prompts/cancer_debug
 
 ### 2. Dry run the launcher
 ```bash
-CUDA_VISIBLE_DEVICES=0 /home/yuen_chen/.conda/envs/enco/bin/python experiments/run_cd_curriculum.py \
+CUDA_VISIBLE_DEVICES=0 python experiments/run_cd_curriculum.py \
   --curriculum-file experiments/cd_curriculum_debug_cancer.json \
   --output-root /tmp/cd_curriculum_debug_cancer \
   --dry-run
@@ -69,7 +69,7 @@ CUDA_VISIBLE_DEVICES=0 /home/yuen_chen/.conda/envs/enco/bin/python experiments/r
 
 ### 3. Run the real smoke test
 ```bash
-CUDA_VISIBLE_DEVICES=0 /home/yuen_chen/.conda/envs/enco/bin/python experiments/run_cd_curriculum.py \
+CUDA_VISIBLE_DEVICES=0 python experiments/run_cd_curriculum.py \
   --curriculum-file experiments/cd_curriculum_debug_cancer.json \
   --output-root /tmp/cd_curriculum_debug_cancer
 ```
