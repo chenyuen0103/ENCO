@@ -56,7 +56,18 @@ def _infer_from_response_csv(response_csv: str) -> dict[str, Any]:
 
     model = ""
     try:
-        model = stem.split("_")[-1]
+        m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+        if m_names:
+            model = m_names.group("model")
+        else:
+            m_resp = re.match(
+                r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
+                r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            if m_resp:
+                model = m_resp.group("model")
     except Exception:
         model = ""
 

@@ -24,7 +24,7 @@ def _context_window_for(model: str) -> int:
 
 
 _RESP_RE = re.compile(
-    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>[^_]+))?$",
+    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>.+))?$",
     flags=re.IGNORECASE,
 )
 
@@ -94,11 +94,18 @@ def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -
 
 
 def _infer_model_from_stem(stem: str) -> str:
-    # query_gemini.py appends args.model.split("/")[-1] to the stem
-    # if not already present, so the model is typically the last underscore token.
-    parts = stem.split("_")
-    if parts:
-        return parts[-1]
+    # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
+    m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+    if m_names:
+        return m_names.group("model")
+    m_resp = re.match(
+        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
+        r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_resp:
+        return m_resp.group("model")
     return "unknown"
 
 

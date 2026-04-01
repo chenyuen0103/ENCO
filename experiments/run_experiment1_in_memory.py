@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import itertools
 import json
 import os
 import re
@@ -34,8 +35,29 @@ def _extract_answer_text(text: str) -> str:
     return m.group(1) if m else (text or "")
 
 
+def _extract_adjacency_from_response(text: str, *, fallback_variables: list[str] | None = None):
+    answer_text = _extract_answer_text(text)
+    mat = extract_adjacency_matrix(answer_text, fallback_variables=fallback_variables)
+    if mat is not None:
+        return mat
+    if answer_text != (text or ""):
+        return extract_adjacency_matrix(text, fallback_variables=fallback_variables)
+    return None
+
+
 def _format_ok(text: str) -> int:
-    return int(bool(FORMAT_RE.match(text or "")))
+    t = text or ""
+    if FORMAT_RE.match(t):
+        return 1
+    # Also accept JSON-only contract used by prompt generators.
+    s = t.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return 0
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return 0
+    return int(isinstance(obj, dict) and isinstance(obj.get("adjacency_matrix"), list))
 
 
 def _compose_prompt(prompt_text: str, extra_output_instruction: str) -> str:
@@ -278,22 +300,16 @@ def _load_completed(out_path: Path, overwrite: bool) -> tuple[set[tuple[int, int
         reader = csv.DictReader(f)
         for row in reader:
             raw = (row.get("raw_response") or "").lstrip()
-            pred = (row.get("prediction") or "").strip()
-            valid_str = str(row.get("valid", "")).strip()
-            try:
-                valid = int(valid_str) == 1
-            except Exception:
-                valid = bool(pred)
             is_error = raw.startswith("[ERROR]")
-            if raw and not is_error and pred and valid:
-                try:
-                    key = (int(row.get("data_idx", -1)), int(row.get("shuffle_idx", -1)))
-                    completed.add(key)
-                    rows.append(row)
-                except Exception:
-                    continue
-            elif not is_error and pred and valid:
-                # keep non-error, valid rows even if raw is empty (should be rare)
+            if is_error:
+                # Rerun only explicit error rows.
+                continue
+            try:
+                key = (int(row.get("data_idx", -1)), int(row.get("shuffle_idx", -1)))
+                completed.add(key)
+                rows.append(row)
+            except Exception:
+                # Keep malformed-key rows in the output file, but do not mark as completed.
                 rows.append(row)
     return completed, rows
 
@@ -314,6 +330,7 @@ def _iter_prompts_for_config(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
+    thinking_tags: bool,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     is_names_only = (obs_per_prompt == 0 and int_per_combo == 0)
     if is_names_only:
@@ -324,6 +341,7 @@ def _iter_prompts_for_config(
             col_order=col_order,
             anonymize=anonymize,
             causal_rules=causal_rules,
+            thinking_tags=thinking_tags,
         )
     try:
         from generate_prompts import iter_prompts_in_memory
@@ -347,6 +365,7 @@ def _iter_prompts_for_config(
         give_steps=give_steps,
         def_int=def_int,
         intervene_vars=intervene_vars,
+        thinking_tags=thinking_tags,
     )
 
 
@@ -439,7 +458,7 @@ def _run_model_for_config(
                 )
 
             answer_text = _extract_answer_text(resp)
-            adj = extract_adjacency_matrix(answer_text, fallback_variables=variables_for_parse)
+            adj = _extract_adjacency_from_response(resp, fallback_variables=variables_for_parse)
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
             valid = 1 if adj is not None else 0
             format_ok = _format_ok(resp)
@@ -622,6 +641,11 @@ def _run_model_for_config(
         if provider == "hf":
             _flush_hf_batch()
 
+    print(
+        f"[summary] wrote={wrote} skipped={skipped} kept_existing={len(existing_rows)} out={out_path.name}",
+        file=sys.stderr,
+        flush=True,
+    )
     print(f"[info] Wrote responses: {out_path}")
 
 
@@ -650,7 +674,7 @@ def main() -> None:
     ap.add_argument(
         "--hf-max-new-tokens",
         type=int,
-        default=0,
+        default=8192,
         help="HF generation max_new_tokens. Set <=0 for no explicit cap (default: 0).",
     )
     ap.add_argument(
@@ -688,10 +712,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--extra-output-instruction",
-        default=(
-            "First write your reasoning inside <think>...</think>, then provide only the final "
-            "JSON adjacency matrix inside <answer>...</answer>. Do not put JSON outside <answer>."
-        ),
+        default="",
         help=(
             "Extra instruction appended to every prompt before querying. "
             "Use empty string to disable."
@@ -737,6 +758,13 @@ def main() -> None:
         help="For each configuration, write ONE example prompt (first row) to disk for debugging.",
     )
     ap.add_argument(
+        "--no-save-example-prompt",
+        dest="save_example_prompt",
+        action="store_false",
+        help="Disable writing one example prompt per configuration.",
+    )
+    ap.set_defaults(save_example_prompt=True)
+    ap.add_argument(
         "--example-prompt-dir",
         type=Path,
         default=None,
@@ -752,6 +780,19 @@ def main() -> None:
     ap.add_argument("--intervene-vars", default="all")
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument("--give-steps", action="store_true")
+    ap.add_argument(
+        "--thinking-tags",
+        dest="thinking_tags",
+        action="store_true",
+        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+    )
+    ap.add_argument(
+        "--no-thinking-tags",
+        dest="thinking_tags",
+        action="store_false",
+        help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
+    )
+    ap.set_defaults(thinking_tags=True)
     ap.add_argument("--single-config", action="store_true")
     ap.add_argument(
         "--config-file",
@@ -910,6 +951,7 @@ def main() -> None:
                                     give_steps=args.give_steps,
                                     def_int=args.def_int,
                                     intervene_vars=args.intervene_vars,
+                                    thinking_tags=bool(args.thinking_tags),
                                 )
 
                                 if args.save_example_prompt:
@@ -927,6 +969,8 @@ def main() -> None:
                                         overwrite=bool(args.overwrite_example_prompt),
                                     )
                                     print(f"[info] Wrote example prompt: {out_p}", file=sys.stderr, flush=True)
+                                    # Preserve all rows for actual querying after sampling one debug prompt.
+                                    prompt_iter = itertools.chain([first], prompt_iter)
 
                                 if args.print_one_prompt:
                                     try:
@@ -980,6 +1024,7 @@ def main() -> None:
                                             give_steps=args.give_steps,
                                             def_int=args.def_int,
                                             intervene_vars=args.intervene_vars,
+                                            thinking_tags=bool(args.thinking_tags),
                                         )
                                         n_rows = 0
                                         for tok_row in token_iter:
@@ -1053,6 +1098,7 @@ def main() -> None:
                                         give_steps=args.give_steps,
                                         def_int=args.def_int,
                                         intervene_vars=args.intervene_vars,
+                                        thinking_tags=bool(args.thinking_tags),
                                     )
                                     _run_model_for_config(
                                         dataset=dataset,
