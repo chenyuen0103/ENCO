@@ -68,6 +68,14 @@ def _parse_extra_args(value: Any) -> List[str]:
     return shlex.split(s)
 
 
+def _append_flag_once(args: List[str], flag: str, enabled: bool) -> List[str]:
+    if not enabled:
+        return list(args)
+    if flag in args:
+        return list(args)
+    return [*args, flag]
+
+
 def _extract_payload_text(raw: str) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -89,6 +97,17 @@ def _default_think_text(task: str) -> str:
     if task == "cd_descendants":
         return "I will output only the required JSON descendants object."
     return "I will output only the required JSON graph object."
+
+
+def _ensure_assistant_think_prefill(prompt: str) -> str:
+    s = str(prompt or "").rstrip()
+    if not s:
+        return "<think>"
+    if s.endswith("<think>"):
+        return s
+    if s.endswith("assistant"):
+        return s + "\n<think>"
+    return s + "\n<think>"
 
 
 def build_generic_sft_jsonl(
@@ -130,8 +149,9 @@ def build_generic_sft_jsonl(
                 if answer_mode == "completion":
                     completion = answer_raw
                 elif answer_mode == "payload":
+                    prompt = _ensure_assistant_think_prefill(prompt)
                     payload = _extract_payload_text(answer_raw)
-                    completion = f"<think>{think_text}</think><answer>{payload}</answer>"
+                    completion = f"</think><answer>{payload}</answer>"
                 else:
                     raise ValueError(f"unsupported answer_mode={answer_mode!r}")
 
@@ -605,6 +625,7 @@ def main() -> None:
         answer_col = str(stage.get("answer_col", "answer"))
         answer_path_col = str(stage.get("answer_path_col", "answer_path"))
         gate_spec = dict(stage.get("gate") or {})
+        enable_thinking = bool(stage.get("enable_thinking", curriculum.get("enable_thinking", False)))
 
         stage_dir = output_root / f"{stage_idx:02d}_{stage_name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -682,6 +703,7 @@ def main() -> None:
             promoted_model = str(sft_output_dir)
 
             sft_eval_args = default_eval_args + _parse_extra_args(stage.get("sft_eval_args"))
+            sft_eval_args = _append_flag_once(sft_eval_args, "--enable-thinking", enable_thinking)
             sft_eval_json = stage_dir / "sft_eval.json"
             _run_grpo_eval(
                 python_exe=python_exe,
@@ -709,6 +731,7 @@ def main() -> None:
         if enable_grpo:
             grpo_output_dir = stage_dir / "grpo"
             grpo_args = default_grpo_args + _parse_extra_args(stage.get("grpo_args"))
+            grpo_args = _append_flag_once(grpo_args, "--enable-thinking", enable_thinking)
             _run_grpo_train(
                 python_exe=python_exe,
                 nproc_per_node=nproc_per_node,
@@ -742,6 +765,7 @@ def main() -> None:
                     raise SystemExit(f"Stage {stage_idx} ({stage_name}) failed after_grpo_train gate.")
 
             grpo_eval_args = default_eval_args + _parse_extra_args(stage.get("grpo_eval_args"))
+            grpo_eval_args = _append_flag_once(grpo_eval_args, "--enable-thinking", enable_thinking)
             grpo_eval_json = stage_dir / "grpo_eval.json"
             _run_grpo_eval(
                 python_exe=python_exe,

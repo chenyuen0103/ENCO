@@ -290,45 +290,22 @@ def run_sft(
             pass
 
     ds = load_dataset("json", data_files=str(sft_jsonl), split="train")
-    # Prefer chat-template formatted SFT text when prompt/answer fields are present.
-    # This enables tokenizer-specific formatting and thinking mode for Qwen-style tokenizers.
-    def _to_sft_text(ex: dict[str, Any]) -> dict[str, str]:
-        prompt = ex.get("prompt")
-        answer = ex.get("answer")
-        if isinstance(prompt, str) and isinstance(answer, str):
-            if hasattr(tokenizer, "apply_chat_template"):
-                messages = [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": answer},
-                ]
-                kwargs: dict[str, Any] = {
-                    "tokenize": False,
-                    "add_generation_prompt": False,
-                }
-                try:
-                    params = inspect.signature(tokenizer.apply_chat_template).parameters
-                    if "enable_thinking" in params:
-                        kwargs["enable_thinking"] = True
-                except Exception:
-                    pass
-                try:
-                    text = tokenizer.apply_chat_template(messages, **kwargs)
-                    if isinstance(text, str):
-                        return {"text": text}
-                except Exception:
-                    # Fall through to plain concatenation fallback.
-                    pass
-            return {"text": prompt + "\n\n" + answer}
-
+    dataset_uses_prompt_completion = "prompt" in ds.column_names and "answer" in ds.column_names
+    if dataset_uses_prompt_completion:
+        keep = {"prompt", "answer"}
+        ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+        ds = ds.rename_column("answer", "completion")
+    else:
         # Backward compatibility for older JSONL files that only contain "text".
-        text0 = ex.get("text")
-        return {"text": text0 if isinstance(text0, str) else ""}
+        def _to_sft_text(ex: dict[str, Any]) -> dict[str, str]:
+            text0 = ex.get("text")
+            return {"text": text0 if isinstance(text0, str) else ""}
 
-    ds = ds.map(
-        _to_sft_text,
-        desc="Formatting SFT data with chat template",
-        remove_columns=ds.column_names,
-    )
+        ds = ds.map(
+            _to_sft_text,
+            desc="Formatting legacy SFT data",
+            remove_columns=ds.column_names,
+        )
     cfg_kwargs = {
         "output_dir": str(sft_output_dir),
         "num_train_epochs": float(sft_epochs),
@@ -340,9 +317,12 @@ def run_sft(
         "save_steps": int(sft_save_steps),
         "bf16": torch_cuda_available(),
         "max_seq_length": int(sft_max_seq_length),
-        "dataset_text_field": "text",
         "report_to": "none",
     }
+    if dataset_uses_prompt_completion:
+        cfg_kwargs["completion_only_loss"] = True
+    else:
+        cfg_kwargs["dataset_text_field"] = "text"
     # Older/newer TRL versions may default eos_token to a placeholder like "<EOS_TOKEN>".
     # Force EOS to the tokenizer's actual EOS symbol when available.
     if getattr(tokenizer, "eos_token", None):

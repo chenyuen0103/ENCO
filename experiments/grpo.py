@@ -11,6 +11,7 @@ import subprocess
 import csv
 import io
 import importlib
+import inspect
 import shlex
 from contextlib import redirect_stdout, redirect_stderr
 import torch
@@ -634,6 +635,9 @@ def build_argparser():
     p.add_argument("--eval_temperature", type=float, default=0.0)
     p.add_argument("--eval_top_p", type=float, default=0.95)
     p.add_argument("--eval_do_sample", action="store_true")
+    p.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
+    p.add_argument("--no-enable-thinking", dest="enable_thinking", action="store_false")
+    p.set_defaults(enable_thinking=False)
     p.add_argument("--eval_debug_csv", type=str, default=None)
     p.add_argument("--eval_model", type=str, default=None)
     p.add_argument("--eval_output_json", type=str, default=None)
@@ -653,7 +657,27 @@ def build_argparser():
     return p
 
 
-def build_prompt(problem: str) -> str:
+def build_prompt(problem: str, tokenizer: AutoTokenizer | None = None, enable_thinking: bool = False) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": str(problem)},
+    ]
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        try:
+            params = inspect.signature(tokenizer.apply_chat_template).parameters
+            if enable_thinking and "enable_thinking" in params:
+                kwargs["enable_thinking"] = True
+            return str(tokenizer.apply_chat_template(messages, **kwargs))
+        except Exception:
+            try:
+                kwargs.pop("enable_thinking", None)
+                return str(tokenizer.apply_chat_template(messages, **kwargs))
+            except Exception:
+                pass
     return f"system\n{SYSTEM_PROMPT}\nuser\n{problem}\nassistant\n"
 
 
@@ -1121,10 +1145,12 @@ def _eval_on_dataset(
     progress_desc: str = "eval",
     progress_output_json: str = None,
     progress_payload_base: dict | None = None,
+    enable_thinking: bool = False,
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     model = _load_eval_model(model_id_or_path)
     input_device = next(model.parameters()).device
 
@@ -1138,7 +1164,19 @@ def _eval_on_dataset(
 
     def _build_prompt_for_eval(example):
         if task == "math":
-            return build_prompt(example["problem"])
+            problem_text = str(example["problem"])
+            return build_prompt(
+                problem_text,
+                tokenizer=tokenizer,
+                enable_thinking=bool(enable_thinking),
+            )
+        prompt_raw = str(example.get("prompt_raw") or "").strip()
+        if prompt_raw:
+            return build_prompt(
+                prompt_raw,
+                tokenizer=tokenizer,
+                enable_thinking=bool(enable_thinking),
+            )
         return str(example["prompt"])
 
     generation_kwargs = {
@@ -1168,7 +1206,7 @@ def _eval_on_dataset(
                 }
             )
         inputs = tokenizer(prompts, **tokenization_kwargs).to(input_device)
-        prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        padded_input_len = int(inputs["input_ids"].shape[1])
 
         with torch.no_grad():
             out = model.generate(
@@ -1181,9 +1219,8 @@ def _eval_on_dataset(
             start = batch_idx * pass_k
             end = start + pass_k
             seqs = out[start:end]
-            prompt_len = int(prompt_lens[batch_idx])
             completions = [
-                tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
+                tokenizer.decode(seq[padded_input_len:], skip_special_tokens=True)
                 for seq in seqs
             ]
 
@@ -1227,7 +1264,7 @@ def _eval_on_dataset(
                     "model": model_id_or_path,
                     "example_idx": idx,
                     "sample_idx": sample_idx,
-                    "problem": example.get("problem", example.get("prompt", "")),
+                    "problem": prompts[batch_idx],
                     "solution": example.get("solution", example.get("answer", "")),
                     "completion": completion_text,
                     "answer_text": answer_text,
@@ -1380,6 +1417,7 @@ def run_eval(args):
         progress_desc=f"eval:{Path(args.eval_model).name}",
         progress_output_json=args.eval_output_json,
         progress_payload_base=base_result,
+        enable_thinking=bool(args.enable_thinking),
     )
 
     result = dict(base_result)
@@ -1760,6 +1798,7 @@ def run_train(args, argv: list[str] | None = None):
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     # ---- Dataset
     if args.task == "math":
