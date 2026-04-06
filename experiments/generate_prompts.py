@@ -1629,6 +1629,86 @@ def format_prompt_descendants_summary(
     return "\n".join(lines)
 
 
+def format_prompt_descendants_no_data(
+    variables: List[str],
+    *,
+    dataset_name: str,
+    intervention_target: str,
+    intervention_value: str,
+    state_names: Optional[List[List[str]]] = None,
+    include_causal_rules: bool = False,
+    include_def_int: bool = False,
+    anonymize: bool = True,
+) -> str:
+    """
+    Prompt for descendant prediction without any observational or interventional
+    summaries. This is intended as a names-only / prior-knowledge probe, not a
+    standard evidence-based descendant task.
+    """
+    lines: List[str] = []
+    lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
+    lines.append(
+        f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
+    )
+    if anonymize:
+        lines.append("We are studying an anonymized Bayesian network.")
+    else:
+        lines.append(f"We are studying a Bayesian network named {dataset_name}.")
+    lines.append("No observational or interventional data are provided for this case.")
+    lines.append("Infer descendants using background causal knowledge and the variable names only.")
+
+    lines.append("ASSUMPTIONS:")
+    lines.append("- The true graph is a DAG (no directed cycles).")
+    lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
+    lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
+    lines.append("- Descendants are variables reachable by directed paths from the intervention target.")
+
+    if include_causal_rules:
+        lines.extend(
+            [
+                "\n--- CAUSAL DISCOVERY REMINDERS ---",
+                "- Descendants include indirect downstream effects, not only direct children.",
+                "- Ancestors and non-descendants of X are not descendants of X.",
+                "- Use only background causal knowledge and the variable names in this no-data setting.",
+            ]
+        )
+
+    if include_def_int:
+        lines.extend(
+            [
+                "\n--- INTERVENTION SEMANTICS ---",
+                f"- In do({intervention_target} = {intervention_value}), {intervention_target} is externally fixed.",
+                f"- The intervention removes all incoming edges into {intervention_target}.",
+                f"- Only downstream variables can be affected by the intervention.",
+            ]
+        )
+
+    lines.append("\n--- VARIABLE ORDER ---")
+    for i, v in enumerate(variables):
+        if state_names and i < len(state_names) and state_names[i]:
+            mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
+            lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
+        else:
+            lines.append(f"{i}: {v}")
+
+    lines.append("\n--- AVAILABLE EVIDENCE ---")
+    lines.append("No empirical summaries are provided in this prompt.")
+
+    lines.append("\n--- INTERVENTION OF INTEREST ---")
+    lines.append(f"intervention=do({intervention_target}={intervention_value})")
+    lines.append("do_n=0")
+    lines.append("do_marginals={}")
+    lines.append("tv_change_vs_obs=[]")
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.append(
+        f"Return the descendants of {intervention_target}: the variables that are downstream of the intervention target."
+    )
+    lines.extend(_build_descendants_output_contract_lines())
+
+    return "\n".join(lines)
+
+
 def format_prompt_summary_full_joint(
     variables: List[str],
     *,

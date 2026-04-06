@@ -493,6 +493,9 @@ def build_hf_pipeline(
     except Exception:
         dtype_val = None
 
+    model_path = Path(model_name)
+    is_adapter = model_path.exists() and (model_path / "adapter_config.json").exists()
+
     try:
         tok = AutoTokenizer.from_pretrained(
             model_name,
@@ -507,12 +510,27 @@ def build_hf_pipeline(
                     tok.pad_token = tok.eos_token
         except Exception:
             pass
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=bool(trust_remote_code),
-            device_map=device_map if device_map else None,
-            dtype=dtype_val if dtype_val is not None else None,
-        )
+        if is_adapter:
+            try:
+                from peft import AutoPeftModelForCausalLM  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    f"Model path '{model_name}' looks like a PEFT adapter checkpoint, "
+                    "but PEFT is not available to load it."
+                ) from e
+            model = AutoPeftModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=bool(trust_remote_code),
+                device_map=device_map if device_map else None,
+                dtype=dtype_val if dtype_val is not None else None,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=bool(trust_remote_code),
+                device_map=device_map if device_map else None,
+                dtype=dtype_val if dtype_val is not None else None,
+            )
         # Align model pad_token_id with tokenizer if missing
         try:
             if getattr(model.config, "pad_token_id", None) is None and getattr(tok, "pad_token_id", None) is not None:

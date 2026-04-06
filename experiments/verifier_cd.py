@@ -4,10 +4,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# Allow free-form reasoning before the final answer block.
-# We only require that the completion ends with a well-formed <answer>...</answer>.
-FORMAT_RE = re.compile(r"(?s)^.*<answer>.*?</answer>\s*$")
+# Accept either:
+# 1) full standalone output: <think>...</think><answer>...</answer>
+# 2) completion-only tail after prompt prefill: ...</think><answer>...</answer>
+FORMAT_RE_FULL = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+FORMAT_RE_COMPLETION = re.compile(r"(?s)^\s*.+?</think>\s*<answer>.*?</answer>\s*$")
+FORMAT_RE_ANSWER_TAIL = re.compile(r"(?s)^\s*(\{.*\}|\[.*\])\s*</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
+PROMPT_COPY_MARKERS = (
+    "OBSERVATIONAL SUMMARY",
+    "INTERVENTION OF INTEREST",
+    "tv_change_vs_obs",
+    "obs_marginals=",
+    "do_marginals=",
+    "The intervention do(",
+)
+VARIABLE_ORDER_RE = re.compile(r"\b\d+\s*:\s*[^:\n]{1,80}states=\{")
 
 
 def completion_to_text(completion: Any) -> str:
@@ -27,16 +39,55 @@ def completion_to_text(completion: Any) -> str:
 
 def extract_answer_text(text: str) -> str:
     m = ANSWER_RE.search(text or "")
-    return m.group(1) if m else (text or "")
+    if m:
+        return m.group(1)
+    s = text or ""
+    if "</answer>" in s:
+        return s.rsplit("</answer>", 1)[0].strip()
+    return s
 
 
 def format_ok(text: str) -> int:
-    return int(bool(FORMAT_RE.match(text or "")))
+    s = text or ""
+    return int(bool(FORMAT_RE_FULL.match(s) or FORMAT_RE_COMPLETION.match(s) or FORMAT_RE_ANSWER_TAIL.match(s)))
 
 
 def cd_format_reward(completions, **kwargs):
     texts = [completion_to_text(c) for c in completions]
     return [1.0 if format_ok(t) else 0.0 for t in texts]
+
+
+def _strict_cd_payload_ok(text: str) -> bool:
+    """
+    Strict formatting for reward purposes:
+    require the outer format markers *and* a parseable causal-discovery payload
+    inside the answer region (or, for answer-tail mode, in the completion tail).
+    """
+    if not format_ok(text):
+        return False
+
+    ans_text = extract_answer_text(text)
+    if extract_descendant_payload(ans_text) is not None:
+        return True
+    if extract_descendant_payload(text) is not None:
+        return True
+    if extract_adjacency_matrix(ans_text) is not None:
+        return True
+    if extract_adjacency_matrix(text) is not None:
+        return True
+    return False
+
+
+def _looks_like_prompt_copy(text: str) -> bool:
+    s = str(text or "")
+    if any(marker in s for marker in PROMPT_COPY_MARKERS):
+        return True
+    return bool(VARIABLE_ORDER_RE.search(s))
+
+
+def _looks_like_null_answer(text: str) -> bool:
+    s = str(text or "").strip().strip("`").strip().lower()
+    return s in {"", "none", "null", "n/a", "na", "unknown", "[]", "{}"}
 
 
 def build_cd_format_reward(scale: float = 0.2):
@@ -46,7 +97,7 @@ def build_cd_format_reward(scale: float = 0.2):
     def _cd_format_reward(completions, **kwargs):
         texts = [completion_to_text(c) for c in completions]
         s = float(scale)
-        return [s if format_ok(t) else 0.0 for t in texts]
+        return [s if _strict_cd_payload_ok(t) else 0.0 for t in texts]
 
     _cd_format_reward.__name__ = "cd_format_reward"
     return _cd_format_reward
@@ -90,10 +141,14 @@ def build_cd_partial_format_reward(scale: float = 0.25):
             expected_n = len(target_adj) if target_adj is not None else None
 
             base = 0.0
+            if "<think>" in t:
+                base += 0.15
+            if "</think>" in t:
+                base += 0.15
             if "<answer>" in t:
-                base += 0.2
+                base += 0.15
             if "</answer>" in t:
-                base += 0.2
+                base += 0.15
             if "adjacency_matrix" in t:
                 base += 0.1
 
@@ -542,22 +597,78 @@ def build_cd_descendant_partial_format_reward(scale: float = 0.25):
         s = float(scale)
         for completion in completions:
             t = completion_to_text(completion) or ""
+            ans_text = extract_answer_text(t)
+            payload = extract_descendant_payload(t)
             base = 0.0
+
+            if "</think>" in t:
+                base += 0.10
             if "<answer>" in t:
-                base += 0.2
+                base += 0.05
             if "</answer>" in t:
-                base += 0.2
-            if '"target"' in t or "target" in t:
-                base += 0.15
-            if '"descendants"' in t or "descendants" in t:
-                base += 0.15
-            if extract_descendant_payload(t) is not None:
-                base += 0.3
+                base += 0.05
+            if '"target"' in ans_text or "target" in ans_text:
+                base += 0.20
+            if '"descendants"' in ans_text or "descendants" in ans_text:
+                base += 0.20
+            if payload is not None:
+                base += 0.40
+
+            # Do not reward degenerate answers like <answer>None</answer>.
+            if _looks_like_null_answer(ans_text):
+                base = min(base, 0.02)
+
+            # Strongly downweight prompt-copy behavior unless it still parses.
+            if _looks_like_prompt_copy(t):
+                base *= 0.15 if payload is None else 0.5
+
             rewards.append(float(s * max(0.0, min(1.0, base))))
         return rewards
 
     cd_descendant_partial_format_reward.__name__ = "cd_descendant_partial_format_reward"
     return cd_descendant_partial_format_reward
+
+
+def build_cd_descendant_answer_tail_partial_format_reward(scale: float = 0.25):
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    def cd_descendant_answer_tail_partial_format_reward(completions, **kwargs):
+        rewards: List[float] = []
+        s = float(scale)
+        for completion in completions:
+            t = completion_to_text(completion) or ""
+            ans_text = extract_answer_text(t)
+            payload = extract_descendant_payload(t)
+            base = 0.0
+
+            if ans_text.lstrip().startswith("{"):
+                base += 0.20
+            if ans_text.lstrip().startswith("["):
+                base += 0.05
+            if '"target"' in ans_text or "target" in ans_text:
+                base += 0.25
+            if '"descendants"' in ans_text or "descendants" in ans_text:
+                base += 0.25
+            if "</answer>" in t:
+                base += 0.10
+
+            if payload is not None:
+                base += 0.35
+
+            if _looks_like_null_answer(ans_text):
+                base = min(base, 0.02)
+
+            if _looks_like_prompt_copy(t):
+                base *= 0.10 if payload is None else 0.5
+
+            rewards.append(float(s * max(0.0, min(1.0, base))))
+        return rewards
+
+    cd_descendant_answer_tail_partial_format_reward.__name__ = (
+        "cd_descendant_answer_tail_partial_format_reward"
+    )
+    return cd_descendant_answer_tail_partial_format_reward
 
 
 def build_cd_descendant_f1_reward(scale: float = 1.0):

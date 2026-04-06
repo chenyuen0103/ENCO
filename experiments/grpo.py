@@ -21,6 +21,21 @@ from urllib import request, error
 from urllib.parse import urlparse
 
 try:
+    from cd_training_format import (
+        DEFAULT_FORMAT_HINT_TEXT,
+        SYSTEM_PROMPT,
+        canonicalize_cd_prompt,
+        default_short_think_text,
+    )
+except ModuleNotFoundError:
+    from experiments.cd_training_format import (
+        DEFAULT_FORMAT_HINT_TEXT,
+        SYSTEM_PROMPT,
+        canonicalize_cd_prompt,
+        default_short_think_text,
+    )
+
+try:
     from torch.nn.parallel import DistributedDataParallel as _DDP
 except Exception:
     _DDP = None
@@ -39,6 +54,7 @@ from verifier_cd import (
     build_cd_format_reward,
     build_cd_partial_format_reward,
     build_cd_descendant_partial_format_reward,
+    build_cd_descendant_answer_tail_partial_format_reward,
     build_cd_graph_reward,
     build_cd_descendant_f1_reward,
     build_cd_edge_f1_reward,
@@ -60,12 +76,6 @@ except Exception:
     parse = None
     verify = None
     _HAS_MATH_VERIFY = False
-
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
-    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-    "The reasoning process and answer are enclosed within <think> and </think> tags, and <answer> and </answer> tags, respectively."
-)
 
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
@@ -235,6 +245,7 @@ class CompactMetricsCallback(TrainerCallback):
         ("rewards/accuracy_reward/mean", "acc"),
         ("rewards/cd_partial_format_reward/mean", "pfmt"),
         ("rewards/cd_descendant_partial_format_reward/mean", "dpfmt"),
+        ("rewards/cd_descendant_answer_tail_partial_format_reward/mean", "dpfmt"),
         ("rewards/cd_descendant_f1_reward/mean", "desc"),
         ("rewards/cd_graph_reward/mean", "cd"),
         ("rewards/cd_edge_f1_reward/mean", "f1"),
@@ -379,6 +390,15 @@ def build_argparser():
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument(
+        "--grpo-beta",
+        type=float,
+        default=0.02,
+        help=(
+            "KL anchor strength for GRPO relative to the reference policy. "
+            "Use a small positive value to keep rollouts closer to the SFT initializer."
+        ),
+    )
+    p.add_argument(
         "--length_penalty_coef",
         type=float,
         default=0.0000333333,
@@ -508,11 +528,23 @@ def build_argparser():
     p.add_argument(
         "--cd-format-hint-text",
         type=str,
-        default=(
-            "Use exactly this structure: <think>...</think><answer>...</answer>. "
-            "Inside <answer>, output only the final graph answer."
+        default=DEFAULT_FORMAT_HINT_TEXT,
+    )
+    p.add_argument(
+        "--cd-grpo-prefill-answer",
+        dest="cd_grpo_prefill_answer",
+        action="store_true",
+        help=(
+            "For cd_descendants training rollouts, prefill the assistant through the short think "
+            "trace and opening <answer>, so GRPO only generates the JSON payload and closing tag."
         ),
     )
+    p.add_argument(
+        "--no-cd-grpo-prefill-answer",
+        dest="cd_grpo_prefill_answer",
+        action="store_false",
+    )
+    p.set_defaults(cd_grpo_prefill_answer=True)
     p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
     p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
     p.add_argument(
@@ -767,6 +799,8 @@ def _load_cd_rows_from_prompt_csv(
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
+    prefill_answer: bool = False,
+    think_text: str = "",
 ) -> list[dict]:
     rows: list[dict] = []
     _set_csv_field_limit()
@@ -784,13 +818,15 @@ def _load_cd_rows_from_prompt_csv(
                 prompt_raw = prompt_path.read_text(encoding="utf-8", errors="ignore")
 
             prompt_text = prompt_raw
-            if wrap_system_prompt:
-                prompt_text = build_prompt(prompt_text)
-            if append_format_hint and format_hint_text:
-                prompt_text = (
-                    f"{prompt_text}\n\n"
-                    f"Formatting requirement: {format_hint_text}"
-                )
+            prompt_text = canonicalize_cd_prompt(
+                prompt_text,
+                wrap_system_prompt=bool(wrap_system_prompt),
+                append_format_hint=bool(append_format_hint),
+                format_hint_text=str(format_hint_text),
+                prefill_think=not bool(prefill_answer),
+                prefill_answer=bool(prefill_answer),
+                think_text=str(think_text),
+            )
 
             answer_raw = (row.get("answer") or "").strip()
             if not answer_raw:
@@ -819,6 +855,8 @@ def _dataset_from_cd_csvs(
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
+    prefill_answer: bool = False,
+    think_text: str = "",
 ) -> Dataset:
     datasets_list = []
     for path_str in csv_paths:
@@ -830,6 +868,8 @@ def _dataset_from_cd_csvs(
             wrap_system_prompt=wrap_system_prompt,
             append_format_hint=append_format_hint,
             format_hint_text=format_hint_text,
+            prefill_answer=prefill_answer,
+            think_text=think_text,
         )
         if not rows:
             raise ValueError(f"No usable rows found in {p}")
@@ -852,6 +892,8 @@ def _dataset_from_cd_config_file(
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
+    prefill_answer: bool = False,
+    think_text: str = "",
     causal_rules: bool = False,
     give_steps: bool = False,
     def_int: bool = False,
@@ -966,13 +1008,15 @@ def _dataset_from_cd_config_file(
                         anonymize=bool(item.get("anonymize", anon)),
                     )
                     prompt_text = prompt_raw
-                    if wrap_system_prompt:
-                        prompt_text = build_prompt(prompt_text)
-                    if append_format_hint and format_hint_text:
-                        prompt_text = (
-                            f"{prompt_text}\n\n"
-                            f"Formatting requirement: {format_hint_text}"
-                        )
+                    prompt_text = canonicalize_cd_prompt(
+                        prompt_text,
+                        wrap_system_prompt=bool(wrap_system_prompt),
+                        append_format_hint=bool(append_format_hint),
+                        format_hint_text=str(format_hint_text),
+                        prefill_think=not bool(prefill_answer),
+                        prefill_answer=bool(prefill_answer),
+                        think_text=str(think_text),
+                    )
                     rows.append(
                         {
                             "prompt_raw": prompt_raw,
@@ -990,13 +1034,15 @@ def _dataset_from_cd_config_file(
 
             prompt_raw = str(item.get("prompt_text", ""))
             prompt_text = prompt_raw
-            if wrap_system_prompt:
-                prompt_text = build_prompt(prompt_text)
-            if append_format_hint and format_hint_text:
-                prompt_text = (
-                    f"{prompt_text}\n\n"
-                    f"Formatting requirement: {format_hint_text}"
-                )
+            prompt_text = canonicalize_cd_prompt(
+                prompt_text,
+                wrap_system_prompt=bool(wrap_system_prompt),
+                append_format_hint=bool(append_format_hint),
+                format_hint_text=str(format_hint_text),
+                prefill_think=not bool(prefill_answer),
+                prefill_answer=bool(prefill_answer),
+                think_text=str(think_text),
+            )
             rows.append(
                 {
                     "prompt_raw": prompt_raw,
@@ -1119,6 +1165,29 @@ def _apply_explicit_generation_config(
             pass
 
 
+def _wrap_generate_with_eval_mode(model):
+    if getattr(model, "_grpo_eval_generate_wrapped", False):
+        return model
+
+    original_generate = getattr(model, "generate", None)
+    if original_generate is None:
+        return model
+
+    def _generate_with_eval_mode(*args, **kwargs):
+        was_training = bool(getattr(model, "training", False))
+        if was_training:
+            model.eval()
+        try:
+            return original_generate(*args, **kwargs)
+        finally:
+            if was_training:
+                model.train()
+
+    setattr(model, "generate", _generate_with_eval_mode)
+    setattr(model, "_grpo_eval_generate_wrapped", True)
+    return model
+
+
 def _write_eval_snapshot(output_json_path: str, payload: dict) -> None:
     if not output_json_path:
         return
@@ -1167,13 +1236,6 @@ def _eval_on_dataset(
             problem_text = str(example["problem"])
             return build_prompt(
                 problem_text,
-                tokenizer=tokenizer,
-                enable_thinking=bool(enable_thinking),
-            )
-        prompt_raw = str(example.get("prompt_raw") or "").strip()
-        if prompt_raw:
-            return build_prompt(
-                prompt_raw,
                 tokenizer=tokenizer,
                 enable_thinking=bool(enable_thinking),
             )
@@ -1682,6 +1744,8 @@ def run_train(args, argv: list[str] | None = None):
         raise ValueError("--train_temperature must be >= 0.")
     if not (0 < args.train_top_p <= 1.0):
         raise ValueError("--train_top_p must be in (0, 1].")
+    if args.grpo_beta < 0:
+        raise ValueError("--grpo-beta must be >= 0.")
     if not args.stop_sequence:
         args.stop_sequence = ["</answer>"]
     args.stop_sequence = [s for s in args.stop_sequence if isinstance(s, str) and s]
@@ -1829,6 +1893,8 @@ def run_train(args, argv: list[str] | None = None):
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
     else:
+        rollout_prefill_answer = bool(args.task == "cd_descendants" and args.cd_grpo_prefill_answer)
+        rollout_think_text = default_short_think_text("cd_descendants") if rollout_prefill_answer else ""
         if args.cd_config_file and args.cd_train_csv:
             raise ValueError(
                 "Use either --cd-config-file (in-memory generation) or --cd-train-csv, not both."
@@ -1846,6 +1912,8 @@ def run_train(args, argv: list[str] | None = None):
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                 append_format_hint=bool(args.cd_append_format_hint),
                 format_hint_text=str(args.cd_format_hint_text),
+                prefill_answer=rollout_prefill_answer,
+                think_text=rollout_think_text,
                 causal_rules=bool(args.cd_config_causal_rules),
                 give_steps=bool(args.cd_config_give_steps),
                 def_int=bool(args.cd_config_def_int),
@@ -1865,6 +1933,8 @@ def run_train(args, argv: list[str] | None = None):
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                 append_format_hint=bool(args.cd_append_format_hint),
                 format_hint_text=str(args.cd_format_hint_text),
+                prefill_answer=rollout_prefill_answer,
+                think_text=rollout_think_text,
             )
             if args.cd_test_csv:
                 raw_test = _dataset_from_cd_csvs(
@@ -1872,6 +1942,8 @@ def run_train(args, argv: list[str] | None = None):
                     wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                     append_format_hint=bool(args.cd_append_format_hint),
                     format_hint_text=str(args.cd_format_hint_text),
+                    prefill_answer=False,
+                    think_text="",
                 )
             else:
                 raw_test = None
@@ -1920,10 +1992,38 @@ def run_train(args, argv: list[str] | None = None):
     if distributed_world_size == 1:
         model_load_kwargs["device_map"] = "auto"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        **model_load_kwargs,
-    )
+    is_adapter = (Path(args.model_id) / "adapter_config.json").exists()
+    if is_adapter:
+        from peft import AutoPeftModelForCausalLM
+
+        adapter_load_kwargs = dict(model_load_kwargs)
+        try:
+            adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
+            if "is_trainable" in adapter_params:
+                adapter_load_kwargs["is_trainable"] = True
+        except Exception:
+            pass
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            args.model_id,
+            **adapter_load_kwargs,
+        )
+        if hasattr(model, "train"):
+            model.train()
+        if hasattr(model, "set_adapter"):
+            try:
+                model.set_adapter("default")
+            except Exception:
+                pass
+        if hasattr(model, "enable_adapter_layers"):
+            try:
+                model.enable_adapter_layers()
+            except Exception:
+                pass
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            **model_load_kwargs,
+        )
     _apply_explicit_generation_config(
         model,
         max_prompt_tokens=args.max_prompt_tokens,
@@ -1932,14 +2032,17 @@ def run_train(args, argv: list[str] | None = None):
         top_p=args.train_top_p,
     )
 
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"],
-    )
-    model = get_peft_model(model, lora_config)
+    if not is_adapter:
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "v_proj"],
+        )
+        model = get_peft_model(model, lora_config)
+
+    _wrap_generate_with_eval_mode(model)
 
     # ---- Reward functions
     def format_reward_math(completions, **kwargs):
@@ -1978,9 +2081,16 @@ def run_train(args, argv: list[str] | None = None):
         if float(args.cd_format_reward_scale) > 0.0:
             reward_funcs.append(build_cd_format_reward(scale=float(args.cd_format_reward_scale)))
         if float(args.cd_partial_format_reward_scale) > 0.0:
-            reward_funcs.append(
-                build_cd_descendant_partial_format_reward(scale=float(args.cd_partial_format_reward_scale))
-            )
+            if bool(args.cd_grpo_prefill_answer):
+                reward_funcs.append(
+                    build_cd_descendant_answer_tail_partial_format_reward(
+                        scale=float(args.cd_partial_format_reward_scale)
+                    )
+                )
+            else:
+                reward_funcs.append(
+                    build_cd_descendant_partial_format_reward(scale=float(args.cd_partial_format_reward_scale))
+                )
         reward_funcs.append(build_cd_descendant_f1_reward(scale=float(args.cd_graph_reward_scale)))
 
     logs_dir = Path(args.output_dir) / "grpo_log"
@@ -2328,6 +2438,7 @@ def run_train(args, argv: list[str] | None = None):
         learning_rate=args.learning_rate,
         remove_unused_columns=False,
         num_train_epochs=args.num_train_epochs,
+        beta=float(args.grpo_beta),
 
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from generate_prompts import (
+    format_prompt_descendants_no_data,
     format_prompt_descendants_summary,
     iter_prompts_in_memory,
 )
@@ -101,6 +102,35 @@ def _stage_slug(idx: int, stage: Dict[str, Any]) -> str:
     return f"stage_{idx}_{anon}_obs{obs_n}_int{int_n}"
 
 
+def _enumerate_no_data_interventions(
+    *,
+    variables: List[str],
+    state_names: List[List[str]] | None,
+    intervene_vars: str,
+) -> List[tuple[str, str]]:
+    if not variables:
+        return []
+
+    if intervene_vars.lower() in {"", "none"}:
+        return []
+    if intervene_vars.lower() == "all":
+        targets = list(variables)
+    else:
+        requested = {s.strip() for s in intervene_vars.split(",") if s.strip()}
+        targets = [v for v in variables if v in requested]
+
+    name_to_idx = {v: i for i, v in enumerate(variables)}
+    pairs: List[tuple[str, str]] = []
+    for target in targets:
+        idx = name_to_idx[target]
+        values = list((state_names[idx] if state_names and idx < len(state_names) else []) or [])
+        if not values:
+            values = ["0", "1"]
+        for value in values:
+            pairs.append((target, str(value)))
+    return pairs
+
+
 def _build_stage_rows(
     *,
     bif_file: str,
@@ -120,10 +150,11 @@ def _build_stage_rows(
     causal_rules = bool(stage.get("causal_rules", default_causal_rules))
     def_int = bool(stage.get("def_int", default_def_int))
     anonymize = bool(stage.get("anonymize", False))
+    no_data = bool(stage.get("no_data", False))
     obs_per_prompt = int(stage.get("obs_per_prompt", 0))
     int_per_combo = int(stage.get("int_per_combo", 0))
 
-    if int_per_combo <= 0:
+    if not no_data and int_per_combo <= 0:
         raise ValueError("Each descendant-task stage must use int_per_combo > 0.")
 
     _, answer_obj, prompt_iter = iter_prompts_in_memory(
@@ -158,25 +189,49 @@ def _build_stage_rows(
         obs_rows_num = list(item.get("obs_rows_num") or [])
         int_groups_num = item.get("int_groups_num") or {}
         state_names = item.get("state_names") or None
+        if no_data:
+            intervention_pairs = _enumerate_no_data_interventions(
+                variables=item_variables,
+                state_names=state_names,
+                intervene_vars=intervene_vars,
+            )
+            intervention_iter = [
+                ((ivar, ival), [])
+                for ivar, ival in intervention_pairs
+            ]
+        else:
+            intervention_iter = sorted(
+                int_groups_num.items(),
+                key=lambda kv: (str(kv[0][0]), str(kv[0][1])),
+            )
 
-        for (ivar, ival), intervention_rows_num in sorted(
-            int_groups_num.items(),
-            key=lambda kv: (str(kv[0][0]), str(kv[0][1])),
-        ):
+        for (ivar, ival), intervention_rows_num in intervention_iter:
             target = str(ivar)
             descendants = descendants_map.get(target, [])
-            prompt_text = format_prompt_descendants_summary(
-                item_variables,
-                dataset_name=dataset_name,
-                intervention_target=target,
-                intervention_value=str(ival),
-                intervention_rows_num=list(intervention_rows_num),
-                obs_rows_num=obs_rows_num,
-                state_names=state_names,
-                include_causal_rules=causal_rules,
-                include_def_int=def_int,
-                anonymize=bool(item.get("anonymize", anonymize)),
-            )
+            if no_data:
+                prompt_text = format_prompt_descendants_no_data(
+                    item_variables,
+                    dataset_name=dataset_name,
+                    intervention_target=target,
+                    intervention_value=str(ival),
+                    state_names=state_names,
+                    include_causal_rules=causal_rules,
+                    include_def_int=def_int,
+                    anonymize=bool(item.get("anonymize", anonymize)),
+                )
+            else:
+                prompt_text = format_prompt_descendants_summary(
+                    item_variables,
+                    dataset_name=dataset_name,
+                    intervention_target=target,
+                    intervention_value=str(ival),
+                    intervention_rows_num=list(intervention_rows_num),
+                    obs_rows_num=obs_rows_num,
+                    state_names=state_names,
+                    include_causal_rules=causal_rules,
+                    include_def_int=def_int,
+                    anonymize=bool(item.get("anonymize", anonymize)),
+                )
             answer = {
                 "target": target,
                 "descendants": descendants,
@@ -223,6 +278,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--def-int", dest="def_int", action="store_true")
     p.add_argument("--no-def-int", dest="def_int", action="store_false")
     p.set_defaults(def_int=True)
+    p.add_argument(
+        "--no-data",
+        dest="no_data",
+        action="store_true",
+        help="Default stage setting: emit descendant prompts without observational or interventional summaries.",
+    )
+    p.add_argument("--with-data", dest="no_data", action="store_false")
+    p.set_defaults(no_data=False)
     return p
 
 
@@ -260,7 +323,7 @@ def main() -> None:
         stage_name = _stage_slug(idx, stage)
         rows = _build_stage_rows(
             bif_file=str(bif_path),
-            stage=stage,
+            stage={**stage, "no_data": bool(stage.get("no_data", args.no_data))},
             default_num_prompts=int(args.num_prompts),
             seed=int(args.seed),
             default_intervene_vars=str(args.intervene_vars),

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import csv
 import inspect
@@ -11,6 +13,19 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    from cd_training_format import (
+        default_short_think_text,
+        ensure_assistant_think_prefill,
+        validate_sft_example,
+    )
+except ModuleNotFoundError:
+    from experiments.cd_training_format import (
+        default_short_think_text,
+        ensure_assistant_think_prefill,
+        validate_sft_example,
+    )
 
 
 def _set_csv_field_limit() -> None:
@@ -115,6 +130,8 @@ def _build_format_check_prompt(
     tokenizer: Any,
     enable_thinking: bool,
 ) -> str:
+    if "<think>" in str(prompt_text or ""):
+        return prompt_text
     if not enable_thinking:
         return prompt_text
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
@@ -171,6 +188,7 @@ def build_sft_jsonl(
                 prompt = _read_text_from_row(row, prompt_text_col, prompt_path_col).strip()
                 if not prompt:
                     raise ValueError("empty prompt")
+                prompt = ensure_assistant_think_prefill(prompt)
 
                 answer_raw = row.get(answer_col)
                 if not answer_raw:
@@ -181,9 +199,12 @@ def build_sft_jsonl(
 
                 target = {"adjacency_matrix": matrix}
                 completion = (
-                    f"<think>{think_text}</think>"
+                    f"{str(think_text or default_short_think_text('causal_discovery')).strip()}</think>"
                     f"<answer>{json.dumps(target, ensure_ascii=False)}</answer>"
                 )
+                issues = validate_sft_example(prompt, completion)
+                if issues:
+                    raise ValueError("; ".join(issues))
                 rec = {
                     "prompt": prompt,
                     "answer": completion,
@@ -212,9 +233,10 @@ def run_sft(
     sft_load_in_4bit: bool,
     sft_use_unsloth_gc: bool,
 ) -> None:
+    import torch
     from datasets import load_dataset
     from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
     SFTConfig, SFTTrainer = _import_trl_sft()
 
@@ -241,10 +263,28 @@ def run_sft(
             "to match grpo.py model setup and avoid device_map/distributed issues."
         )
     if is_adapter:
-        model = AutoPeftModelForCausalLM.from_pretrained(
-            base_model,
-            **model_load_kwargs,
-        )
+        adapter_load_kwargs = dict(model_load_kwargs)
+        try:
+            adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
+            if "is_trainable" in adapter_params:
+                adapter_load_kwargs["is_trainable"] = True
+        except Exception:
+            pass
+        model = AutoPeftModelForCausalLM.from_pretrained(base_model, **adapter_load_kwargs)
+        # Older PEFT paths may still leave the adapter frozen; make the adapter
+        # trainable explicitly so stage-to-stage SFT continuation works.
+        if hasattr(model, "train"):
+            model.train()
+        if hasattr(model, "set_adapter"):
+            try:
+                model.set_adapter("default")
+            except Exception:
+                pass
+        if hasattr(model, "enable_adapter_layers"):
+            try:
+                model.enable_adapter_layers()
+            except Exception:
+                pass
     else:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
@@ -281,6 +321,23 @@ def run_sft(
             target_modules=["q_proj", "v_proj"],
         )
         model = get_peft_model(model, lora_config)
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception:
+            pass
+    else:
+        try:
+            input_embeddings = model.get_input_embeddings()
+            if input_embeddings is not None:
+                def _require_grad_hook(module, inputs, output):
+                    if hasattr(output, "requires_grad_"):
+                        output.requires_grad_(True)
+                    return output
+
+                input_embeddings.register_forward_hook(_require_grad_hook)
+        except Exception:
+            pass
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config"):
@@ -288,6 +345,17 @@ def run_sft(
             model.config.use_cache = False
         except Exception:
             pass
+    trainable_params = 0
+    total_params = 0
+    for param in model.parameters():
+        count = int(param.numel())
+        total_params += count
+        if bool(getattr(param, "requires_grad", False)):
+            trainable_params += count
+    print(
+        f"[sft] trainable_params={trainable_params} total_params={total_params} "
+        f"trainable_pct={(100.0 * trainable_params / max(total_params, 1)):.4f}"
+    )
 
     ds = load_dataset("json", data_files=str(sft_jsonl), split="train")
     dataset_uses_prompt_completion = "prompt" in ds.column_names and "answer" in ds.column_names
@@ -319,26 +387,126 @@ def run_sft(
         "max_seq_length": int(sft_max_seq_length),
         "report_to": "none",
     }
-    if dataset_uses_prompt_completion:
-        cfg_kwargs["completion_only_loss"] = True
-    else:
-        cfg_kwargs["dataset_text_field"] = "text"
     # Older/newer TRL versions may default eos_token to a placeholder like "<EOS_TOKEN>".
     # Force EOS to the tokenizer's actual EOS symbol when available.
+    eos_id_check = tokenizer.convert_tokens_to_ids(tokenizer.eos_token) if getattr(tokenizer, "eos_token", None) else None
+    if eos_id_check is None:
+        raise ValueError(
+            f"SFT eos_token is not in tokenizer vocab: eos_token={getattr(tokenizer, 'eos_token', None)!r}. "
+            "Set a valid eos token before trainer init."
+        )
+    print(f"[sft] eos_token={tokenizer.eos_token!r} eos_token_id={eos_id_check}")
+
+    if dataset_uses_prompt_completion:
+        eos_token_id = int(tokenizer.eos_token_id)
+
+        def _tokenize_prompt_completion(example: dict[str, Any]) -> dict[str, Any]:
+            prompt = str(example.get("prompt") or "")
+            completion = str(example.get("completion") or "")
+            issues = validate_sft_example(prompt, completion)
+            if issues:
+                raise ValueError("; ".join(issues))
+
+            prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            completion_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
+            if not completion_ids:
+                raise ValueError("completion tokenization produced zero tokens")
+            if not completion_ids or completion_ids[-1] != eos_token_id:
+                completion_ids = [*completion_ids, eos_token_id]
+
+            max_len = int(sft_max_seq_length)
+            if len(completion_ids) >= max_len:
+                completion_ids = completion_ids[:max_len]
+                prompt_ids = []
+            else:
+                keep_prompt = max_len - len(completion_ids)
+                if len(prompt_ids) > keep_prompt:
+                    prompt_ids = prompt_ids[-keep_prompt:]
+
+            input_ids = [*prompt_ids, *completion_ids]
+            labels = ([-100] * len(prompt_ids)) + list(completion_ids)
+            if len(input_ids) != len(labels):
+                raise ValueError("input_ids/labels length mismatch")
+            supervised_tokens = sum(1 for x in labels if x != -100)
+            if supervised_tokens <= 0:
+                raise ValueError("no supervised completion tokens")
+            return {
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+                "labels": labels,
+                "__prompt_tokens": len(prompt_ids),
+                "__completion_tokens": len(completion_ids),
+                "__supervised_tokens": supervised_tokens,
+            }
+
+        tokenized_ds = ds.map(
+            _tokenize_prompt_completion,
+            remove_columns=ds.column_names,
+            desc="Tokenizing prompt/completion SFT data",
+        )
+        supervised_total = int(sum(int(x) for x in tokenized_ds["__supervised_tokens"]))
+        if supervised_total <= 0:
+            raise ValueError("prompt/completion SFT dataset has zero supervised tokens")
+        prompt_tok_mean = sum(int(x) for x in tokenized_ds["__prompt_tokens"]) / max(len(tokenized_ds), 1)
+        completion_tok_mean = sum(int(x) for x in tokenized_ds["__completion_tokens"]) / max(len(tokenized_ds), 1)
+        print(
+            "[sft] prompt/completion dataset "
+            f"rows={len(tokenized_ds)} "
+            f"prompt_tokens_mean={prompt_tok_mean:.1f} "
+            f"completion_tokens_mean={completion_tok_mean:.1f} "
+            f"supervised_tokens_total={supervised_total}"
+        )
+
+        class _PromptCompletionCollator:
+            def __init__(self, pad_token_id: int):
+                self.pad_token_id = int(pad_token_id)
+
+            def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+                max_len = max(len(f["input_ids"]) for f in features)
+                batch_input_ids = []
+                batch_attention = []
+                batch_labels = []
+                for feat in features:
+                    pad = max_len - len(feat["input_ids"])
+                    batch_input_ids.append(list(feat["input_ids"]) + ([self.pad_token_id] * pad))
+                    batch_attention.append(list(feat["attention_mask"]) + ([0] * pad))
+                    batch_labels.append(list(feat["labels"]) + ([-100] * pad))
+                return {
+                    "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
+                    "attention_mask": torch.tensor(batch_attention, dtype=torch.long),
+                    "labels": torch.tensor(batch_labels, dtype=torch.long),
+                }
+
+        train_args = TrainingArguments(
+            output_dir=str(sft_output_dir),
+            num_train_epochs=float(sft_epochs),
+            learning_rate=float(sft_lr),
+            per_device_train_batch_size=int(sft_batch_size),
+            gradient_accumulation_steps=int(sft_grad_accum),
+            logging_steps=int(sft_logging_steps),
+            save_steps=int(sft_save_steps),
+            bf16=torch_cuda_available(),
+            report_to="none",
+            remove_unused_columns=False,
+            save_total_limit=1,
+        )
+        trainer = Trainer(
+            model=model,
+            args=train_args,
+            train_dataset=tokenized_ds,
+            data_collator=_PromptCompletionCollator(tokenizer.pad_token_id),
+        )
+        trainer.train()
+        trainer.save_model(str(sft_output_dir))
+        tokenizer.save_pretrained(str(sft_output_dir))
+        return
+
+    cfg_kwargs["dataset_text_field"] = "text"
     if getattr(tokenizer, "eos_token", None):
         cfg_kwargs["eos_token"] = tokenizer.eos_token
     cfg = SFTConfig(**_filter_supported(SFTConfig.__init__, cfg_kwargs))
-    # Some TRL builds may still carry a placeholder EOS token from defaults.
-    # Force args.eos_token to a tokenizer token that resolves in vocab.
     if getattr(tokenizer, "eos_token", None):
         cfg.eos_token = tokenizer.eos_token
-    eos_id_check = tokenizer.convert_tokens_to_ids(cfg.eos_token) if getattr(cfg, "eos_token", None) else None
-    if eos_id_check is None:
-        raise ValueError(
-            f"SFT eos_token is not in tokenizer vocab: eos_token={cfg.eos_token!r}. "
-            "Set a valid eos token before SFTTrainer init."
-        )
-    print(f"[sft] eos_token={cfg.eos_token!r} eos_token_id={eos_id_check}")
 
     trainer_kwargs = {
         "model": model,
@@ -403,9 +571,7 @@ def run_grpo(
     subprocess.run(cmd, env=child_env, check=True)
 
 
-# For format-check inference, allow free-form reasoning before the final answer
-# and require only that the completion ends with <answer>...</answer>.
-FORMAT_RE = re.compile(r"(?s)^.*<answer>.*?</answer>\s*$")
+FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 
 
 def run_format_check(
@@ -424,6 +590,7 @@ def run_format_check(
     format_check_enable_thinking: bool,
 ) -> None:
     import torch
+    from tqdm.auto import tqdm
     from unsloth import FastLanguageModel
     from transformers import StoppingCriteria, StoppingCriteriaList
     from verifier_cd import extract_adjacency_matrix
@@ -479,7 +646,14 @@ def run_format_check(
             else None
         )
 
-        for i, row in enumerate(rows):
+        progress = tqdm(
+            rows,
+            total=len(rows),
+            desc="check",
+            unit="row",
+            dynamic_ncols=True,
+        )
+        for i, row in enumerate(progress):
             prompt = _read_text_from_row(row, prompt_text_col, prompt_path_col).strip()
             prompt_for_model = _build_format_check_prompt(
                 prompt,
@@ -515,6 +689,15 @@ def run_format_check(
             prompt_len = int(inputs["input_ids"].shape[-1])
             gen_ids = out[0][prompt_len:]
             resp = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            generated_tokens = int(gen_ids.shape[-1])
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            eos_seen = False
+            if eos_token_id is not None:
+                try:
+                    eos_seen = any(int(tok) == int(eos_token_id) for tok in gen_ids.tolist())
+                except Exception:
+                    eos_seen = False
+            answer_closed = bool((resp or "").rstrip().endswith("</answer>"))
 
             is_fmt_ok = int(bool(FORMAT_RE.match(resp or "")))
             mat = extract_adjacency_matrix(resp, expected_n=expected_n)
@@ -529,12 +712,22 @@ def run_format_check(
                 "data_idx": row.get("data_idx"),
                 "shuffle_idx": row.get("shuffle_idx"),
                 "prompt_tokens": prompt_len,
+                "generated_tokens": generated_tokens,
+                "eos_seen": int(eos_seen),
+                "answer_closed": int(answer_closed),
                 "format_ok": is_fmt_ok,
                 "parse_ok": is_parse_ok,
                 "response_chars": len(resp),
                 "response": resp,
             }
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fout.flush()
+            progress.set_postfix(
+                format_ok=f"{fmt_ok}/{n}",
+                parse_ok=f"{parse_ok}/{n}",
+                prompt_tokens=prompt_len,
+                gen_tokens=generated_tokens,
+            )
 
     fmt_rate = (fmt_ok / n) if n > 0 else 0.0
     parse_rate = (parse_ok / n) if n > 0 else 0.0
@@ -597,7 +790,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sft-lr", type=float, default=2e-5)
     ap.add_argument("--sft-batch-size", type=int, default=1)
     ap.add_argument("--sft-grad-accum", type=int, default=4)
-    ap.add_argument("--sft-max-seq-length", type=int, default=8192)
+    ap.add_argument("--sft-max-seq-length", type=int, default=262144)
     ap.add_argument("--sft-save-steps", type=int, default=50)
     ap.add_argument("--sft-logging-steps", type=int, default=5)
     ap.add_argument("--sft-load-in-4bit", action="store_true")

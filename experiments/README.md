@@ -238,3 +238,55 @@ python run_experiment1_pipeline.py --steps evaluate,analyze --dataset cancer
 ```
 
 This will include `predictions_obs*_int*_ENCO.csv` in `experiments/out/experiment1/cancer_summary.csv`.
+
+## Behavioral teacher attribution
+
+To support the research direction of asking which classical procedure an LLM is
+behaviorally closest to, this repo now includes:
+
+- `experiments/attribute_teacher_behavior.py`
+
+This script is a post-hoc analysis step. It does not run PC/GES/IGSP/etc. for you;
+instead, it expects one evaluated LLM CSV plus one or more teacher CSVs that already
+contain graph predictions for the same instances.
+
+### What it computes
+
+- nearest-teacher matching per row
+- disagreement-set attribution (rows where teachers disagree)
+- pairwise graph similarity metrics between the LLM and each teacher:
+  - directed-edge SHD
+  - edge F1
+  - skeleton F1
+  - orientation accuracy on shared skeleton edges
+  - collider F1
+
+### Row alignment
+
+Teacher rows are aligned to LLM rows in this order:
+
+1. `(data_idx, shuffle_idx)`
+2. `data_idx` alone, but only when unique in the teacher CSV
+3. ground-truth graph hash parsed from `answer` / `answer_path`
+4. optional single-row fallback via `--allow-single-row-fallback`
+
+The last fallback is mainly for diagnostics. For the actual attribution study in your
+research plan, teacher outputs should ideally be generated on the same per-instance
+datasets as the LLM prompts.
+
+### Example
+
+```bash
+python experiments/attribute_teacher_behavior.py \
+  --llm-csv experiments/responses/cancer/responses_obs200_int0_shuf3_anon_gpt-4o-mini.csv \
+  --teacher-csv path/to/pc_outputs.csv --teacher-name PC \
+  --teacher-csv path/to/ges_outputs.csv --teacher-name GES \
+  --teacher-csv path/to/igsp_outputs.csv --teacher-name IGSP \
+  --metric pair_shd
+```
+
+Outputs:
+
+- `<llm_csv>.teacher_attr.rows.csv`: one row per `(llm row, teacher)` pair
+- `<llm_csv>.teacher_attr.row_summary.csv`: one row per LLM example with nearest-teacher info
+- `<llm_csv>.teacher_attr.summary.json`: aggregate attribution summary and alignment stats

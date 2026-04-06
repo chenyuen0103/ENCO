@@ -12,7 +12,24 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-from run_sft_then_grpo import run_sft
+try:
+    from cd_training_format import (
+        DEFAULT_FORMAT_HINT_TEXT,
+        build_payload_completion,
+        canonicalize_cd_prompt,
+        default_short_think_text,
+        validate_sft_example,
+    )
+    from run_sft_then_grpo import run_sft
+except ModuleNotFoundError:
+    from experiments.cd_training_format import (
+        DEFAULT_FORMAT_HINT_TEXT,
+        build_payload_completion,
+        canonicalize_cd_prompt,
+        default_short_think_text,
+        validate_sft_example,
+    )
+    from experiments.run_sft_then_grpo import run_sft
 
 
 SUPPORTED_TASKS = {"causal_discovery", "cd_descendants"}
@@ -93,33 +110,20 @@ def _extract_payload_text(raw: str) -> str:
         return s
 
 
-def _default_think_text(task: str) -> str:
-    if task == "cd_descendants":
-        return "I will output only the required JSON descendants object."
-    return "I will output only the required JSON graph object."
-
-
-def _ensure_assistant_think_prefill(prompt: str) -> str:
-    s = str(prompt or "").rstrip()
-    if not s:
-        return "<think>"
-    if s.endswith("<think>"):
-        return s
-    if s.endswith("assistant"):
-        return s + "\n<think>"
-    return s + "\n<think>"
-
-
 def build_generic_sft_jsonl(
     *,
     in_csv: Path,
     out_jsonl: Path,
+    task: str,
     think_text: str,
     prompt_text_col: str,
     prompt_path_col: str,
     answer_col: str,
     answer_path_col: str,
     answer_mode: str,
+    wrap_system_prompt: bool,
+    append_format_hint: bool,
+    format_hint_text: str,
 ) -> tuple[int, int]:
     _set_csv_field_limit()
     rows = _read_csv_rows(in_csv)
@@ -146,12 +150,19 @@ def build_generic_sft_jsonl(
                 if not answer_raw:
                     raise ValueError("empty answer")
 
+                prompt = canonicalize_cd_prompt(
+                    prompt,
+                    wrap_system_prompt=wrap_system_prompt,
+                    append_format_hint=append_format_hint,
+                    format_hint_text=format_hint_text,
+                    prefill_think=(answer_mode == "payload"),
+                )
+
                 if answer_mode == "completion":
-                    completion = answer_raw
+                    completion = answer_raw.strip()
                 elif answer_mode == "payload":
-                    prompt = _ensure_assistant_think_prefill(prompt)
                     payload = _extract_payload_text(answer_raw)
-                    completion = f"</think><answer>{payload}</answer>"
+                    completion = build_payload_completion(payload, think_text=think_text, task=task)
                 else:
                     raise ValueError(f"unsupported answer_mode={answer_mode!r}")
 
@@ -166,6 +177,33 @@ def build_generic_sft_jsonl(
                 skipped += 1
                 print(f"[warn] skip row {idx} from {in_csv}: {exc}", file=sys.stderr)
     return wrote, skipped
+
+
+def _validate_sft_jsonl(path: Path, *, sample_limit: int = 8) -> Dict[str, Any]:
+    total = 0
+    issues: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            total += 1
+            if len(issues) >= sample_limit:
+                continue
+            row = json.loads(s)
+            row_issues = validate_sft_example(str(row.get("prompt") or ""), str(row.get("answer") or ""))
+            if row_issues:
+                issues.append(
+                    {
+                        "row_idx": total - 1,
+                        "issues": row_issues,
+                    }
+                )
+    return {
+        "rows": total,
+        "sample_issues": issues,
+        "ok": not issues,
+    }
 
 
 def _sample_rows(
@@ -265,12 +303,25 @@ def _load_json(path: Path) -> Any:
 
 def _load_last_jsonl(path: Path) -> Dict[str, Any]:
     last: Dict[str, Any] | None = None
+    last_metrics: Dict[str, Any] | None = None
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s:
                 continue
-            last = json.loads(s)
+            row = json.loads(s)
+            last = row
+            if any(
+                isinstance(k, str) and (
+                    k.startswith("rewards/")
+                    or k.startswith("completions/")
+                    or k in {"reward", "reward_std", "entropy", "loss", "grad_norm"}
+                )
+                for k in row.keys()
+            ):
+                last_metrics = row
+    if last_metrics is not None:
+        return last_metrics
     if last is None:
         raise ValueError(f"no JSONL rows in {path}")
     return last
@@ -528,6 +579,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write an example curriculum JSON and exit.",
     )
+    p.add_argument(
+        "--reuse-existing-sft",
+        action="store_true",
+        help="If a stage SFT checkpoint already exists under the output root, reuse it and skip SFT training.",
+    )
+    p.add_argument(
+        "--reuse-existing-sft-eval-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional eval JSON to use for the stage's after_sft_eval gate when reusing an existing SFT checkpoint. "
+            "Useful when responses were rescored from a saved eval file without rerunning inference."
+        ),
+    )
     return p.parse_args()
 
 
@@ -619,11 +684,18 @@ def main() -> None:
         replay_ratio = float(stage.get("replay_ratio", 0.0))
         replay_seed = int(stage.get("replay_seed", 1234 + stage_idx))
         answer_mode = str(stage.get("sft_answer_mode", "payload"))
-        think_text = str(stage.get("think_text") or _default_think_text(task))
+        think_text = str(stage.get("think_text") or default_short_think_text(task))
         prompt_text_col = str(stage.get("prompt_text_col", "prompt_text"))
         prompt_path_col = str(stage.get("prompt_path_col", "prompt_path"))
         answer_col = str(stage.get("answer_col", "answer"))
         answer_path_col = str(stage.get("answer_path_col", "answer_path"))
+        wrap_system_prompt = bool(stage.get("cd_wrap_system_prompt", curriculum.get("cd_wrap_system_prompt", True)))
+        append_format_hint = bool(stage.get("cd_append_format_hint", curriculum.get("cd_append_format_hint", True)))
+        format_hint_text = str(
+            stage.get("cd_format_hint_text")
+            or curriculum.get("cd_format_hint_text")
+            or DEFAULT_FORMAT_HINT_TEXT
+        )
         gate_spec = dict(stage.get("gate") or {})
         enable_thinking = bool(stage.get("enable_thinking", curriculum.get("enable_thinking", False)))
 
@@ -654,28 +726,41 @@ def main() -> None:
         if enable_sft:
             sft_cfg = dict(stage.get("sft") or {})
             sft_jsonl = stage_dir / "sft_train.jsonl"
+            sft_output_dir = stage_dir / "sft"
+            reuse_existing_sft = bool(args.reuse_existing_sft and sft_output_dir.exists())
             wrote, skipped = build_generic_sft_jsonl(
                 in_csv=mixed_train_csv,
                 out_jsonl=sft_jsonl,
+                task=task,
                 think_text=think_text,
                 prompt_text_col=prompt_text_col,
                 prompt_path_col=prompt_path_col,
                 answer_col=answer_col,
                 answer_path_col=answer_path_col,
                 answer_mode=answer_mode,
+                wrap_system_prompt=wrap_system_prompt,
+                append_format_hint=append_format_hint,
+                format_hint_text=format_hint_text,
             )
-            sft_output_dir = stage_dir / "sft"
+            sft_validation = _validate_sft_jsonl(sft_jsonl)
             stage_result["sft_build"] = {
                 "jsonl": str(sft_jsonl),
                 "wrote": wrote,
                 "skipped": skipped,
+                "validation": sft_validation,
+                "reused_checkpoint": reuse_existing_sft,
             }
             if wrote <= 0:
                 raise ValueError(
                     f"Stage {stage_idx} ({stage_name}) produced no SFT rows from {mixed_train_csv}. "
                     f"skipped={skipped}"
                 )
-            if not args.dry_run:
+            if not sft_validation["ok"]:
+                raise ValueError(
+                    f"Stage {stage_idx} ({stage_name}) produced invalid SFT prompt/completion rows: "
+                    f"{sft_validation['sample_issues']}"
+                )
+            if not args.dry_run and not reuse_existing_sft:
                 prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
                 os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
                 try:
@@ -698,6 +783,8 @@ def main() -> None:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                     else:
                         os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+            elif reuse_existing_sft:
+                print(f"[reuse] stage {stage_idx} using existing SFT checkpoint at {sft_output_dir}")
             stage_result["sft_output_dir"] = str(sft_output_dir)
             stage_result["sft_eval_json"] = str(stage_dir / "sft_eval.json")
             promoted_model = str(sft_output_dir)
@@ -705,21 +792,34 @@ def main() -> None:
             sft_eval_args = default_eval_args + _parse_extra_args(stage.get("sft_eval_args"))
             sft_eval_args = _append_flag_once(sft_eval_args, "--enable-thinking", enable_thinking)
             sft_eval_json = stage_dir / "sft_eval.json"
-            _run_grpo_eval(
-                python_exe=python_exe,
-                grpo_script=grpo_script,
-                task=task,
-                eval_model=sft_output_dir,
-                eval_csv=eval_csv,
-                output_json=sft_eval_json,
-                extra_args=sft_eval_args,
-                env=gpu_env,
-                dry_run=args.dry_run,
-            )
+            sft_eval_gate_json = sft_eval_json
+            if args.reuse_existing_sft_eval_json is not None:
+                sft_eval_gate_json = args.reuse_existing_sft_eval_json.resolve()
+                if not sft_eval_gate_json.exists():
+                    raise FileNotFoundError(
+                        f"--reuse-existing-sft-eval-json not found: {sft_eval_gate_json}"
+                    )
+                print(f"[reuse] stage {stage_idx} using existing SFT eval JSON at {sft_eval_gate_json}")
+            else:
+                _run_grpo_eval(
+                    python_exe=python_exe,
+                    grpo_script=grpo_script,
+                    task=task,
+                    eval_model=sft_output_dir,
+                    eval_csv=eval_csv,
+                    output_json=sft_eval_json,
+                    extra_args=sft_eval_args,
+                    env=gpu_env,
+                    dry_run=args.dry_run,
+                )
             if not args.dry_run and gate_spec.get("after_sft_eval"):
-                sft_eval_payload = _load_json(sft_eval_json)
+                sft_eval_payload = _load_json(sft_eval_gate_json)
                 ok, messages = _check_gate(dict(sft_eval_payload.get("eval") or {}), dict(gate_spec["after_sft_eval"]))
-                stage_result["after_sft_eval_gate"] = {"passed": ok, "checks": messages}
+                stage_result["after_sft_eval_gate"] = {
+                    "passed": ok,
+                    "checks": messages,
+                    "source_json": str(sft_eval_gate_json),
+                }
                 if not ok:
                     stage_result["status"] = "failed_after_sft_eval_gate"
                     run_summary["stages"].append(stage_result)
