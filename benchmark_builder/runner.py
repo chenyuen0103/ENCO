@@ -56,6 +56,7 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
+    tags.append("thinktags")
     if cell.style in {"matrix", "summary_joint"}:
         tags.append(cell.style)
     if cell.row_order != "random":

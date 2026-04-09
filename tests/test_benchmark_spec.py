@@ -51,7 +51,7 @@ class TestBenchmarkSpec(unittest.TestCase):
         )
         self.assertEqual(
             _prompt_base_name(cell=cell, num_prompts=spec.num_prompts, shuffles_per_graph=spec.shuffles_per_graph),
-            "prompts_obs100_int0_shuf1_p5_summary_joint",
+            "prompts_obs100_int0_shuf1_p5_thinktags_summary_joint",
         )
 
 
