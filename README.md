@@ -126,6 +126,7 @@ User-facing CLIs:
 scripts/build-benchmark --manifest benchmark_specs/reference_suite.json
 scripts/run-benchmark --manifest benchmark_specs/reference_suite.json
 scripts/summarize-benchmark --manifest benchmark_specs/reference_suite.json
+scripts/clean-benchmark-prompts --manifest benchmark_specs/reference_suite.json --yes
 ```
 
 Curated manifests:
@@ -140,6 +141,11 @@ Execution policy:
 - `execution.prompt_storage = "disk"` keeps full prompt CSVs
 - `execution.prompt_storage = "in_memory"` generates prompts lazily and only preserves responses
 - `execution.prompt_retention = "example"` or `"none"` controls whether any prompt text survives in in-memory mode
+
+Prompt cleanup:
+
+- `scripts/clean-benchmark-prompts --manifest benchmark_specs/reference_suite.json --yes`
+- Add `--example-prompts` to also remove saved example prompts from in-memory runs
 
 Baseline support:
 

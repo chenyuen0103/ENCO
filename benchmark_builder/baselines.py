@@ -58,6 +58,28 @@ class ClassicalBaselineAdapter(BaselineAdapter):
             "--out_dir",
             "responses",
         ]
+        if self.method_name == "PC":
+            cmd.extend(
+                [
+                    "--pc-variant",
+                    baseline.pc_variant,
+                    "--pc-ci-test",
+                    baseline.pc_ci_test,
+                    "--pc-significance-level",
+                    str(baseline.pc_significance_level),
+                    "--pc-max-cond-vars",
+                    str(baseline.pc_max_cond_vars),
+                ]
+            )
+        elif self.method_name == "GES":
+            cmd.extend(
+                [
+                    "--ges-scoring-method",
+                    baseline.ges_scoring_method,
+                    "--ges-min-improvement",
+                    str(baseline.ges_min_improvement),
+                ]
+            )
         _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
         return out_csv
 
@@ -67,7 +89,14 @@ class ENCOBaselineAdapter(BaselineAdapter):
     repo_root: Path
 
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
-        return baseline.enabled
+        if not baseline.enabled:
+            return False
+        scope = baseline.scope.lower()
+        if scope == "observational":
+            return cell.int_per_combo == 0 and cell.obs_per_prompt > 0
+        if scope == "interventional":
+            return cell.int_per_combo > 0
+        return True
 
     def run(
         self,

@@ -35,7 +35,7 @@
     {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api"}
   ],
   "baselines": [
-    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy", "pc_variant": "stable", "pc_ci_test": "chi_square", "pc_significance_level": 0.01, "pc_max_cond_vars": 5},
     {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
   ],
   "evaluator": {

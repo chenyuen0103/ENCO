@@ -55,8 +55,8 @@
     {"name": "Qwen2.5-72B-Instruct", "provider": "auto", "temperature": 0.0, "backend_version": "hf"}
   ],
   "baselines": [
-    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy"},
-    {"name": "GES", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy", "pc_variant": "stable", "pc_ci_test": "chi_square", "pc_significance_level": 0.01, "pc_max_cond_vars": 5},
+    {"name": "GES", "enabled": true, "scope": "observational", "library": "pgmpy", "ges_scoring_method": "bic-d", "ges_min_improvement": 1e-6},
     {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
   ],
   "evaluator": {

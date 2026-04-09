@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmark_builder.graph_io import load_causal_graph
 from experiments.evaluate import eval_pair
+
+
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"pgmpy\..*")
 
 
 def _load_observational_array(graph: Any, sample_size_obs: int, seed: int) -> tuple[np.ndarray, list[str]]:
@@ -47,6 +51,16 @@ def _adjacency_from_edges(var_names: list[str], edges: list[tuple[str, str]]) ->
         if src in name_to_idx and dst in name_to_idx:
             adj[name_to_idx[src], name_to_idx[dst]] = 1
     return adj
+
+
+def _coerce_discrete_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    # pgmpy selects discrete-vs-continuous scores from pandas dtypes. The sampled
+    # ENCO benchmark graphs are categorical, but they arrive as int64 arrays, which
+    # newer pgmpy versions may misclassify as continuous for GES scoring.
+    discrete_df = df.copy()
+    for col in discrete_df.columns:
+        discrete_df[col] = discrete_df[col].astype("category")
+    return discrete_df
 
 
 def _run_pc(df: pd.DataFrame, *, variant: str, ci_test: str, significance_level: float, max_cond_vars: int) -> np.ndarray:
@@ -135,7 +149,7 @@ def main() -> int:
         graph_path = Path(graph_file).resolve()
         graph = load_causal_graph(graph_path)
         data_obs, var_names = _load_observational_array(graph, args.sample_size_obs, args.seed)
-        df = pd.DataFrame(data_obs, columns=var_names)
+        df = _coerce_discrete_dataframe(pd.DataFrame(data_obs, columns=var_names))
 
         answer = np.asarray(graph.adj_matrix).astype(int)
         np.fill_diagonal(answer, 0)

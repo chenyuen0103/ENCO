@@ -15,6 +15,11 @@ class TestBenchmarkSpec(unittest.TestCase):
         self.assertEqual(len(spec.models), 4)
         self.assertTrue(spec.names_only.enabled)
         self.assertEqual([baseline.name for baseline in spec.baselines], ["PC", "GES", "ENCO"])
+        pc = next(b for b in spec.baselines if b.name == "PC")
+        ges = next(b for b in spec.baselines if b.name == "GES")
+        self.assertEqual(pc.pc_variant, "stable")
+        self.assertEqual(pc.pc_ci_test, "chi_square")
+        self.assertEqual(ges.ges_scoring_method, "bic-d")
 
     def test_legacy_paper_slice_normalizes(self) -> None:
         spec = load_benchmark_spec("paper_slices/sachs_main.json")

@@ -38,6 +38,14 @@ Summarize completed runs:
 scripts/summarize-benchmark --manifest benchmark_specs/authoring_demo.json
 ```
 
+Clean up prompt files after a run:
+
+```bash
+scripts/clean-benchmark-prompts --manifest benchmark_specs/authoring_demo.json --yes
+```
+
+If you also kept one example prompt per configuration in in-memory mode, add `--example-prompts`.
+
 ## What You Get
 
 - `benchmark_runs/authoring_demo/prompt_bundle.json`
@@ -59,6 +67,7 @@ Because this manifest uses in-memory prompting, the full prompt CSVs are not wri
 - prompt definitions: `prompt_cells[]`
 - controls: `names_only`
 - execution roster: `models[]`, `baselines[]`
+- optional classical-baseline controls: `pc_variant`, `pc_ci_test`, `pc_max_cond_vars`, `ges_scoring_method`
 - evaluation settings: `evaluator`
 - execution policy: `execution`
 - provenance metadata: `provenance`

@@ -72,6 +72,12 @@ class BaselineSpec:
     seed: int | None = None
     checkpoint_dir: str | None = None
     library: str | None = None
+    pc_variant: str = "stable"
+    pc_ci_test: str = "chi_square"
+    pc_significance_level: float = 0.01
+    pc_max_cond_vars: int = 5
+    ges_scoring_method: str = "bic-d"
+    ges_min_improvement: float = 1e-6
     notes: str = ""
 
 
@@ -266,6 +272,12 @@ def _build_baseline(item: dict[str, Any]) -> BaselineSpec:
         seed=item.get("seed"),
         checkpoint_dir=item.get("checkpoint_dir"),
         library=item.get("library"),
+        pc_variant=item.get("pc_variant", "stable"),
+        pc_ci_test=item.get("pc_ci_test", "chi_square"),
+        pc_significance_level=float(item.get("pc_significance_level", 0.01)),
+        pc_max_cond_vars=int(item.get("pc_max_cond_vars", 5)),
+        ges_scoring_method=item.get("ges_scoring_method", "bic-d"),
+        ges_min_improvement=float(item.get("ges_min_improvement", 1e-6)),
         notes=item.get("notes", ""),
     )
 
