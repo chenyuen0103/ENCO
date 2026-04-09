@@ -27,3 +27,6 @@ google-genai
 transformers
 accelerate
 sentencepiece
+
+# Optional: classical baselines used by the benchmark builder
+pgmpy

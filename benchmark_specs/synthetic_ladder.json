@@ -1,0 +1,57 @@
+{
+  "name": "synthetic_ladder",
+  "role": "appendix",
+  "description": "Synthetic controllability ladder with 10, 20, and 50 variable DAGs materialized from manifests.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "synthetic_random_10",
+      "graph_source": "synthetic",
+      "graph_params": {"graph_type": "random", "num_vars": 10, "num_categs": 10, "edge_prob": 0.3, "seed": 101},
+      "benchmark_card": "benchmark_cards/synthetic_ladder.md",
+      "role": "appendix"
+    },
+    {
+      "name": "synthetic_random_20",
+      "graph_source": "synthetic",
+      "graph_params": {"graph_type": "random", "num_vars": 20, "num_categs": 10, "edge_prob": 0.2, "seed": 102},
+      "benchmark_card": "benchmark_cards/synthetic_ladder.md",
+      "role": "appendix"
+    },
+    {
+      "name": "synthetic_random_50",
+      "graph_source": "synthetic",
+      "graph_params": {"graph_type": "random", "num_vars": 50, "num_categs": 10, "edge_prob": 0.1, "seed": 103},
+      "benchmark_card": "benchmark_cards/synthetic_ladder.md",
+      "role": "appendix"
+    }
+  ],
+  "num_prompts": 3,
+  "seed": 42,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false}
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "models": [
+    {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api"}
+  ],
+  "baselines": [
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "GES", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
+  ],
+  "evaluator": {
+    "tau": 0.7
+  },
+  "provenance": {
+    "schema_version": "benchmark_spec/v1",
+    "tags": ["synthetic", "appendix"]
+  },
+  "benchmark_card": "benchmark_cards/synthetic_ladder.md",
+  "notes": "Synthetic ladder for scale and controllability studies."
+}

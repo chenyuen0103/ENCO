@@ -12,6 +12,7 @@ This repository is adapted from the original ENCO codebase by Lippe, Cohen, and 
 
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Benchmark Builder](#benchmark-builder)
 - [Datasets](#datasets)
 - [Running experiments](#running-experiments)
 - [Simple example](#simple-example)
@@ -107,6 +108,47 @@ source .venv/bin/activate
 Notes:
 - For GPU ENCO, install the correct CUDA-enabled PyTorch build for your machine (instead of the default pip build).
 - For OpenAI runs, export `OPENAI_API_KEY`. For Gemini runs, export `GOOGLE_API_KEY` (or `GEMINI_API_KEY`).
+
+## Benchmark Builder
+
+This repository now includes a manifest-driven benchmark framework for LLM causal discovery.
+
+Core directories:
+
+- `benchmark_specs/`: reusable benchmark manifests
+- `benchmark_cards/`: benchmark cards with intended and unsupported claims
+- `benchmark_runs/`: prompt bundles, run provenance, and aggregate summaries
+- `paper_slices/`: compatibility layer for older paper-facing manifests
+
+User-facing CLIs:
+
+```bash
+scripts/build-benchmark --manifest benchmark_specs/reference_suite.json
+scripts/run-benchmark --manifest benchmark_specs/reference_suite.json
+scripts/summarize-benchmark --manifest benchmark_specs/reference_suite.json
+```
+
+Curated manifests:
+
+- `benchmark_specs/reference_suite.json`
+- `benchmark_specs/smoke_suite.json`
+- `benchmark_specs/synthetic_ladder.json`
+- `benchmark_specs/authoring_demo.json`
+
+Execution policy:
+
+- `execution.prompt_storage = "disk"` keeps full prompt CSVs
+- `execution.prompt_storage = "in_memory"` generates prompts lazily and only preserves responses
+- `execution.prompt_retention = "example"` or `"none"` controls whether any prompt text survives in in-memory mode
+
+Baseline support:
+
+- Native to the original repo: `ENCO`
+- Added in this benchmark-builder extension: `PC` and `GES` via `experiments/run_classical_baselines.py`
+
+Authoring tutorial:
+
+- [`docs/tutorials/benchmark_authoring.md`](docs/tutorials/benchmark_authoring.md)
 
 ### Datasets
 

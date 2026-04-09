@@ -170,12 +170,39 @@ This usually yields much shorter prompts and avoids having the LLM call tools du
 To build an ENCO-style LaTeX grid table from evaluated LLM runs, use:
 `experiments/make_llm_baseline_table.py`.
 
-## Classical baselines (ENCO)
+## Classical baselines
 
-To run a classical causal discovery baseline, use ENCO on the same underlying graph(s) with sampled
-observational/interventional data sizes that match the “Data Volume” / “Data Type” dimensions.
+The original ENCO repo ships ENCO as the native interventional baseline. This benchmark-builder extension
+adds representative observational baselines through `experiments/run_classical_baselines.py`:
 
-### Run ENCO on one config (example: cancer, obs=5000, int=200)
+- `PC` (constraint-based)
+- `GES` (score-based)
+- `ENCO` (interventional anchor from the original repo)
+
+### Run PC or GES on one config
+
+Run from `experiments/`:
+```bash
+cd experiments
+
+python run_classical_baselines.py \
+  --method PC \
+  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+  --sample_size_obs 5000 \
+  --seed 42
+```
+
+Swap `--method GES` to run GES instead. Both methods write predictions under
+`experiments/responses/<dataset>/predictions_obs*_int0_<METHOD>.csv`.
+
+`run_classical_baselines.py` requires `pgmpy`.
+
+### Run ENCO on one config
+
+Use ENCO on the same underlying graph(s) with sampled observational/interventional data sizes that match
+the “Data Volume” / “Data Type” dimensions.
+
+Example: cancer, `obs=5000`, `int=200`.
 
 Run from `experiments/`:
 ```bash
@@ -246,7 +273,7 @@ behaviorally closest to, this repo now includes:
 
 - `experiments/attribute_teacher_behavior.py`
 
-This script is a post-hoc analysis step. It does not run PC/GES/IGSP/etc. for you;
+This script is a post-hoc analysis step. It does not run PC/GES/etc. for you;
 instead, it expects one evaluated LLM CSV plus one or more teacher CSVs that already
 contain graph predictions for the same instances.
 

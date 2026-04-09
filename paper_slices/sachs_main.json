@@ -1,0 +1,46 @@
+{
+  "name": "sachs_main",
+  "role": "main",
+  "dataset": "sachs",
+  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "model": "gpt-5-mini",
+  "seed": 42,
+  "num_prompts": 5,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "enco": {
+    "enabled": true,
+    "sample_size_obs": 100,
+    "sample_size_inters": 50,
+    "max_inters": -1,
+    "seed": 42,
+    "checkpoint_dir": "experiments/checkpoints/paper_slices/sachs_main/enco"
+  },
+  "notes": "Canonical main-paper slice: Sachs, real names, obs100/int50, summary_joint vs matrix, matched ENCO."
+}

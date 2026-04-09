@@ -1,0 +1,74 @@
+{
+  "name": "reference_suite",
+  "role": "main",
+  "description": "Reference NeurIPS ED benchmark suite for LLM causal discovery on curated real graphs.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "sachs",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/sachs.bif",
+      "benchmark_card": "benchmark_cards/sachs_reference.md",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "11_vars"]
+    },
+    {
+      "name": "child",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/child.bif",
+      "benchmark_card": "benchmark_cards/child_reference.md",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "20_vars"]
+    },
+    {
+      "name": "alarm",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/alarm.bif",
+      "benchmark_card": "benchmark_cards/alarm_reference.md",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "37_vars"]
+    }
+  ],
+  "num_prompts": 5,
+  "seed": 42,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 0, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 0, "anonymize": false},
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false},
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 50, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 50, "anonymize": false},
+    {"style": "summary_joint", "obs_per_prompt": 1000, "int_per_combo": 50, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 1000, "int_per_combo": 50, "anonymize": false},
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 50, "anonymize": true},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 50, "anonymize": true}
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "models": [
+    {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api"},
+    {"name": "gpt-5", "provider": "auto", "temperature": 0.0, "backend_version": "api"},
+    {"name": "gemini-2.5-flash", "provider": "auto", "temperature": 0.0, "backend_version": "api"},
+    {"name": "Qwen2.5-72B-Instruct", "provider": "auto", "temperature": 0.0, "backend_version": "hf"}
+  ],
+  "baselines": [
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "GES", "enabled": true, "scope": "observational", "library": "pgmpy"},
+    {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
+  ],
+  "evaluator": {
+    "tau": 0.7,
+    "pred_col": "prediction"
+  },
+  "provenance": {
+    "schema_version": "benchmark_spec/v1",
+    "parser_version": "query_gemini.extract_adjacency",
+    "evaluator_version": "evaluate.py",
+    "tags": ["reference_suite", "neurips_ed"]
+  },
+  "benchmark_card": "benchmark_cards/reference_suite.md",
+  "notes": "Main reference suite for the reusable benchmark-builder paper."
+}

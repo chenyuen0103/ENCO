@@ -1,0 +1,19 @@
+{
+  "name": "cancer_smoke_names_only",
+  "role": "smoke",
+  "dataset": "cancer",
+  "bif_file": "causal_graphs/real_data/small_graphs/cancer.bif",
+  "model": "gpt-5-mini",
+  "seed": 42,
+  "num_prompts": 2,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "enco": {
+    "enabled": false
+  },
+  "notes": "Debug-only cancer names_only parser/eval smoke slice."
+}

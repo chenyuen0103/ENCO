@@ -26,8 +26,9 @@ def _use_edge_list_output(variables: List[str]) -> bool:
     return len(variables) > LARGE_GRAPH_EDGE_LIST_THRESHOLD
 
 def _load_graph_file(path: str):  # type: ignore
-    from causal_graphs.graph_real_world import load_graph_file  # type: ignore
-    return load_graph_file(path)
+    from benchmark_builder.graph_io import load_causal_graph  # type: ignore
+
+    return load_causal_graph(path)
 
 
 def _build_output_contract_lines(
@@ -192,11 +193,11 @@ def iter_prompts_in_memory(
     Generate prompts in-memory (no prompt files, no prompt CSV).
     Returns (base_name, answer_obj, iterator of rows with prompt_text).
     """
-    bif_abs = Path(bif_file).resolve(strict=True)
-    graph = _load_graph_file(str(bif_abs))
+    graph_abs = Path(bif_file).resolve(strict=True)
+    graph = _load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
-    codebook = build_codebook(graph, base_variables, str(bif_abs))
+    codebook = build_codebook(graph, base_variables, str(graph_abs))
 
     adj_np = np.asarray(graph.adj_matrix)
     base_adj_bin = (adj_np > 0).astype(int).tolist()
@@ -480,7 +481,11 @@ def build_codebook(graph, variables: List[str], bif_path: str) -> Dict[str, List
     Final codebook: prefer BIF categories, then fall back to graph cardinality,
     else default to ['0','1'].
     """
-    cb_bif = build_codebook_from_bif(bif_path, variables)
+    path = Path(bif_path)
+    if path.suffix.lower() == ".bif" and path.exists():
+        cb_bif = build_codebook_from_bif(bif_path, variables)
+    else:
+        cb_bif = {v: None for v in variables}
     out: Dict[str, List[str]] = {}
     for i, v in enumerate(variables):
         names = cb_bif.get(v)
@@ -2240,6 +2245,11 @@ def choose_given_edges(
 def main():
     ap = argparse.ArgumentParser(description="Generate N prompt,answer pairs with optional interventional rows.")
     ap.add_argument("--bif-file", default="../causal_graphs/real_data/small_graphs/cancer.bif")
+    ap.add_argument(
+        "--graph-file",
+        default=None,
+        help="Generic graph path (.bif or .pt). If set, overrides --bif-file.",
+    )
     ap.add_argument("--num-prompts", type=int, default=5)
     ap.add_argument("--obs-per-prompt", type=int, default=100)
     ap.add_argument("--int-per-combo", type=int, default=0)
@@ -2287,19 +2297,20 @@ def main():
                 f"variables (not all). If you expected do(X=*) rows for every variable, pass --intervene-vars all.",
                 file=sys.stderr,
             )
+    graph_file = args.graph_file or args.bif_file
     default_out_dir = os.path.join(
         os.path.dirname(__file__),
         "prompts",
-        os.path.splitext(os.path.basename(args.bif_file))[0],
+        os.path.splitext(os.path.basename(graph_file))[0],
     )
     args.out_dir = args.out_dir or default_out_dir
 
     # 1. Load Graph
-    bif_abs = Path(args.bif_file).resolve(strict=True)
-    graph = _load_graph_file(str(bif_abs))
+    graph_abs = Path(graph_file).resolve(strict=True)
+    graph = _load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
-    codebook = build_codebook(graph, base_variables, str(bif_abs))
+    codebook = build_codebook(graph, base_variables, str(graph_abs))
 
     # 2. Base Adjacency
     adj_np = np.asarray(graph.adj_matrix)
@@ -2521,7 +2532,7 @@ def main():
                 rows_text_source = rows_for_prompt
 
                 # Text Generation
-                dataset_name = os.path.splitext(os.path.basename(args.bif_file))[0]
+                dataset_name = os.path.splitext(os.path.basename(graph_file))[0]
                 use_edge_list_output = _use_edge_list_output(variables_out)
                 is_names_only_cfg = (args.obs_per_prompt == 0 and args.int_per_combo == 0)
                 if is_names_only_cfg:
