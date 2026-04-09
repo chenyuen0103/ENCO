@@ -253,6 +253,10 @@ def _infer_dataset_name_from_csv_path(csv_path: Path) -> Optional[str]:
     Returns None if it can't be inferred safely.
     """
     parts = list(csv_path.parts)
+    if "benchmarks" in parts:
+        i = parts.index("benchmarks")
+        if i + 2 < len(parts):
+            return parts[i + 2]
     for anchor in ("experiment1", "prompts", "out"):
         if anchor not in parts:
             continue
