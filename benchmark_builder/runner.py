@@ -48,6 +48,29 @@ def _build_cell_config_name(cell: PromptCellSpec) -> str:
     return "_".join(parts)
 
 
+def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_graph: int) -> str:
+    tags: list[str] = []
+    if cell.anonymize:
+        tags.append("anon")
+    if cell.causal_rules:
+        tags.append("rules")
+    if cell.give_steps:
+        tags.append("steps")
+    if cell.style in {"matrix", "summary_joint"}:
+        tags.append(cell.style)
+    if cell.row_order != "random":
+        tags.append(f"row{cell.row_order}")
+    if cell.col_order != "original":
+        tags.append(f"col{cell.col_order}")
+    extra_suffix = ("_" + "_".join(tags)) if tags else ""
+    return (
+        f"prompts_obs{cell.obs_per_prompt}"
+        f"_int{cell.int_per_combo}"
+        f"_shuf{shuffles_per_graph}"
+        f"_p{num_prompts}{extra_suffix}"
+    )
+
+
 def _response_name_for_prompt(prompt_csv: Path, model_name: str) -> str:
     stem = prompt_csv.stem
     if stem.startswith("prompts_"):
@@ -116,10 +139,10 @@ class BenchmarkRunner:
         dry_run: bool,
     ) -> dict[str, Any]:
         config_name = _build_cell_config_name(cell)
-        base_name = (
-            f"prompts_obs{cell.obs_per_prompt}_int{cell.int_per_combo}"
-            f"_shuf{self.spec.shuffles_per_graph}_p{self.spec.num_prompts}"
-            f"_{'anon' if cell.anonymize else 'real'}_thinktags_{cell.style}"
+        base_name = _prompt_base_name(
+            cell=cell,
+            num_prompts=self.spec.num_prompts,
+            shuffles_per_graph=self.spec.shuffles_per_graph,
         )
         out_dir = self.experiments_dir / "prompts" / "benchmarks" / self.spec.name / dataset.name / config_name
         prompt_csv = out_dir / f"{base_name}.csv"

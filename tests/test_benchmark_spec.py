@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from benchmark_builder.registry import BenchmarkRegistry
+from benchmark_builder.runner import _prompt_base_name
 from benchmark_builder.schema import load_benchmark_spec
 
 
@@ -37,6 +38,21 @@ class TestBenchmarkSpec(unittest.TestCase):
         spec = load_benchmark_spec("benchmark_specs/authoring_demo.json")
         self.assertEqual(spec.execution.prompt_storage, "in_memory")
         self.assertEqual(spec.execution.prompt_retention, "example")
+
+    def test_prompt_basename_matches_generator_convention(self) -> None:
+        spec = load_benchmark_spec("benchmark_specs/reference_suite.json")
+        cell = next(
+            cell
+            for cell in spec.prompt_cells
+            if cell.style == "summary_joint"
+            and cell.obs_per_prompt == 100
+            and cell.int_per_combo == 0
+            and not cell.anonymize
+        )
+        self.assertEqual(
+            _prompt_base_name(cell=cell, num_prompts=spec.num_prompts, shuffles_per_graph=spec.shuffles_per_graph),
+            "prompts_obs100_int0_shuf1_p5_summary_joint",
+        )
 
 
 if __name__ == "__main__":
