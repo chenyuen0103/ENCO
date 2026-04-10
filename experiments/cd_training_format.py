@@ -5,13 +5,23 @@ import re
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
-    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-    "The reasoning process and answer are enclosed within <think> and </think> tags, and <answer> and </answer> tags, respectively."
+    "The assistant reasons step by step inside <think> tags, following three explicit stages:\n"
+    "  Stage 1 (Skeleton): List each directly connected variable pair on its own line as \"X -- Y\". "
+    "If none, write \"None\".\n"
+    "  Stage 2 (V-structures): List each unshielded collider as \"(parent1, collider, parent2)\" on its own line. "
+    "If none, write \"None\".\n"
+    "  Stage 3 (Orientation): List each directed edge on its own line as \"X -> Y\". "
+    "If none, write \"None\".\n"
+    "After reasoning, the assistant outputs the final adjacency matrix inside <answer> tags."
 )
 
 DEFAULT_FORMAT_HINT_TEXT = (
-    "Use exactly this structure: <think>...</think><answer>...</answer>. "
-    "Inside <answer>, output only the final graph answer."
+    "Reason in three stages inside <think>: "
+    "Stage 1 (Skeleton) - one \"X -- Y\" per line; "
+    "Stage 2 (V-structures) - one \"(parent1, collider, parent2)\" per line; "
+    "Stage 3 (Orientation) - one \"X -> Y\" per line. "
+    "Write \"None\" for any empty stage. "
+    "Then output: <answer>{\"adjacency_matrix\": [...]}</answer>."
 )
 
 _CHAT_PROMPT_RE = re.compile(r"(?s)^\s*(system\n|<\|im_start\|>system\b)")
@@ -21,7 +31,11 @@ _ASSISTANT_SUFFIX_RE = re.compile(r"(?s)(assistant\s*)$")
 def default_short_think_text(task: str) -> str:
     if task == "cd_descendants":
         return "I compare the intervention shifts and keep only downstream variables."
-    return "I infer the graph structure and return only the final JSON answer."
+    return (
+        "Stage 1 (Skeleton):\n"
+        "Stage 2 (V-structures):\n"
+        "Stage 3 (Orientation):"
+    )
 
 
 def looks_like_chat_prompt(text: str) -> bool:

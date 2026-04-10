@@ -60,6 +60,10 @@ from verifier_cd import (
     build_cd_edge_f1_reward,
     build_cd_low_shd_reward,
     build_cd_acyclic_reward,
+    build_cd_cot_structure_reward,
+    build_cd_skeleton_f1_reward,
+    build_cd_vstruct_f1_reward,
+    build_cd_orientation_f1_reward,
     build_length_penalty_reward,
     completion_to_text as cd_completion_to_text,
     extract_answer_text as cd_extract_answer_text,
@@ -251,6 +255,8 @@ class CompactMetricsCallback(TrainerCallback):
         ("rewards/cd_edge_f1_reward/mean", "f1"),
         ("rewards/cd_low_shd_reward/mean", "lshd"),
         ("rewards/cd_acyclic_reward/mean", "dag"),
+        ("rewards/cd_cot_structure_reward/mean", "cot"),
+        ("rewards/cd_skeleton_f1_reward/mean", "skel"),
         ("rewards/format_reward/mean", "fmt"),
         ("rewards/cd_format_reward/mean", "fmt"),
         ("rewards/length_penalty_reward/mean", "len"),
@@ -335,6 +341,16 @@ def build_argparser():
         help="Training/eval task type. causal_discovery and cd_descendants expect prompt CSV inputs.",
     )
     p.add_argument("--model_id", type=str, default="Qwen/Qwen2-0.5B-Instruct")
+    p.add_argument(
+        "--base-model-override",
+        type=str,
+        default=None,
+        help=(
+            "When model_id is a PEFT adapter trained on a quantized base (e.g. BNB 4-bit), "
+            "provide the full-precision base model path/id here. The base will be loaded "
+            "in bfloat16 without quantization and the adapter applied on top."
+        ),
+    )
     p.add_argument("--dataset_id", type=str, default="AI-MO/NuminaMath-TIR")
     p.add_argument("--train_split", type=str, default="train[:5%]")
     p.add_argument("--test_split", type=str, default="test[:5%]")
@@ -583,6 +599,30 @@ def build_argparser():
         default=0.0,
         help="Optional separate acyclicity reward scale (0 disables).",
     )
+    p.add_argument(
+        "--cd-cot-structure-reward-scale",
+        type=float,
+        default=0.0,
+        help="Soft reward for mentioning all three staged-reasoning stages in <think> (0 disables).",
+    )
+    p.add_argument(
+        "--cd-skeleton-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: skeleton F1 parsed from Stage 1 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-vstruct-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: v-structure triple F1 parsed from Stage 2 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-orientation-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: directed edge F1 parsed from Stage 3 of <think> vs ground truth (0 disables).",
+    )
     p.add_argument("--cd-reward-require-dag", dest="cd_reward_require_dag", action="store_true")
     p.add_argument("--no-cd-reward-require-dag", dest="cd_reward_require_dag", action="store_false")
     p.set_defaults(cd_reward_require_dag=True)
@@ -807,7 +847,7 @@ def _load_cd_rows_from_prompt_csv(
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            prompt_raw = (row.get("prompt_text") or "").strip()
+            prompt_raw = (row.get("prompt_text") or row.get("prompt") or "").strip()
             if not prompt_raw:
                 prompt_path_raw = (row.get("prompt_path") or "").strip()
                 if not prompt_path_raw:
@@ -963,9 +1003,13 @@ def _dataset_from_cd_config_file(
             intervene_vars=str(intervene_vars),
             thinking_tags=bool(thinking_tags),
         )
-        answer_raw = json.dumps(answer_obj, ensure_ascii=False)
         adj = answer_obj.get("adjacency_matrix") if isinstance(answer_obj, dict) else None
         variables_out = answer_obj.get("variables") if isinstance(answer_obj, dict) else None
+        # Export only adjacency_matrix — variables is internal metadata not used by reward fns.
+        if isinstance(answer_obj, dict) and "adjacency_matrix" in answer_obj:
+            answer_raw = json.dumps({"adjacency_matrix": answer_obj["adjacency_matrix"]}, ensure_ascii=False)
+        else:
+            answer_raw = json.dumps(answer_obj, ensure_ascii=False)
         descendants_map: dict[str, list[str]] = {}
         if (
             task == "cd_descendants"
@@ -1178,6 +1222,9 @@ def _wrap_generate_with_eval_mode(model):
         if was_training:
             model.eval()
         try:
+            if torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    return original_generate(*args, **kwargs)
             return original_generate(*args, **kwargs)
         finally:
             if was_training:
@@ -1186,6 +1233,36 @@ def _wrap_generate_with_eval_mode(model):
     setattr(model, "generate", _generate_with_eval_mode)
     setattr(model, "_grpo_eval_generate_wrapped", True)
     return model
+
+
+def _coerce_model_floating_dtype(model, target_dtype: torch.dtype) -> tuple[int, int]:
+    """Best-effort cast for floating params/buffers to avoid mixed-dtype matmul crashes."""
+    converted = 0
+    skipped = 0
+
+    for param in model.parameters():
+        try:
+            if not getattr(param, "is_floating_point", lambda: False)():
+                continue
+            if param.dtype == target_dtype:
+                continue
+            param.data = param.data.to(dtype=target_dtype)
+            converted += 1
+        except Exception:
+            skipped += 1
+
+    for buf in model.buffers():
+        try:
+            if not getattr(buf, "is_floating_point", lambda: False)():
+                continue
+            if buf.dtype == target_dtype:
+                continue
+            buf.data = buf.data.to(dtype=target_dtype)
+            converted += 1
+        except Exception:
+            skipped += 1
+
+    return converted, skipped
 
 
 def _write_eval_snapshot(output_json_path: str, payload: dict) -> None:
@@ -1987,6 +2064,7 @@ def run_train(args, argv: list[str] | None = None):
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     model_load_kwargs = {
         "dtype": "auto",
+        "attn_implementation": "flash_attention_2",
     }
     # `device_map="auto"` is incompatible with distributed Accelerate launches.
     if distributed_world_size == 1:
@@ -1994,19 +2072,29 @@ def run_train(args, argv: list[str] | None = None):
 
     is_adapter = (Path(args.model_id) / "adapter_config.json").exists()
     if is_adapter:
-        from peft import AutoPeftModelForCausalLM
+        from peft import AutoPeftModelForCausalLM, PeftModel
 
-        adapter_load_kwargs = dict(model_load_kwargs)
-        try:
-            adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
-            if "is_trainable" in adapter_params:
-                adapter_load_kwargs["is_trainable"] = True
-        except Exception:
-            pass
-        model = AutoPeftModelForCausalLM.from_pretrained(
-            args.model_id,
-            **adapter_load_kwargs,
-        )
+        if getattr(args, "base_model_override", None):
+            # Load full-precision base then apply adapter on top (bypasses quantized base).
+            print(f"[train] Loading full-precision base from {args.base_model_override}, "
+                  f"then applying adapter from {args.model_id}")
+            base = AutoModelForCausalLM.from_pretrained(
+                args.base_model_override,
+                **model_load_kwargs,
+            )
+            model = PeftModel.from_pretrained(base, args.model_id, is_trainable=True)
+        else:
+            adapter_load_kwargs = dict(model_load_kwargs)
+            try:
+                adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
+                if "is_trainable" in adapter_params:
+                    adapter_load_kwargs["is_trainable"] = True
+            except Exception:
+                pass
+            model = AutoPeftModelForCausalLM.from_pretrained(
+                args.model_id,
+                **adapter_load_kwargs,
+            )
         if hasattr(model, "train"):
             model.train()
         if hasattr(model, "set_adapter"):
@@ -2019,6 +2107,10 @@ def run_train(args, argv: list[str] | None = None):
                 model.enable_adapter_layers()
             except Exception:
                 pass
+        # Required for gradient checkpointing + LoRA: base weights are frozen,
+        # so we need embedding outputs to require grad for recomputation to work.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
@@ -2041,6 +2133,18 @@ def run_train(args, argv: list[str] | None = None):
             target_modules=["q_proj", "v_proj"],
         )
         model = get_peft_model(model, lora_config)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    # Keep all floating modules in one dtype. Some adapter/base combinations can
+    # otherwise mix fp32 and bf16 and fail in Linear matmul.
+    if torch.cuda.is_available():
+        cast_dtype = torch.bfloat16
+        casted, skipped_cast = _coerce_model_floating_dtype(model, cast_dtype)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[train] dtype normalization -> {cast_dtype}: converted={casted}, skipped={skipped_cast}"
+            )
 
     _wrap_generate_with_eval_mode(model)
 
@@ -2076,6 +2180,14 @@ def run_train(args, argv: list[str] | None = None):
             reward_funcs.append(build_cd_low_shd_reward(scale=float(args.cd_low_shd_reward_scale)))
         if float(args.cd_acyclic_reward_scale) > 0.0:
             reward_funcs.append(build_cd_acyclic_reward(scale=float(args.cd_acyclic_reward_scale)))
+        if float(args.cd_cot_structure_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_cot_structure_reward(scale=float(args.cd_cot_structure_reward_scale)))
+        if float(args.cd_skeleton_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_skeleton_f1_reward(scale=float(args.cd_skeleton_f1_reward_scale)))
+        if float(args.cd_vstruct_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_vstruct_f1_reward(scale=float(args.cd_vstruct_f1_reward_scale)))
+        if float(args.cd_orientation_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_orientation_f1_reward(scale=float(args.cd_orientation_f1_reward_scale)))
         reward_funcs.append(cd_graph_reward)
     elif args.task == "cd_descendants":
         if float(args.cd_format_reward_scale) > 0.0:
@@ -2446,6 +2558,10 @@ def run_train(args, argv: list[str] | None = None):
 
         bf16=torch.cuda.is_available(),
 
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        torch_compile=False,  # set True for ~20% speedup if your torch version supports it
+
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         generation_kwargs=train_generation_kwargs or None,
@@ -2505,6 +2621,17 @@ def run_train(args, argv: list[str] | None = None):
                 "and ensure --vllm_group_port is free and consistent for this run."
             ) from e
         raise
+
+    # Sanity-check: ensure at least one parameter requires grad before launching training.
+    trainable_params = [n for n, p in model.named_parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError(
+            "No trainable parameters found before trainer.train(). "
+            "All parameters have requires_grad=False. "
+            "Check that the LoRA adapter is loaded correctly and enable_input_require_grads() was called."
+        )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"[train] trainable params: {len(trainable_params)} (first few: {trainable_params[:3]})")
 
     try:
         trainer.train()

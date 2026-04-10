@@ -35,22 +35,16 @@ def _build_output_contract_lines(
     output_edge_list: bool,
     require_think_answer_blocks: bool = True,
 ) -> List[str]:
+    _ = require_think_answer_blocks
     if output_edge_list:
         json_key = "edges"
-        json_field_desc = '- "edges": [["source","target"], ...] using exact variable names.'
+        key_desc = '"edges": [["source","target"], ...] using exact variable names.'
     else:
         json_key = "adjacency_matrix"
-        json_field_desc = '- "adjacency_matrix": N x N 0/1 matrix in declared variable order.'
-
-
-    _ = require_think_answer_blocks
+        key_desc = '"adjacency_matrix": N×N 0/1 matrix in variable order. Must be a DAG.'
     return [
-        "Output exactly: <think>...</think><answer>...</answer>.",
-        "Keep <think> concise (minimal necessary reasoning only).",
-        f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
-        json_field_desc,
-        "No extra text before, between, or after the two blocks.",
-        'The JSON in <answer> must start with "{" and end with "}".',
+        f'Output: <think>[staged reasoning]</think><answer>{{"{json_key}": ...}}</answer>',
+        key_desc,
     ]
 
 
@@ -1940,19 +1934,15 @@ def format_prompt_summary_full_joint(
     for i, v in enumerate(variables):
         lines.append(f"{i}: {v}")
 
-    lines.append("\n--- ASSIGNMENT FORMAT ---")
-    lines.append("x = [" + ",".join(variables) + "]")
-    lines.append("num_states=" + _compact_json(num_states))
-    lines.append("Each histogram entry is [x, count{}].".format(", prob" if include_probabilities else ""))
-    lines.append("do(X=v) means intervened data where X is forcibly set to value v.")
-    if include_marginals:
-        lines.append("marginals[j][s] := P(variables[j]=s) in VARIABLES order; each marginals[j] sums to 1.")
-
-    lines.append("\n--- OMISSIONS ---")
-    if omitted_are_zero_prob:
-        lines.append("Unlisted assignments have probability 0.")
-    else:
-        lines.append("Unlisted assignments may be missing due to finite sampling (not necessarily probability 0).")
+    lines.append("\n--- DATA FORMAT ---")
+    num_states_str = _compact_json(num_states)
+    prob_note = ", prob" if include_probabilities else ""
+    marginals_note = " marginals[j][s]=P(Xj=s)." if include_marginals else ""
+    omit_note = "Unlisted assignments have P=0." if omitted_are_zero_prob else "Unlisted assignments may be absent due to finite sampling."
+    lines.append(
+        f"num_states={num_states_str}. hist entries: [assignment{prob_note}, count]."
+        f" do(X=v): X fixed to v, its incoming edges removed.{marginals_note} {omit_note}"
+    )
 
     if (not anonymize) and include_state_legend and state_map:
         kept_vars: List[str] = []
@@ -2014,16 +2004,12 @@ def format_prompt_summary_full_joint(
         lines.append("1) Use interventional shifts to identify descendants/orient edges; use joint patterns for colliders.")
         lines.append("2) Output a DAG as JSON.")
 
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.extend(
         _build_output_contract_lines(
             output_edge_list=output_edge_list,
             require_think_answer_blocks=require_think_answer_blocks,
         )
     )
-    lines.append("Must be a DAG (acyclic).")
-
-    lines.append("\n--- END ---")
     return "\n".join(lines)
 
 def format_prompt_with_interventions(

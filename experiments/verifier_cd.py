@@ -790,6 +790,403 @@ def build_cd_acyclic_reward(scale: float = 0.1):
     )
 
 
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+# Stage header splitters
+_STAGE1_RE = re.compile(r"Stage\s+1\s*\([^)]*\)\s*:", re.IGNORECASE)
+_STAGE2_RE = re.compile(r"Stage\s+2\s*\([^)]*\)\s*:", re.IGNORECASE)
+_STAGE3_RE = re.compile(r"Stage\s+3\s*\([^)]*\)\s*:", re.IGNORECASE)
+
+# Stage 1 keywords: skeleton identification
+_SKELETON_RE = re.compile(
+    r"\b(skeleton|adjacent|undirected|connected pair|no direct|not adjacent"
+    r"|are connected|are not connected|edge between|no edge)\b",
+    re.IGNORECASE,
+)
+# Stage 2 keywords: v-structure / collider identification
+_VSTRUCT_RE = re.compile(
+    r"\b(collider|v.structure|v structure|unshielded|immorality|triple|blocked|d.separat)\b",
+    re.IGNORECASE,
+)
+# Stage 3 keywords: orientation / Meek rules
+_ORIENT_RE = re.compile(
+    r"\b(meek|orient|direction|acyclic|propagat|rule [123]|R[123]:)\b",
+    re.IGNORECASE,
+)
+
+# Edge patterns used for parsing think-block stages
+_EDGE_DIRECTED_RE = re.compile(r"\b(\w+)\s*->\s*(\w+)\b")
+_EDGE_UNDIRECTED_RE = re.compile(r"\b(\w+)\s*--\s*(\w+)\b")
+# Collider triple: (parent1, collider, parent2)
+_COLLIDER_TRIPLE_RE = re.compile(r"\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)")
+
+# Variable block in prompt: "0: X1", "1: Pollution", etc.
+_VAR_BLOCK_RE = re.compile(r"---\s*VARIABLES\s*---\s*\n(.*?)(?=\n---|\Z)", re.DOTALL)
+_VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(\S+)", re.MULTILINE)
+
+
+def _extract_think_block(text: str) -> str:
+    """Return the contents of <think>...</think>, or empty string."""
+    m = _THINK_RE.search(text or "")
+    return m.group(1) if m else ""
+
+
+def _extract_stage(think: str, start_re: re.Pattern, end_re: re.Pattern) -> str:
+    """Return the text of one stage section, bounded by its header and the next stage header."""
+    m = start_re.search(think)
+    if not m:
+        return ""
+    start = m.end()
+    m2 = end_re.search(think, start)
+    end = m2.start() if m2 else len(think)
+    return think[start:end].strip()
+
+
+def _variables_from_prompt(prompt: str) -> Optional[List[str]]:
+    """Extract ordered variable names from the VARIABLES block in a prompt."""
+    m = _VAR_BLOCK_RE.search(prompt or "")
+    if not m:
+        return None
+    names = _VAR_LINE_RE.findall(m.group(1))
+    return names if names else None
+
+
+def _skeleton_from_adj(adj: List[List[int]]) -> set:
+    """Return index-pair set representing the undirected skeleton."""
+    n = len(adj)
+    edges = set()
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adj[i][j] == 1 or adj[j][i] == 1:
+                edges.add((i, j))
+    return edges
+
+
+def _skeleton_from_stage1_text(stage1_text: str) -> set:
+    """Parse 'X -- Y' lines from Stage 1 text into a set of frozenset name-pairs."""
+    edges = set()
+    for m in _EDGE_UNDIRECTED_RE.finditer(stage1_text):
+        a, b = m.group(1), m.group(2)
+        edges.add(frozenset([a, b]))
+    return edges
+
+
+def build_cd_cot_structure_reward(scale: float = 0.1):
+    """
+    Soft shaping reward for staged reasoning structure inside <think>.
+    Awards credit proportionally for mentioning all three stages.
+    - Stage 1 (Skeleton): 1/3 of scale
+    - Stage 2 (V-structures): 1/3 of scale
+    - Stage 3 (Orientation): 1/3 of scale
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    def _cd_cot_structure_reward(completions, **kwargs):
+        rewards: List[float] = []
+        s = float(scale)
+        for completion in completions:
+            text = completion_to_text(completion)
+            think = _extract_think_block(text)
+            if not think:
+                rewards.append(0.0)
+                continue
+            score = 0.0
+            if _SKELETON_RE.search(think):
+                score += 1.0 / 3.0
+            if _VSTRUCT_RE.search(think):
+                score += 1.0 / 3.0
+            if _ORIENT_RE.search(think):
+                score += 1.0 / 3.0
+            rewards.append(float(s * score))
+        return rewards
+
+    _cd_cot_structure_reward.__name__ = "cd_cot_structure_reward"
+    return _cd_cot_structure_reward
+
+
+def build_cd_skeleton_f1_reward(scale: float = 0.2):
+    """
+    Hard shaping reward that parses Stage 1 (Skeleton) text from <think> and computes
+    skeleton F1 against the ground truth.
+
+    Parses 'X -- Y' lines from the Stage 1 section by name, then maps names to indices
+    using the VARIABLES block in the prompt. Falls back to 0 if Stage 1 is missing or
+    variable names cannot be resolved.
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def _named_skeleton_f1(pred_edges: set, target_edges: set) -> float:
+        """F1 over sets of frozenset name-pairs."""
+        if not pred_edges and not target_edges:
+            return 1.0
+        if not pred_edges or not target_edges:
+            return 0.0
+        tp = len(pred_edges & target_edges)
+        precision = tp / len(pred_edges)
+        recall = tp / len(target_edges)
+        if precision + recall == 0.0:
+            return 0.0
+        return 2.0 * precision * recall / (precision + recall)
+
+    def _cd_skeleton_f1_reward(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        prompts = kwargs.get("prompt")
+        rewards: List[float] = []
+        s = float(scale)
+
+        for i, completion in enumerate(completions):
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+
+            target_adj = _cached_target(target_raw)
+            if target_adj is None:
+                rewards.append(0.0)
+                continue
+
+            # Extract variable names from prompt to build named target skeleton
+            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
+            if variables is None or len(variables) != len(target_adj):
+                rewards.append(0.0)
+                continue
+
+            target_edges = set(
+                frozenset([variables[a], variables[b]])
+                for a in range(len(target_adj))
+                for b in range(a + 1, len(target_adj))
+                if target_adj[a][b] == 1 or target_adj[b][a] == 1
+            )
+
+            text = completion_to_text(completion)
+            think = _extract_think_block(text)
+            if not think:
+                rewards.append(0.0)
+                continue
+
+            stage1_text = _extract_stage(think, _STAGE1_RE, _STAGE2_RE)
+            pred_edges = _skeleton_from_stage1_text(stage1_text)
+
+            value = _named_skeleton_f1(pred_edges, target_edges)
+            rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
+        return rewards
+
+    _cd_skeleton_f1_reward.__name__ = "cd_skeleton_f1_reward"
+    return _cd_skeleton_f1_reward
+
+
+def build_cd_vstruct_f1_reward(scale: float = 0.15):
+    """
+    Shaping reward that parses Stage 2 (V-structures) text from <think> and computes
+    F1 over unshielded collider triples against ground truth.
+
+    Ground truth v-structures are derived from the adjacency matrix: a triple (i, k, j)
+    is a v-structure iff i->k, j->k, and i-k-j is NOT in the skeleton (unshielded).
+    Predicted triples are parsed from '(parent1, collider, parent2)' lines.
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def _vstruct_set_from_adj(adj: List[List[int]], variables: List[str]) -> set:
+        """Return frozenset triples (p1, collider, p2) as name-tuples (sorted parents)."""
+        n = len(adj)
+        vstructs = set()
+        for k in range(n):
+            parents = [i for i in range(n) if adj[i][k] == 1]
+            for pi in range(len(parents)):
+                for pj in range(pi + 1, len(parents)):
+                    i, j = parents[pi], parents[pj]
+                    # unshielded: no edge between i and j
+                    if adj[i][j] == 0 and adj[j][i] == 0:
+                        p1, p2 = sorted([variables[i], variables[j]])
+                        vstructs.add((p1, variables[k], p2))
+        return vstructs
+
+    def _vstruct_set_from_stage2_text(stage2_text: str) -> set:
+        """Parse '(parent1, collider, parent2)' triples; normalize by sorting parents."""
+        vstructs = set()
+        for m in _COLLIDER_TRIPLE_RE.finditer(stage2_text):
+            p1, col, p2 = m.group(1), m.group(2), m.group(3)
+            sp1, sp2 = sorted([p1, p2])
+            vstructs.add((sp1, col, sp2))
+        return vstructs
+
+    def _f1(pred: set, target: set) -> float:
+        if not pred and not target:
+            return 1.0
+        if not pred or not target:
+            return 0.0
+        tp = len(pred & target)
+        prec = tp / len(pred)
+        rec = tp / len(target)
+        if prec + rec == 0.0:
+            return 0.0
+        return 2.0 * prec * rec / (prec + rec)
+
+    def _cd_vstruct_f1_reward(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        prompts = kwargs.get("prompt")
+        rewards: List[float] = []
+        s = float(scale)
+
+        for i, completion in enumerate(completions):
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+
+            target_adj = _cached_target(target_raw)
+            if target_adj is None:
+                rewards.append(0.0)
+                continue
+
+            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
+            if variables is None or len(variables) != len(target_adj):
+                rewards.append(0.0)
+                continue
+
+            target_vstructs = _vstruct_set_from_adj(target_adj, variables)
+
+            text = completion_to_text(completion)
+            think = _extract_think_block(text)
+            if not think:
+                rewards.append(0.0)
+                continue
+
+            stage2_text = _extract_stage(think, _STAGE2_RE, _STAGE3_RE)
+            pred_vstructs = _vstruct_set_from_stage2_text(stage2_text)
+
+            value = _f1(pred_vstructs, target_vstructs)
+            rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
+        return rewards
+
+    _cd_vstruct_f1_reward.__name__ = "cd_vstruct_f1_reward"
+    return _cd_vstruct_f1_reward
+
+
+def build_cd_orientation_f1_reward(scale: float = 0.15):
+    """
+    Shaping reward that parses Stage 3 (Orientation) text from <think> and computes
+    F1 over directed edges against ground truth.
+
+    Predicted edges are parsed from 'X -> Y' lines in the Stage 3 section.
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def _directed_set_from_adj(adj: List[List[int]], variables: List[str]) -> set:
+        """Return (src_name, dst_name) pairs for all directed edges."""
+        n = len(adj)
+        return {
+            (variables[i], variables[j])
+            for i in range(n)
+            for j in range(n)
+            if adj[i][j] == 1
+        }
+
+    def _directed_set_from_stage3_text(stage3_text: str) -> set:
+        """Parse 'X -> Y' lines from Stage 3 text."""
+        return {
+            (m.group(1), m.group(2))
+            for m in _EDGE_DIRECTED_RE.finditer(stage3_text)
+        }
+
+    def _f1(pred: set, target: set) -> float:
+        if not pred and not target:
+            return 1.0
+        if not pred or not target:
+            return 0.0
+        tp = len(pred & target)
+        prec = tp / len(pred)
+        rec = tp / len(target)
+        if prec + rec == 0.0:
+            return 0.0
+        return 2.0 * prec * rec / (prec + rec)
+
+    def _cd_orientation_f1_reward(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        prompts = kwargs.get("prompt")
+        rewards: List[float] = []
+        s = float(scale)
+
+        for i, completion in enumerate(completions):
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+
+            target_adj = _cached_target(target_raw)
+            if target_adj is None:
+                rewards.append(0.0)
+                continue
+
+            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
+            if variables is None or len(variables) != len(target_adj):
+                rewards.append(0.0)
+                continue
+
+            target_directed = _directed_set_from_adj(target_adj, variables)
+
+            text = completion_to_text(completion)
+            think = _extract_think_block(text)
+            if not think:
+                rewards.append(0.0)
+                continue
+
+            # Stage 3 runs to end of think block (no following stage header)
+            m3 = _STAGE3_RE.search(think)
+            stage3_text = think[m3.end():].strip() if m3 else ""
+            pred_directed = _directed_set_from_stage3_text(stage3_text)
+
+            value = _f1(pred_directed, target_directed)
+            rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
+        return rewards
+
+    _cd_orientation_f1_reward.__name__ = "cd_orientation_f1_reward"
+    return _cd_orientation_f1_reward
+
+
 def build_length_penalty_reward(
     tokenizer: Any,
     coef: float = 0.0,

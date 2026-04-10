@@ -241,6 +241,14 @@ def build_argparser():
     p.set_defaults(use_unsloth=True)
     p.add_argument("--unsloth-load-in-4bit", action="store_true", help="Load base model in 4-bit via Unsloth.")
     p.add_argument(
+        "--distributed-unsloth-load-in-4bit",
+        action="store_true",
+        help=(
+            "Allow 4-bit Unsloth loading even when WORLD_SIZE>1. "
+            "By default distributed runs auto-switch to non-quantized loading for DDP stability."
+        ),
+    )
+    p.add_argument(
         "--unsloth-fast-inference",
         dest="unsloth_fast_inference",
         action="store_true",
@@ -1647,11 +1655,19 @@ def run_train(args):
             else:
                 unsloth_max_seq_length = 2048
 
+        load_in_4bit = bool(args.unsloth_load_in_4bit)
+        if distributed_world_size > 1 and load_in_4bit and not args.distributed_unsloth_load_in_4bit:
+            print(
+                "[train] distributed mode: forcing Unsloth load_in_4bit=False to match DDP-safe "
+                "multi-GPU loading"
+            )
+            load_in_4bit = False
+
         load_kwargs = {
             "model_name": args.model_id,
             "max_seq_length": unsloth_max_seq_length,
             "dtype": None,
-            "load_in_4bit": bool(args.unsloth_load_in_4bit),
+            "load_in_4bit": load_in_4bit,
             "fast_inference": bool(args.unsloth_fast_inference),
             "gpu_memory_utilization": float(args.unsloth_gpu_memory_utilization),
         }
