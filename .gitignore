@@ -143,6 +143,8 @@ checkpoints/*
 *.csv
 *.json
 *.jsonl
+!benchmark_specs/*.json
+!paper_slices/*.json
 out/
 prompts/
 *.pdf
@@ -159,3 +161,9 @@ experiments/unsloth_compiled_cache/*
 *.png
 
 .claude/
+
+CLAUDE.md
+refine-logs/
+paper_slices/
+!paper_slices/
+>>>>>>> 01462b7f9dc119b1ee9d7eb4cfb9dfa5513d6ef2

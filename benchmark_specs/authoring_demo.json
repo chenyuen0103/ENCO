@@ -1,0 +1,54 @@
+{
+  "name": "authoring_demo",
+  "role": "tutorial",
+  "description": "Minimal manifest showing how a user can define a new benchmark family without editing core code.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "asia_demo",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/asia.bif",
+      "benchmark_card": "benchmark_cards/authoring_demo.md",
+      "role": "tutorial"
+    },
+    {
+      "name": "synthetic_demo_10",
+      "graph_source": "synthetic",
+      "graph_params": {"graph_type": "random", "num_vars": 10, "num_categs": 8, "edge_prob": 0.25, "seed": 501},
+      "benchmark_card": "benchmark_cards/authoring_demo.md",
+      "role": "tutorial"
+    }
+  ],
+  "num_prompts": 2,
+  "seed": 7,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 0, "anonymize": false},
+    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false},
+    {"style": "matrix", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": true}
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "models": [
+    {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api"}
+  ],
+  "baselines": [
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy", "pc_variant": "stable", "pc_ci_test": "chi_square", "pc_significance_level": 0.01, "pc_max_cond_vars": 5},
+    {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
+  ],
+  "evaluator": {
+    "tau": 0.7
+  },
+  "execution": {
+    "prompt_storage": "in_memory",
+    "prompt_retention": "example"
+  },
+  "provenance": {
+    "schema_version": "benchmark_spec/v1",
+    "tags": ["tutorial", "authoring"]
+  },
+  "benchmark_card": "benchmark_cards/authoring_demo.md",
+  "notes": "Tutorial manifest for benchmark authoring."
+}

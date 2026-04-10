@@ -16,7 +16,7 @@ LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
 # Allow running from experiments/ with repo root one level up
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 try:
-    from causal_graphs.graph_real_world import load_graph_file as _load_graph_file_full  # type: ignore
+    from benchmark_builder.graph_io import load_causal_graph as _load_graph_file_full  # type: ignore
 except Exception:
     _load_graph_file_full = None
 
@@ -161,8 +161,8 @@ def iter_names_only_prompts_in_memory(
     Generate names-only prompts in-memory.
     Returns (base_name, answer_obj, iterator of rows with prompt_text).
     """
-    bif_abs = Path(bif_file).resolve(strict=True)
-    graph = load_graph_file(str(bif_abs))
+    graph_abs = Path(bif_file).resolve(strict=True)
+    graph = load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
 
@@ -243,7 +243,12 @@ def main():
     ap = argparse.ArgumentParser(description="Generate 'Names Only' prompts (No Data).")
     
     # --- Critical Arguments (Used) ---
-    ap.add_argument("--bif-file", required=True)
+    ap.add_argument("--bif-file", default="../causal_graphs/real_data/small_graphs/cancer.bif")
+    ap.add_argument(
+        "--graph-file",
+        default=None,
+        help="Generic graph path (.bif or .pt). If set, overrides --bif-file.",
+    )
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--col-order", choices=["original", "reverse", "random", "topo", "reverse_topo"], default="original")
     ap.add_argument("--num-prompts", type=int, default=5)
@@ -270,8 +275,9 @@ def main():
     args = ap.parse_args()
 
     # 1. Load Graph
-    bif_abs = Path(args.bif_file).resolve(strict=True)
-    graph = load_graph_file(str(bif_abs))
+    graph_file = args.graph_file or args.bif_file
+    graph_abs = Path(graph_file).resolve(strict=True)
+    graph = load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
     
@@ -349,7 +355,7 @@ def main():
     csv_writer.writeheader()
 
     # 5. Generate Prompts (Since there's no data, the prompt is identical for all 'replicates')
-    dataset_name = os.path.splitext(os.path.basename(args.bif_file))[0]
+    dataset_name = os.path.splitext(os.path.basename(graph_file))[0]
     prompt_text = format_names_only_prompt(
         variables_out,
         dataset_name,

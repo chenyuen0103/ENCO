@@ -1,0 +1,29 @@
+{
+  "name": "cancer_smoke_summary",
+  "role": "smoke",
+  "dataset": "cancer",
+  "bif_file": "causal_graphs/real_data/small_graphs/cancer.bif",
+  "model": "gpt-5-mini",
+  "seed": 42,
+  "num_prompts": 2,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 10,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "enco": {
+    "enabled": false
+  },
+  "notes": "Debug-only cancer smoke slice for end-to-end plumbing validation."
+}
