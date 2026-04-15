@@ -104,7 +104,11 @@ def _export_rows(
         writer.writeheader()
 
         for config_idx, cfg in enumerate(configs):
-            prompt_style = str(cfg["style"])
+            prompt_style = str(cfg.get("style", cfg.get("prompt_style", "")))
+            if not prompt_style:
+                raise ValueError(
+                    f"Config {config_idx} missing required 'style'/'prompt_style': {cfg}"
+                )
             anonymize = bool(cfg.get("anonymize", False))
             obs_per_prompt = int(cfg["obs_per_prompt"])
             int_per_combo = int(cfg["int_per_combo"])

@@ -55,7 +55,7 @@ def _build_descendants_output_contract_lines() -> List[str]:
         "Keep <think> concise (minimal necessary reasoning only).",
         'Inside <answer>, output exactly one JSON object with keys "target" and "descendants".',
         '- "target": the intervened variable name.',
-        '- "descendants": a JSON list of variable names that are descendants of "target".',
+        '- "descendants": a JSON list of variable names that are downstream of "target". Use [] if there are none.',
         "Use exact variable names from the prompt and exclude the target itself from descendants.",
         "No extra text before, between, or after the two blocks.",
         'The JSON in <answer> must start with "{" and end with "}".',
@@ -1398,7 +1398,7 @@ def format_prompt_summary_probs(
 
     lines.append("\n--- VARIABLES (ORDER MATTERS) ---")
     for i, v in enumerate(variables):
-        if state_names and i < len(state_names) and state_names[i]:
+        if state_names and i < len(state_names) and state_names[i] and not _is_trivial_state_names(state_names[i]):
             mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
             lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
         else:
@@ -1498,6 +1498,11 @@ def format_prompt_summary_probs(
     return "\n".join(lines)
 
 
+def _is_trivial_state_names(names: List[str]) -> bool:
+    """Return True if state names are just the string form of their index (0→'0', 1→'1', ...)."""
+    return all(str(s) == str(name) for s, name in enumerate(names))
+
+
 def format_prompt_descendants_summary(
     variables: List[str],
     *,
@@ -1519,7 +1524,6 @@ def format_prompt_descendants_summary(
         raise ValueError("intervention_rows_num must be non-empty")
 
     lines: List[str] = []
-    lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
     lines.append(
         f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
     )
@@ -1530,7 +1534,6 @@ def format_prompt_descendants_summary(
 
     lines.append("ASSUMPTIONS:")
     lines.append("- The true graph is a DAG (no directed cycles).")
-    lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
     lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
     lines.append("- Only descendants of the intervened variable can change because of the intervention, up to sampling noise.")
 
@@ -1556,7 +1559,7 @@ def format_prompt_descendants_summary(
 
     lines.append("\n--- VARIABLE ORDER ---")
     for i, v in enumerate(variables):
-        if state_names and i < len(state_names) and state_names[i]:
+        if state_names and i < len(state_names) and state_names[i] and not _is_trivial_state_names(state_names[i]):
             mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
             lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
         else:
@@ -1617,8 +1620,97 @@ def format_prompt_descendants_summary(
             ensure_ascii=False,
         )
     )
-    lines.append("tv_change_vs_obs=" + json.dumps(tv_scores, separators=(",", ":"), ensure_ascii=False))
+    lines.append(
+        "tv_change_vs_obs="
+        + json.dumps(tv_scores, separators=(",", ":"), ensure_ascii=False)
+        + "  # total-variation distance vs obs; larger = more likely descendant"
+    )
 
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
+    lines.append(
+        f"Return the descendants of {intervention_target}: the variables whose distributions indicate they are downstream of the intervention."
+    )
+    lines.extend(_build_descendants_output_contract_lines())
+
+    return "\n".join(lines)
+
+
+def format_prompt_descendants_matrix(
+    variables: List[str],
+    *,
+    dataset_name: str,
+    intervention_target: str,
+    intervention_value: str,
+    intervention_rows_num: List[List[float]],
+    obs_rows_num: List[List[float]],
+    state_names: Optional[List[List[str]]] = None,
+    include_causal_rules: bool = False,
+    include_def_int: bool = False,
+    anonymize: bool = True,
+) -> str:
+    """
+    Matrix-style prompt for the cd_descendants subtask.
+
+    Shows raw case rows (observational block + one intervention block) instead
+    of the marginal/TV summary used by format_prompt_descendants_summary.
+    """
+    if not intervention_rows_num:
+        raise ValueError("intervention_rows_num must be non-empty")
+
+    lines: List[str] = []
+    lines.append(
+        f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
+    )
+    if anonymize:
+        lines.append("The following are empirical data from an anonymized Bayesian network.")
+    else:
+        lines.append(f"The following are empirical data from a Bayesian network named {dataset_name}.")
+
+    lines.append("ASSUMPTIONS:")
+    lines.append("- The true graph is a DAG (no directed cycles).")
+    lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
+    lines.append("- Only descendants of the intervened variable can change because of the intervention, up to sampling noise.")
+
+    if include_causal_rules:
+        lines.extend([
+            "\n--- CAUSAL DISCOVERY REMINDERS ---",
+            "- Variables whose distributions shift under do(X=v) are candidates for being descendants of X.",
+            "- Ancestors and non-descendants of X should remain invariant up to sampling noise.",
+            "- Descendants include indirect downstream effects, not only direct children.",
+        ])
+
+    if include_def_int:
+        lines.extend([
+            "\n--- INTERVENTION SEMANTICS ---",
+            f"- In do({intervention_target} = {intervention_value}), {intervention_target} is externally fixed.",
+            f"- The intervention removes all incoming edges into {intervention_target}.",
+            f"- Downstream variables may change; upstream variables should not change because of this intervention.",
+        ])
+
+    lines.append("\n--- VARIABLE ORDER ---")
+    for i, v in enumerate(variables):
+        if state_names and i < len(state_names) and state_names[i] and not _is_trivial_state_names(state_names[i]):
+            mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
+            lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
+        else:
+            lines.append(f"{i}: {v}")
+
+    header = " | ".join(variables)
+
+    if obs_rows_num:
+        lines.append("\n--- OBSERVATIONAL DATA (no intervention) ---")
+        lines.append("Each row is one observed case.")
+        lines.append(header)
+        for row in obs_rows_num:
+            lines.append(" | ".join(str(int(round(float(x)))) for x in row))
+
+    lines.append(f"\n--- INTERVENTIONAL DATA ---")
+    lines.append(f"[Intervention: do({intervention_target} = {intervention_value})]")
+    lines.append(header)
+    for row in intervention_rows_num:
+        lines.append(" | ".join(str(int(round(float(x)))) for x in row))
+
+    lines.append("\n--- END OF DATA ---")
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.append(
         f"Return the descendants of {intervention_target}: the variables whose distributions indicate they are downstream of the intervention."
@@ -1645,7 +1737,6 @@ def format_prompt_descendants_no_data(
     standard evidence-based descendant task.
     """
     lines: List[str] = []
-    lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
     lines.append(
         f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
     )
@@ -1658,7 +1749,6 @@ def format_prompt_descendants_no_data(
 
     lines.append("ASSUMPTIONS:")
     lines.append("- The true graph is a DAG (no directed cycles).")
-    lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
     lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
     lines.append("- Descendants are variables reachable by directed paths from the intervention target.")
 
@@ -1684,7 +1774,7 @@ def format_prompt_descendants_no_data(
 
     lines.append("\n--- VARIABLE ORDER ---")
     for i, v in enumerate(variables):
-        if state_names and i < len(state_names) and state_names[i]:
+        if state_names and i < len(state_names) and state_names[i] and not _is_trivial_state_names(state_names[i]):
             mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
             lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
         else:

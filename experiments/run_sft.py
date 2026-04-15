@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,49 @@ def torch_cuda_available() -> bool:
         return False
 
 
+def _resolve_train_log_path(sft_output_dir: Path, train_log_jsonl: Path | None) -> Path:
+    if train_log_jsonl is not None:
+        out = Path(train_log_jsonl)
+    else:
+        out = Path(sft_output_dir) / "train_metrics.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _build_jsonl_metrics_callback(output_path: Path):
+    from transformers import TrainerCallback
+
+    class _JsonlMetricsCallback(TrainerCallback):
+        def __init__(self, p: Path):
+            self.output_path = Path(p)
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        @staticmethod
+        def _to_jsonable(value: Any) -> Any:
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value
+            if hasattr(value, "item"):
+                try:
+                    return _JsonlMetricsCallback._to_jsonable(value.item())
+                except Exception:
+                    pass
+            return str(value)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+            if not state.is_local_process_zero or not logs:
+                return
+            payload = {
+                "global_step": int(state.global_step),
+                "epoch": float(state.epoch) if state.epoch is not None else None,
+                "time_unix": time.time(),
+            }
+            payload.update({k: self._to_jsonable(v) for k, v in logs.items()})
+            with self.output_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+
+    return _JsonlMetricsCallback(output_path)
+
+
 def _run_sft_unsloth(
     *,
     base_model: str,
@@ -162,6 +206,7 @@ def _run_sft_unsloth(
     sft_logging_steps: int,
     lora_r: int,
     lora_alpha: int,
+    train_log_jsonl: Path | None = None,
     grpo_base_model: str | None = None,
 ) -> None:
     """Single-GPU SFT via Unsloth — ~2× faster, supports 4-bit to reduce VRAM."""
@@ -254,6 +299,8 @@ def _run_sft_unsloth(
     print(f"[sft/unsloth] rows={len(tokenized_ds)} supervised_tokens_total={supervised_total}")
 
     from trl import SFTTrainer, SFTConfig
+    metrics_jsonl_path = _resolve_train_log_path(sft_output_dir, train_log_jsonl)
+    print(f"[sft/unsloth] JSONL logging enabled: {metrics_jsonl_path}")
     cfg = SFTConfig(
         output_dir=str(sft_output_dir),
         num_train_epochs=float(sft_epochs),
@@ -276,6 +323,7 @@ def _run_sft_unsloth(
         tokenizer=tokenizer,
         train_dataset=tokenized_ds,
         args=cfg,
+        callbacks=[_build_jsonl_metrics_callback(metrics_jsonl_path)],
     )
     trainer.train()
     model.save_pretrained(str(sft_output_dir))
@@ -307,10 +355,13 @@ def run_sft(
     sft_max_seq_length: int,
     sft_save_steps: int,
     sft_logging_steps: int,
+    train_log_jsonl: Path | None,
     use_unsloth: bool = False,
     lora_r: int = 16,
     lora_alpha: int = 16,
     grpo_base_model: str | None = None,
+    wandb_project: str | None = None,
+    wandb_run_name: str | None = None,
 ) -> None:
     if use_unsloth:
         _run_sft_unsloth(
@@ -326,6 +377,7 @@ def run_sft(
             sft_logging_steps=sft_logging_steps,
             lora_r=lora_r,
             lora_alpha=lora_alpha,
+            train_log_jsonl=train_log_jsonl,
             grpo_base_model=grpo_base_model,
         )
         return
@@ -541,7 +593,8 @@ def run_sft(
         logging_steps=int(sft_logging_steps),
         save_steps=int(sft_save_steps),
         bf16=torch_cuda_available(),
-        report_to="none",
+        report_to="wandb" if wandb_project else "none",
+        run_name=wandb_run_name,
         remove_unused_columns=False,
         save_total_limit=1,
         # Non-reentrant gradient checkpointing avoids the DDP + LoRA
@@ -550,11 +603,14 @@ def run_sft(
         gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
     )
+    metrics_jsonl_path = _resolve_train_log_path(sft_output_dir, train_log_jsonl)
+    print(f"[sft] JSONL logging enabled: {metrics_jsonl_path}")
     trainer = Trainer(
         model=model,
         args=train_args,
         train_dataset=tokenized_ds,
         data_collator=_Collator(tokenizer.pad_token_id),
+        callbacks=[_build_jsonl_metrics_callback(metrics_jsonl_path)],
     )
     trainer.train()
     trainer.save_model(str(sft_output_dir))
@@ -783,9 +839,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sft-lr", type=float, default=2e-5)
     ap.add_argument("--sft-batch-size", type=int, default=1)
     ap.add_argument("--sft-grad-accum", type=int, default=4)
-    ap.add_argument("--sft-max-seq-length", type=int, default=3000)
+    ap.add_argument("--sft-max-seq-length", type=int, default=16384)
     ap.add_argument("--sft-save-steps", type=int, default=100)
     ap.add_argument("--sft-logging-steps", type=int, default=10)
+    ap.add_argument(
+        "--train-log-jsonl",
+        type=Path,
+        default=None,
+        help="Optional JSONL metrics path for SFT logs. Default: <sft_output_dir>/train_metrics.jsonl",
+    )
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=16)
     ap.add_argument(
@@ -838,6 +900,20 @@ def parse_args() -> argparse.Namespace:
     ap.set_defaults(format_check_enable_thinking=False)
     ap.add_argument("--format-check-out", type=Path, default=None)
 
+    # Logging options
+    ap.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="Weights & Biases project name for logging. If set, run name is derived from --sft-output-dir basename.",
+    )
+    ap.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Custom W&B run name (defaults to --sft-output-dir basename if --wandb-project is set).",
+    )
+
     ap.add_argument(
         "--grpo-args",
         nargs=argparse.REMAINDER,
@@ -849,6 +925,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # Derive wandb run name from sft-output-dir if not provided
+    wandb_run_name = args.wandb_run_name
+    if args.wandb_project and not wandb_run_name:
+        wandb_run_name = Path(args.sft_output_dir).name
+
+    # Make wandb project/name explicit for Trainer integrations.
+    if args.wandb_project:
+        os.environ["WANDB_PROJECT"] = str(args.wandb_project)
+        if wandb_run_name:
+            os.environ["WANDB_NAME"] = str(wandb_run_name)
 
     if args.stage in ("all", "sft"):
         already_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -868,10 +955,13 @@ def main() -> None:
                 sft_max_seq_length=args.sft_max_seq_length,
                 sft_save_steps=args.sft_save_steps,
                 sft_logging_steps=args.sft_logging_steps,
+                train_log_jsonl=args.train_log_jsonl,
                 use_unsloth=args.use_unsloth,
                 lora_r=args.lora_r,
                 lora_alpha=args.lora_alpha,
                 grpo_base_model=getattr(args, "grpo_base_model", None),
+                wandb_project=args.wandb_project,
+                wandb_run_name=wandb_run_name,
             )
         finally:
             if not already_distributed:

@@ -266,6 +266,218 @@ python run_experiment1_pipeline.py --steps evaluate,analyze --dataset cancer
 
 This will include `predictions_obs*_int*_ENCO.csv` in `experiments/out/experiment1/cancer_summary.csv`.
 
+## GRPO Training
+
+This section covers fine-tuning a causal discovery model with GRPO (Group Relative Policy Optimization)
+after an initial SFT phase.
+
+### SFT readiness check
+
+Before launching GRPO, verify the SFT checkpoint produces correct output format and has partial (not
+perfect) task accuracy. Run `eval_sft_on_jsonl.py` on a small held-out set:
+
+```bash
+cd /u/chenyuen0103/ENCO
+
+python experiments/eval_sft_on_jsonl.py \
+    --model experiments/checkpoints/staged_sft_v3 \
+    --jsonl experiments/data/permuted_sft.jsonl \
+    --n 20 \
+    --graph-filter cancer earthquake \
+    --output-jsonl experiments/checkpoints/staged_sft_v3/eval_permuted_20.jsonl
+```
+
+**Readiness criteria:**
+- `tags_correct = 100%` — every rollout is scoreable; no zero-reward completions due to format failures
+- `adj_matrix_present = 100%` — adjacency matrix is always parseable
+- `exact_match` between 5–50% — model is trying but not memorised; GRPO has a gradient to work with
+- `prompt_copy = 0%` — no degenerate hallucination
+
+The `prompt_model_input` field in the output JSONL records exactly what tokens the model received, which
+you can compare against the raw `prompt` field to verify the tokenizer is not adding unexpected structure.
+
+### Step 1 — Generate a fresh GRPO dataset
+
+GRPO needs data the model has **not memorised** from SFT. Generate fresh observational/interventional
+samples from the same graphs but with a different random seed. Start with the two simplest graphs
+(cancer, earthquake — 5 nodes each) before introducing harder ones.
+
+Run from the repo root:
+
+```bash
+python experiments/build_grpo_cd_mix_dataset.py \
+    --graph-names cancer,earthquake \
+    --output-csv experiments/data/grpo_v1_cancer_earthquake_seed200.csv \
+    --obs-values 100 \
+    --int-values 10 \
+    --num-prompts-per-config 500 \
+    --shuffles-per-graph 3 \
+    --seed 200 \
+    --anonymize
+```
+
+**Why these settings:**
+- `--seed 200` — outside all SFT seeds (42) and prior GRPO seeds (42–46); different Bayesian network
+  samples so the model cannot memorise
+- `--obs-values 100 --int-values 10` — same data regime as SFT to keep difficulty consistent
+- `--num-prompts-per-config 500` × `--shuffles-per-graph 3` = 3000 rows per graph (6000 total)
+- `--graph-names cancer,earthquake` — curriculum: master simple 5-node graphs first before adding
+  asia (8 nodes) or sachs (11 nodes)
+
+Sanity-check the output:
+
+```bash
+python3 -c "
+import csv
+with open('experiments/data/grpo_v1_cancer_earthquake_seed200.csv') as f:
+    rows = list(csv.DictReader(f))
+graphs = {}
+for r in rows:
+    g = r.get('dataset', '?')
+    graphs[g] = graphs.get(g, 0) + 1
+print('Total rows:', len(rows))
+print('By graph:', graphs)
+print('Columns:', list(rows[0].keys()))
+print('Prompt tail:', rows[0].get('prompt_text', '')[-200:])
+"
+```
+
+The prompt tail should end with `assistant\n<think>` — this is the prefill boundary where the model
+begins generating.
+
+### Step 2 — Launch GRPO training
+
+```bash
+torchrun --standalone --nproc_per_node=4 experiments/grpo.py \
+    --mode train \
+    --task causal_discovery \
+    --model_id experiments/checkpoints/staged_sft_v3 \
+    --cd-train-csv experiments/data/grpo_v1_cancer_earthquake_seed200.csv \
+    --cd-test-csv experiments/data/cancer_randcol_seed44.csv \
+    --output_dir experiments/checkpoints/grpo_v1_cancer_earthquake \
+    --no-use-vllm \
+    --max_completion_length 8192 \
+    --max_prompt_tokens 4096 \
+    --num_generations 4 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 5e-6 \
+    --cd-format-reward-scale 0.05 \
+    --cd-cot-structure-reward-scale 0.05 \
+    --cd-skeleton-f1-reward-scale 0.10 \
+    --cd-vstruct-f1-reward-scale 0.10 \
+    --cd-orientation-f1-reward-scale 0.10 \
+    --cd-edge-f1-reward-scale 0.30 \
+    --cd-low-shd-reward-scale 0.20 \
+    --cd-graph-reward-scale 0.50 \
+    --cd-append-format-hint \
+    --save_steps 20 \
+    --logging_steps 1 \
+    --sample_completions_every 10 \
+    --report_to none
+```
+
+### Step 3 — Monitor training
+
+Check `experiments/checkpoints/grpo_v1_cancer_earthquake/grpo_log/sample_completions_rank0.jsonl`
+for the sampled completions. Key fields to watch:
+
+| Field | What to look for |
+|---|---|
+| `format_ok` | Should be 1 on nearly all rows within a few steps |
+| `cd_edge_f1_reward` | Should increase over training steps |
+| `cd_graph_reward` | Sparse signal; look for trend over 50+ steps |
+| `completion` | Should start with `Stage 1 (Skeleton):`, not hallucinated data |
+
+If `cd_edge_f1_reward` for one graph is consistently 0 across many steps, that graph may be too hard
+for the current policy — consider temporarily removing it from `--cd-train-csv`.
+
+### Curriculum progression
+
+Once cancer+earthquake edge-F1 is stable (typically > 0.6), add harder graphs:
+
+```bash
+torchrun --standalone --nproc_per_node=4 experiments/grpo.py \
+    --mode train \
+    --task causal_discovery \
+    --model_id experiments/checkpoints/grpo_v1_cancer_earthquake \
+    --cd-train-csv experiments/data/grpo_v1_cancer_earthquake_seed200.csv \
+    --cd-train-csv experiments/data/asia_randcol_seed45.csv \
+    --cd-test-csv experiments/data/cancer_randcol_seed44.csv \
+    --output_dir experiments/checkpoints/grpo_v2_with_asia \
+    ... (same reward flags)
+```
+
+Generate asia/sachs GRPO data the same way as Step 1, substituting `--graph-names asia` or
+`--graph-names sachs` and keeping `--seed 200`.
+
+## GRPO Training — Descendant Task
+
+This section covers fine-tuning from an SFT checkpoint on the `cd_descendants` task using GRPO.
+
+### Step 1 — Evaluate the SFT checkpoint
+
+```bash
+python experiments/eval_sft_on_jsonl.py \
+    --model experiments/checkpoints/descendant_sft_v1 \
+    --jsonl experiments/data/descendant_sft.jsonl \
+    --n 100 \
+    --max-new-tokens 4096 \
+    --output-jsonl experiments/checkpoints/descendant_sft_v1/eval_descendant_100.jsonl
+```
+
+To verify GRPO multi-GPU compatibility before launching training:
+
+```bash
+python experiments/eval_sft_on_jsonl.py \
+    --model experiments/checkpoints/descendant_sft_v1 \
+    --jsonl experiments/data/descendant_sft.jsonl \
+    --check-grpo-compat
+```
+
+### Step 2 — Generate GRPO prompt data
+
+Split CSVs already exist under `experiments/prompts/cd_descendants/sachs/splits/`. To regenerate:
+
+```bash
+python experiments/collect_descendant_sft_data.py \
+    --output experiments/data/descendant_sft.jsonl \
+    --graphs cancer earthquake asia sachs \
+    --obs-values 50 100 \
+    --int-values 10 50 \
+    --num-prompts 10 \
+    --seed 42
+```
+
+### Step 3 — Launch GRPO training from the SFT checkpoint
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  experiments/grpo.py \
+  --mode train \
+  --task cd_descendants \
+  --model_id experiments/checkpoints/descendant_sft_v1 \
+  --cd-train-csv experiments/prompts/cd_descendants/sachs/splits/stage_1_anon_obs50_int10_train.csv \
+  --cd-test-csv  experiments/prompts/cd_descendants/sachs/splits/stage_1_anon_obs50_int10_eval.csv \
+  --output_dir experiments/checkpoints/descendant_grpo_v1 \
+  --no-use-vllm \
+  --max_completion_length 4096 \
+  --num_generations 2 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 5e-6 \
+  --cd-format-reward-scale 1.0 \
+  --cd-partial-format-reward-scale 1.0 \
+  --cd-graph-reward-scale 1.0 \
+  --length_penalty_coef 0.00002 \
+  --length_penalty_max_abs 0 \
+  --save_steps 20 \
+  --logging_steps 1 \
+  --sample_completions_every 10 \
+  --sample_completions_max_chars 0 \
+  --report_to none
+```
+
 ## Behavioral teacher attribution
 
 To support the research direction of asking which classical procedure an LLM is

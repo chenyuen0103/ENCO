@@ -13,10 +13,11 @@ torchrun --standalone --nproc_per_node="$N_GPUS" \
   --mode train \
   --task cd_descendants \
   --model_id Qwen/Qwen3-4B-Thinking-2507 \
-  --cd-train-csv experiments/checkpoints/cd_descendants_1024/01_stage_1_named_obs50_int10/train_mixed.csv \
-  --cd-test-csv experiments/prompts/cd_descendants/sachs/splits/stage_1_named_obs50_int10_eval.csv \
-  --output_dir experiments/checkpoints/cd_descendants_8192/01_stage_1_named_obs50_int10/grpo \
+  --cd-train-csv experiments/prompts/cd_descendants/sachs/splits/stage_1_anon_obs50_int10_train.csv \
+  --cd-test-csv experiments/prompts/cd_descendants/sachs/splits/stage_1_anon_obs50_int10_eval.csv \
+  --output_dir experiments/checkpoints/cd_descendants_8192/01_stage_1_anon_obs50_int10/grpo \
   --no-use-vllm \
+  --max_prompt_tokens 4096 \
   --max_completion_length 8192 \
   --num_generations 2 \
   --per_device_train_batch_size 1 \
@@ -29,4 +30,6 @@ torchrun --standalone --nproc_per_node="$N_GPUS" \
   --length_penalty_max_abs 0 \
   --save_steps 20 \
   --logging_steps 1 \
+  --sample_completions_every 10 \
+  --sample_completions_max_chars 0 \
   --report_to none

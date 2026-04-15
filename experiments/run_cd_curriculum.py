@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -17,6 +18,7 @@ try:
         DEFAULT_FORMAT_HINT_TEXT,
         build_payload_completion,
         canonicalize_cd_prompt,
+        default_format_hint_text,
         default_short_think_text,
         validate_sft_example,
     )
@@ -26,6 +28,7 @@ except ModuleNotFoundError:
         DEFAULT_FORMAT_HINT_TEXT,
         build_payload_completion,
         canonicalize_cd_prompt,
+        default_format_hint_text,
         default_short_think_text,
         validate_sft_example,
     )
@@ -110,6 +113,16 @@ def _extract_payload_text(raw: str) -> str:
         return s
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def build_generic_sft_jsonl(
     *,
     in_csv: Path,
@@ -152,6 +165,7 @@ def build_generic_sft_jsonl(
 
                 prompt = canonicalize_cd_prompt(
                     prompt,
+                    task=task,
                     wrap_system_prompt=wrap_system_prompt,
                     append_format_hint=append_format_hint,
                     format_hint_text=format_hint_text,
@@ -694,7 +708,7 @@ def main() -> None:
         format_hint_text = str(
             stage.get("cd_format_hint_text")
             or curriculum.get("cd_format_hint_text")
-            or DEFAULT_FORMAT_HINT_TEXT
+            or default_format_hint_text(task)
         )
         gate_spec = dict(stage.get("gate") or {})
         enable_thinking = bool(stage.get("enable_thinking", curriculum.get("enable_thinking", False)))
@@ -727,7 +741,6 @@ def main() -> None:
             sft_cfg = dict(stage.get("sft") or {})
             sft_jsonl = stage_dir / "sft_train.jsonl"
             sft_output_dir = stage_dir / "sft"
-            reuse_existing_sft = bool(args.reuse_existing_sft and sft_output_dir.exists())
             wrote, skipped = build_generic_sft_jsonl(
                 in_csv=mixed_train_csv,
                 out_jsonl=sft_jsonl,
@@ -742,6 +755,28 @@ def main() -> None:
                 append_format_hint=append_format_hint,
                 format_hint_text=format_hint_text,
             )
+            sft_signature = {
+                "task": task,
+                "answer_mode": answer_mode,
+                "think_text": think_text,
+                "wrap_system_prompt": wrap_system_prompt,
+                "append_format_hint": append_format_hint,
+                "format_hint_text": format_hint_text,
+                "input_csv": str(mixed_train_csv),
+                "jsonl_sha256": _file_sha256(sft_jsonl),
+            }
+            sft_signature_path = stage_dir / "sft_signature.json"
+            prior_sft_signature = _load_json(sft_signature_path) if sft_signature_path.exists() else None
+            reuse_existing_sft = bool(
+                args.reuse_existing_sft
+                and sft_output_dir.exists()
+                and prior_sft_signature == sft_signature
+            )
+            if bool(args.reuse_existing_sft and sft_output_dir.exists()) and not reuse_existing_sft:
+                print(
+                    f"[reuse] stage {stage_idx} disabled SFT checkpoint reuse because prompt/data signature changed"
+                )
+            _write_json(sft_signature_path, sft_signature)
             sft_validation = _validate_sft_jsonl(sft_jsonl)
             stage_result["sft_build"] = {
                 "jsonl": str(sft_jsonl),
@@ -749,6 +784,8 @@ def main() -> None:
                 "skipped": skipped,
                 "validation": sft_validation,
                 "reused_checkpoint": reuse_existing_sft,
+                "signature_path": str(sft_signature_path),
+                "signature": sft_signature,
             }
             if wrote <= 0:
                 raise ValueError(

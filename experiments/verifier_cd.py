@@ -282,6 +282,16 @@ def _load_json_from_raw(raw: Any) -> Any:
     except Exception:
         pass
 
+    # If the string is a full completion with <answer>...</answer> tags,
+    # extract the JSON from inside the tags (e.g. JSONL answer fields that
+    # store the full staged completion rather than just the adjacency matrix).
+    m = ANSWER_RE.search(s)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception:
+            pass
+
     try:
         p = Path(s)
         if p.exists() and p.is_file():
@@ -299,6 +309,110 @@ def target_matrix_from_answer(raw: Any) -> Optional[List[List[int]]]:
     if obj is None:
         return None
     return _matrix_from_obj(obj)
+
+
+def _named_skeleton_edges_from_adj(adj: List[List[int]], variables: List[str]) -> set:
+    """Return frozenset name-pairs for the undirected skeleton."""
+    return {
+        frozenset([variables[a], variables[b]])
+        for a in range(len(adj))
+        for b in range(a + 1, len(adj))
+        if adj[a][b] == 1 or adj[b][a] == 1
+    }
+
+
+def _named_vstructs_from_adj(adj: List[List[int]], variables: List[str]) -> set:
+    """Return normalized (parent1, collider, parent2) name-tuples for v-structures."""
+    n = len(adj)
+    vstructs = set()
+    for k in range(n):
+        parents = [i for i in range(n) if adj[i][k] == 1]
+        for pi in range(len(parents)):
+            for pj in range(pi + 1, len(parents)):
+                i, j = parents[pi], parents[pj]
+                if adj[i][j] == 0 and adj[j][i] == 0:
+                    p1, p2 = sorted([variables[i], variables[j]])
+                    vstructs.add((p1, variables[k], p2))
+    return vstructs
+
+
+def _named_directed_edges_from_adj(adj: List[List[int]], variables: List[str]) -> set:
+    """Return (src_name, dst_name) pairs for all directed edges."""
+    return {
+        (variables[i], variables[j])
+        for i in range(len(adj))
+        for j in range(len(adj))
+        if adj[i][j] == 1
+    }
+
+
+def build_cd_stage_targets(prompt: str, answer: Any) -> Optional[Dict[str, List[List[str]]]]:
+    """
+    Precompute ground-truth Stage 1/2/3 structures from the prompt VARIABLES block
+    plus the target adjacency matrix.
+    """
+    variables = _variables_from_prompt(prompt or "")
+    adj = target_matrix_from_answer(answer)
+    if variables is None or adj is None or len(variables) != len(adj):
+        return None
+
+    skeleton = sorted(
+        [sorted(list(edge)) for edge in _named_skeleton_edges_from_adj(adj, variables)],
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    vstructs = sorted(list(_named_vstructs_from_adj(adj, variables)))
+    directed = sorted([list(edge) for edge in _named_directed_edges_from_adj(adj, variables)])
+    return {
+        "target_stage1_skeleton_edges": skeleton,
+        "target_stage2_vstructures": vstructs,
+        "target_stage3_directed_edges": directed,
+    }
+
+
+def _target_skeleton_edges_from_kwargs(kwargs: dict, index: int) -> Optional[set]:
+    values = kwargs.get("target_stage1_skeleton_edges")
+    if values is None or index >= len(values):
+        return None
+    raw = values[index]
+    if not isinstance(raw, list):
+        return None
+    out = set()
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        a, b = str(item[0]), str(item[1])
+        out.add(frozenset([a, b]))
+    return out
+
+
+def _target_vstructs_from_kwargs(kwargs: dict, index: int) -> Optional[set]:
+    values = kwargs.get("target_stage2_vstructures")
+    if values is None or index >= len(values):
+        return None
+    raw = values[index]
+    if not isinstance(raw, list):
+        return None
+    out = set()
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        out.add((str(item[0]), str(item[1]), str(item[2])))
+    return out
+
+
+def _target_directed_edges_from_kwargs(kwargs: dict, index: int) -> Optional[set]:
+    values = kwargs.get("target_stage3_directed_edges")
+    if values is None or index >= len(values):
+        return None
+    raw = values[index]
+    if not isinstance(raw, list):
+        return None
+    out = set()
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        out.add((str(item[0]), str(item[1])))
+    return out
 
 
 def _normalize_descendant_payload(obj: Any) -> Optional[Dict[str, Any]]:
@@ -369,6 +483,155 @@ def target_descendants_from_answer(raw: Any) -> Optional[Dict[str, Any]]:
     if obj is None:
         return None
     return _normalize_descendant_payload(obj)
+
+
+_DESC_VAR_BLOCK_RE = re.compile(r"---\s*VARIABLE ORDER\s*---\s*\n(.*?)(?=\n---|\Z)", re.DOTALL)
+_DESC_VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(\S+)", re.MULTILINE)
+_DESC_TV_RE = re.compile(r"tv_change_vs_obs=(\[[^\n]*\])")
+_DESC_DO_N_RE = re.compile(r"\bdo_n=(\d+)")
+_DESC_STAGE1_HINT_RE = re.compile(r"\b(shift detection|tv change|total-variation|rank(?:ing)?|marginal shift)\b", re.IGNORECASE)
+_DESC_STAGE2_HINT_RE = re.compile(r"\b(threshold analysis|noise threshold|sampling noise|stable|shifted)\b", re.IGNORECASE)
+_DESC_STAGE3_HINT_RE = re.compile(r"\b(conclusion|descendants?\s+of|has no descendants|final descendants)\b", re.IGNORECASE)
+
+
+def _value_at(values: Any, index: int) -> Any:
+    if isinstance(values, (list, tuple)):
+        return values[index] if index < len(values) else None
+    return values
+
+
+def _descendant_noise_threshold(do_n: int) -> float:
+    if do_n <= 0:
+        return 0.20
+    if do_n <= 5:
+        return 0.15
+    if do_n <= 20:
+        return 0.10
+    if do_n <= 50:
+        return 0.07
+    return 0.05
+
+
+def _descendant_variables_from_prompt(prompt: str) -> List[str]:
+    m = _DESC_VAR_BLOCK_RE.search(prompt or "")
+    if not m:
+        return []
+    return [str(name) for name in _DESC_VAR_LINE_RE.findall(m.group(1))]
+
+
+def _extract_descendant_prompt_targets(prompt: str, answer: Any) -> Optional[Dict[str, Any]]:
+    payload = target_descendants_from_answer(answer)
+    if payload is None:
+        return None
+
+    prompt_text = str(prompt or "")
+    tv_match = _DESC_TV_RE.search(prompt_text)
+    tv_changes: List[Tuple[str, float]] = []
+    if tv_match:
+        try:
+            raw = json.loads(tv_match.group(1))
+            for item in raw:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                tv_changes.append((str(item[0]).strip(), float(item[1])))
+        except Exception:
+            tv_changes = []
+
+    do_n = 0
+    do_match = _DESC_DO_N_RE.search(prompt_text)
+    if do_match:
+        try:
+            do_n = int(do_match.group(1))
+        except Exception:
+            do_n = 0
+
+    target = str(payload["target"])
+    descendants = [str(x) for x in payload["descendants"]]
+    desc_set = set(descendants)
+    threshold = _descendant_noise_threshold(do_n)
+
+    variables = _descendant_variables_from_prompt(prompt_text)
+    if variables:
+        non_target_vars = [v for v in variables if v != target]
+    else:
+        non_target_vars = [v for v, _ in tv_changes if v != target]
+
+    tv_map = {v: float(tv) for v, tv in tv_changes if v and v != target}
+    ranking = [v for v, _ in tv_changes if v and v != target]
+    if not ranking:
+        ranking = [v for v in non_target_vars if v != target]
+
+    shift_labels = {
+        v: ("shifted" if float(tv_map.get(v, 0.0)) > threshold else "stable")
+        for v in non_target_vars
+    }
+    descendant_labels = {v: ("descendant" if v in desc_set else "not descendant") for v in non_target_vars}
+    return {
+        "target": target,
+        "descendants": descendants,
+        "ranking": ranking,
+        "shift_labels": shift_labels,
+        "descendant_labels": descendant_labels,
+        "variables": non_target_vars,
+        "threshold": float(threshold),
+        "do_n": int(do_n),
+    }
+
+
+def _descendant_targets_from_kwargs(kwargs: dict, index: int, cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    prompt = _value_at(kwargs.get("prompt_raw"), index)
+    if prompt is None:
+        prompt = _value_at(kwargs.get("prompt"), index)
+    answer = _value_at(kwargs.get("answer"), index)
+    if answer is None:
+        answer = _value_at(kwargs.get("answer_path"), index)
+    key = (str(prompt or ""), str(answer or ""))
+    if key in cache:
+        return cache[key]
+    cache[key] = _extract_descendant_prompt_targets(str(prompt or ""), answer)
+    return cache[key]
+
+
+def _vars_in_text_order(text: str, variables: List[str]) -> List[str]:
+    if not text or not variables:
+        return []
+    pattern = re.compile(r"\b(" + "|".join(re.escape(v) for v in sorted(set(variables), key=len, reverse=True)) + r")\b")
+    seen = set()
+    out: List[str] = []
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _pairwise_order_score(pred_order: List[str], target_order: List[str]) -> float:
+    pred_pos = {name: idx for idx, name in enumerate(pred_order)}
+    total = 0
+    correct = 0
+    for i in range(len(target_order)):
+        for j in range(i + 1, len(target_order)):
+            a, b = target_order[i], target_order[j]
+            if a not in pred_pos or b not in pred_pos:
+                continue
+            total += 1
+            if pred_pos[a] < pred_pos[b]:
+                correct += 1
+    if total == 0:
+        return 0.0
+    return float(correct) / float(total)
+
+
+def _descendant_stage2_lines(stage2_text: str) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    for raw_line in (stage2_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        out.append((line, line.lower()))
+    return out
 
 
 def _set_f1(pred_items: List[str], target_items: List[str]) -> float:
@@ -715,6 +978,130 @@ def build_cd_descendant_f1_reward(scale: float = 1.0):
     return cd_descendant_f1_reward
 
 
+def build_cd_descendant_cot_structure_reward(scale: float = 0.1):
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    def _reward_fn(completions, **kwargs):
+        rewards: List[float] = []
+        s = float(scale)
+        for completion in completions:
+            text = completion_to_text(completion)
+            think = _extract_think_block(text)
+            if not think:
+                rewards.append(0.0)
+                continue
+            score = 0.0
+            if _STAGE1_RE.search(think) or _DESC_STAGE1_HINT_RE.search(think):
+                score += 1.0 / 3.0
+            if _STAGE2_RE.search(think) or _DESC_STAGE2_HINT_RE.search(think):
+                score += 1.0 / 3.0
+            if _STAGE3_RE.search(think) or _DESC_STAGE3_HINT_RE.search(think):
+                score += 1.0 / 3.0
+            rewards.append(float(s * score))
+        return rewards
+
+    _reward_fn.__name__ = "cd_descendant_cot_structure_reward"
+    return _reward_fn
+
+
+def build_cd_descendant_shift_ranking_reward(scale: float = 0.2):
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+
+    def _reward_fn(completions, **kwargs):
+        rewards: List[float] = []
+        s = float(scale)
+        for i, completion in enumerate(completions):
+            targets = _descendant_targets_from_kwargs(kwargs, i, target_cache)
+            if not targets:
+                rewards.append(0.0)
+                continue
+
+            target_order = [v for v in targets["ranking"] if isinstance(v, str)]
+            if len(target_order) < 2:
+                rewards.append(0.0)
+                continue
+
+            think = _extract_think_block(completion_to_text(completion))
+            stage1 = _extract_stage(think, _STAGE1_RE, _STAGE2_RE) if think else ""
+            if not stage1:
+                rewards.append(0.0)
+                continue
+
+            pred_order = _vars_in_text_order(stage1, target_order)
+            rewards.append(float(s * _pairwise_order_score(pred_order, target_order)))
+        return rewards
+
+    _reward_fn.__name__ = "cd_descendant_shift_ranking_reward"
+    return _reward_fn
+
+
+def build_cd_descendant_variable_classification_reward(scale: float = 0.2):
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+
+    def _reward_fn(completions, **kwargs):
+        rewards: List[float] = []
+        s = float(scale)
+        for i, completion in enumerate(completions):
+            targets = _descendant_targets_from_kwargs(kwargs, i, target_cache)
+            if not targets:
+                rewards.append(0.0)
+                continue
+
+            shift_targets = dict(targets["shift_labels"])
+            desc_targets = dict(targets["descendant_labels"])
+            if not shift_targets and not desc_targets:
+                rewards.append(0.0)
+                continue
+
+            think = _extract_think_block(completion_to_text(completion))
+            stage2 = _extract_stage(think, _STAGE2_RE, _STAGE3_RE) if think else ""
+            if not stage2:
+                rewards.append(0.0)
+                continue
+
+            total = 0
+            correct = 0
+            for line, line_lower in _descendant_stage2_lines(stage2):
+                vars_in_line = _vars_in_text_order(line, targets["variables"])
+                if not vars_in_line:
+                    continue
+                var = vars_in_line[0]
+
+                pred_shift: Optional[str] = None
+                if "stable" in line_lower:
+                    pred_shift = "stable"
+                elif "shifted" in line_lower or "shift" in line_lower:
+                    pred_shift = "shifted"
+
+                pred_desc: Optional[str] = None
+                if "not descendant" in line_lower:
+                    pred_desc = "not descendant"
+                elif "descendant" in line_lower:
+                    pred_desc = "descendant"
+
+                if pred_shift is not None and var in shift_targets:
+                    total += 1
+                    if pred_shift == shift_targets[var]:
+                        correct += 1
+                if pred_desc is not None and var in desc_targets:
+                    total += 1
+                    if pred_desc == desc_targets[var]:
+                        correct += 1
+
+            rewards.append(float(s * (float(correct) / float(total) if total > 0 else 0.0)))
+        return rewards
+
+    _reward_fn.__name__ = "cd_descendant_variable_classification_reward"
+    return _reward_fn
+
+
 def _build_cd_scalar_reward(
     *,
     name: str,
@@ -793,9 +1180,9 @@ def build_cd_acyclic_reward(scale: float = 0.1):
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # Stage header splitters
-_STAGE1_RE = re.compile(r"Stage\s+1\s*\([^)]*\)\s*:", re.IGNORECASE)
-_STAGE2_RE = re.compile(r"Stage\s+2\s*\([^)]*\)\s*:", re.IGNORECASE)
-_STAGE3_RE = re.compile(r"Stage\s+3\s*\([^)]*\)\s*:", re.IGNORECASE)
+_STAGE1_RE = re.compile(r"Stage\s+1\s*\([^)]*\)[^:]*:", re.IGNORECASE)
+_STAGE2_RE = re.compile(r"Stage\s+2\s*\([^)]*\)[^:]*:", re.IGNORECASE)
+_STAGE3_RE = re.compile(r"Stage\s+3\s*\([^)]*\)[^:]*:", re.IGNORECASE)
 
 # Stage 1 keywords: skeleton identification
 _SKELETON_RE = re.compile(
@@ -826,9 +1213,25 @@ _VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(\S+)", re.MULTILINE)
 
 
 def _extract_think_block(text: str) -> str:
-    """Return the contents of <think>...</think>, or empty string."""
-    m = _THINK_RE.search(text or "")
-    return m.group(1) if m else ""
+    """
+    Return the contents of the think block.
+
+    Supports both:
+    - full outputs: <think>...</think><answer>...</answer>
+    - completion-only tails after prompt prefill: ...</think><answer>...</answer>
+    """
+    s = text or ""
+    m = _THINK_RE.search(s)
+    if m:
+        return m.group(1)
+
+    # GRPO commonly prefills the prompt through the opening <think> tag, so the
+    # reward function may receive only the generated tail:
+    #   "Stage 1 ... </think><answer>..."
+    end_idx = s.find("</think>")
+    if end_idx != -1:
+        return s[:end_idx]
+    return ""
 
 
 def _extract_stage(think: str, start_re: re.Pattern, end_re: re.Pattern) -> str:
@@ -874,7 +1277,15 @@ def _skeleton_from_stage1_text(stage1_text: str) -> set:
 def build_cd_cot_structure_reward(scale: float = 0.1):
     """
     Soft shaping reward for staged reasoning structure inside <think>.
-    Awards credit proportionally for mentioning all three stages.
+    Awards credit proportionally for including all three stages.
+
+    Prefer explicit stage headers when present, since the training/eval format
+    requires:
+      - Stage 1 (Skeleton)
+      - Stage 2 (V-structures)
+      - Stage 3 (Orientation)
+
+    Fall back to the older keyword heuristics for partially formatted outputs.
     - Stage 1 (Skeleton): 1/3 of scale
     - Stage 2 (V-structures): 1/3 of scale
     - Stage 3 (Orientation): 1/3 of scale
@@ -892,11 +1303,11 @@ def build_cd_cot_structure_reward(scale: float = 0.1):
                 rewards.append(0.0)
                 continue
             score = 0.0
-            if _SKELETON_RE.search(think):
+            if _STAGE1_RE.search(think) or _SKELETON_RE.search(think):
                 score += 1.0 / 3.0
-            if _VSTRUCT_RE.search(think):
+            if _STAGE2_RE.search(think) or _VSTRUCT_RE.search(think):
                 score += 1.0 / 3.0
-            if _ORIENT_RE.search(think):
+            if _STAGE3_RE.search(think) or _ORIENT_RE.search(think):
                 score += 1.0 / 3.0
             rewards.append(float(s * score))
         return rewards
@@ -948,30 +1359,26 @@ def build_cd_skeleton_f1_reward(scale: float = 0.2):
         s = float(scale)
 
         for i, completion in enumerate(completions):
-            target_raw = None
-            if answers is not None and i < len(answers):
-                target_raw = answers[i]
-            elif answer_paths is not None and i < len(answer_paths):
-                target_raw = answer_paths[i]
+            target_edges = _target_skeleton_edges_from_kwargs(kwargs, i)
+            if target_edges is None:
+                target_raw = None
+                if answers is not None and i < len(answers):
+                    target_raw = answers[i]
+                elif answer_paths is not None and i < len(answer_paths):
+                    target_raw = answer_paths[i]
 
-            target_adj = _cached_target(target_raw)
-            if target_adj is None:
-                rewards.append(0.0)
-                continue
+                target_adj = _cached_target(target_raw)
+                if target_adj is None:
+                    rewards.append(0.0)
+                    continue
 
-            # Extract variable names from prompt to build named target skeleton
-            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-            variables = _variables_from_prompt(prompt_text) if prompt_text else None
-            if variables is None or len(variables) != len(target_adj):
-                rewards.append(0.0)
-                continue
+                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+                variables = _variables_from_prompt(prompt_text) if prompt_text else None
+                if variables is None or len(variables) != len(target_adj):
+                    rewards.append(0.0)
+                    continue
 
-            target_edges = set(
-                frozenset([variables[a], variables[b]])
-                for a in range(len(target_adj))
-                for b in range(a + 1, len(target_adj))
-                if target_adj[a][b] == 1 or target_adj[b][a] == 1
-            )
+                target_edges = _named_skeleton_edges_from_adj(target_adj, variables)
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
@@ -1012,21 +1419,6 @@ def build_cd_vstruct_f1_reward(scale: float = 0.15):
         target_cache[key] = mat
         return mat
 
-    def _vstruct_set_from_adj(adj: List[List[int]], variables: List[str]) -> set:
-        """Return frozenset triples (p1, collider, p2) as name-tuples (sorted parents)."""
-        n = len(adj)
-        vstructs = set()
-        for k in range(n):
-            parents = [i for i in range(n) if adj[i][k] == 1]
-            for pi in range(len(parents)):
-                for pj in range(pi + 1, len(parents)):
-                    i, j = parents[pi], parents[pj]
-                    # unshielded: no edge between i and j
-                    if adj[i][j] == 0 and adj[j][i] == 0:
-                        p1, p2 = sorted([variables[i], variables[j]])
-                        vstructs.add((p1, variables[k], p2))
-        return vstructs
-
     def _vstruct_set_from_stage2_text(stage2_text: str) -> set:
         """Parse '(parent1, collider, parent2)' triples; normalize by sorting parents."""
         vstructs = set()
@@ -1056,24 +1448,26 @@ def build_cd_vstruct_f1_reward(scale: float = 0.15):
         s = float(scale)
 
         for i, completion in enumerate(completions):
-            target_raw = None
-            if answers is not None and i < len(answers):
-                target_raw = answers[i]
-            elif answer_paths is not None and i < len(answer_paths):
-                target_raw = answer_paths[i]
+            target_vstructs = _target_vstructs_from_kwargs(kwargs, i)
+            if target_vstructs is None:
+                target_raw = None
+                if answers is not None and i < len(answers):
+                    target_raw = answers[i]
+                elif answer_paths is not None and i < len(answer_paths):
+                    target_raw = answer_paths[i]
 
-            target_adj = _cached_target(target_raw)
-            if target_adj is None:
-                rewards.append(0.0)
-                continue
+                target_adj = _cached_target(target_raw)
+                if target_adj is None:
+                    rewards.append(0.0)
+                    continue
 
-            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-            variables = _variables_from_prompt(prompt_text) if prompt_text else None
-            if variables is None or len(variables) != len(target_adj):
-                rewards.append(0.0)
-                continue
+                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+                variables = _variables_from_prompt(prompt_text) if prompt_text else None
+                if variables is None or len(variables) != len(target_adj):
+                    rewards.append(0.0)
+                    continue
 
-            target_vstructs = _vstruct_set_from_adj(target_adj, variables)
+                target_vstructs = _named_vstructs_from_adj(target_adj, variables)
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
@@ -1112,16 +1506,6 @@ def build_cd_orientation_f1_reward(scale: float = 0.15):
         target_cache[key] = mat
         return mat
 
-    def _directed_set_from_adj(adj: List[List[int]], variables: List[str]) -> set:
-        """Return (src_name, dst_name) pairs for all directed edges."""
-        n = len(adj)
-        return {
-            (variables[i], variables[j])
-            for i in range(n)
-            for j in range(n)
-            if adj[i][j] == 1
-        }
-
     def _directed_set_from_stage3_text(stage3_text: str) -> set:
         """Parse 'X -> Y' lines from Stage 3 text."""
         return {
@@ -1149,24 +1533,26 @@ def build_cd_orientation_f1_reward(scale: float = 0.15):
         s = float(scale)
 
         for i, completion in enumerate(completions):
-            target_raw = None
-            if answers is not None and i < len(answers):
-                target_raw = answers[i]
-            elif answer_paths is not None and i < len(answer_paths):
-                target_raw = answer_paths[i]
+            target_directed = _target_directed_edges_from_kwargs(kwargs, i)
+            if target_directed is None:
+                target_raw = None
+                if answers is not None and i < len(answers):
+                    target_raw = answers[i]
+                elif answer_paths is not None and i < len(answer_paths):
+                    target_raw = answer_paths[i]
 
-            target_adj = _cached_target(target_raw)
-            if target_adj is None:
-                rewards.append(0.0)
-                continue
+                target_adj = _cached_target(target_raw)
+                if target_adj is None:
+                    rewards.append(0.0)
+                    continue
 
-            prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-            variables = _variables_from_prompt(prompt_text) if prompt_text else None
-            if variables is None or len(variables) != len(target_adj):
-                rewards.append(0.0)
-                continue
+                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
+                variables = _variables_from_prompt(prompt_text) if prompt_text else None
+                if variables is None or len(variables) != len(target_adj):
+                    rewards.append(0.0)
+                    continue
 
-            target_directed = _directed_set_from_adj(target_adj, variables)
+                target_directed = _named_directed_edges_from_adj(target_adj, variables)
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
