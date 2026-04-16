@@ -266,6 +266,79 @@ python run_experiment1_pipeline.py --steps evaluate,analyze --dataset cancer
 
 This will include `predictions_obs*_int*_ENCO.csv` in `experiments/out/experiment1/cancer_summary.csv`.
 
+## External LLM baselines
+
+The benchmark builder supports four external LLM baselines. All of them write the same one-row
+prediction CSV contract as the classical baselines, so they can be run through
+`scripts/run-benchmark --steps baselines` and summarized by the existing evaluator.
+
+- `TakayamaSCP`: faithful PC-based implementation of the Takayama et al. pipeline via
+  `experiments/run_takayama_scd.py`
+- `JiralerspongBFS`: semantic-only BFS-style graph expansion over variable names
+- `CausalLLMPrompt`: one-shot semantic / metadata prompt baseline
+- `CausalLLMData`: one-shot data-backed prompt baseline over summary statistics
+
+### TakayamaSCP
+
+`TakayamaSCP` follows the published PC-based workflow:
+
+1. Run unconstrained PC on standardized observational data.
+2. Bootstrap PC to estimate directed and undirected edge probabilities.
+3. Build pairwise prompts for every ordered variable pair using Takayama prompt pattern `1` or `2`.
+4. Query the LLM twice per pair:
+   - first for a free-form explanation
+   - then for a `<yes>` / `<no>` judgment sampled multiple times
+5. Convert the sampled pairwise probabilities into prior knowledge.
+6. Rerun PC with those constraints.
+
+Current constraints:
+
+- observational only (`int_n = 0`)
+- OpenAI provider only, because faithful reproduction depends on chat-completions logprobs
+- manifest controls: `model`, `provider`, `temperature`, `max_new_tokens`, `num_samples`,
+  `takayama_pattern`, `takayama_bootstrap_samples`
+
+Example from `experiments/`:
+
+```bash
+python run_takayama_scd.py \
+  --graph_files ../causal_graphs/real_data/small_graphs/sachs.bif \
+  --sample_size_obs 100 \
+  --seed 42 \
+  --out_dir responses \
+  --model gpt-5-mini \
+  --provider openai \
+  --temperature 0.7 \
+  --num_samples 5 \
+  --takayama_pattern 2 \
+  --bootstrap_samples 100 \
+  --naming_regime real
+```
+
+### Other external baselines
+
+The remaining three baselines are benchmark-native approximations exposed through
+`experiments/run_external_llm_baselines.py`.
+
+Example:
+
+```bash
+python run_external_llm_baselines.py \
+  --method JiralerspongBFS \
+  --graph_files ../causal_graphs/real_data/small_graphs/sachs.bif \
+  --sample_size_obs 0 \
+  --sample_size_inters 0 \
+  --model gpt-5-mini \
+  --provider auto \
+  --temperature 0.7 \
+  --num_samples 5 \
+  --edge_threshold 0.5
+```
+
+For benchmark manifests, configure them under `baselines[]` with the same `name` values above plus
+optional LLM controls such as `model`, `provider`, `temperature`, `max_new_tokens`, `num_samples`,
+`edge_threshold`, `takayama_pattern`, and `takayama_bootstrap_samples`.
+
 ## Behavioral teacher attribution
 
 To support the research direction of asking which classical procedure an LLM is

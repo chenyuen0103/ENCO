@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
+from benchmark_builder.baselines import build_baseline_adapters
 from benchmark_builder.registry import BenchmarkRegistry
 from benchmark_builder.runner import _prompt_base_name
-from benchmark_builder.schema import load_benchmark_spec
+from benchmark_builder.schema import BaselineSpec, PromptCellSpec, load_benchmark_spec
 
 
 class TestBenchmarkSpec(unittest.TestCase):
@@ -53,6 +55,20 @@ class TestBenchmarkSpec(unittest.TestCase):
             _prompt_base_name(cell=cell, num_prompts=spec.num_prompts, shuffles_per_graph=spec.shuffles_per_graph),
             "prompts_obs100_int0_shuf1_p5_thinktags_summary_joint",
         )
+
+    def test_external_llm_adapters_bind_to_expected_configs(self) -> None:
+        adapters = build_baseline_adapters(Path(".").resolve())
+        names_only = PromptCellSpec(style="names_only", obs_per_prompt=0, int_per_combo=0)
+        observational = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=0)
+        summary = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=50)
+        matrix = PromptCellSpec(style="matrix", obs_per_prompt=100, int_per_combo=50)
+        self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), names_only))
+        self.assertTrue(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), observational))
+        self.assertTrue(adapters["JiralerspongBFS"].applies_to(BaselineSpec(name="JiralerspongBFS"), names_only))
+        self.assertTrue(adapters["CausalLLMPrompt"].applies_to(BaselineSpec(name="CausalLLMPrompt"), names_only))
+        self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), summary))
+        self.assertTrue(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), summary))
+        self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), matrix))
 
 
 if __name__ == "__main__":
