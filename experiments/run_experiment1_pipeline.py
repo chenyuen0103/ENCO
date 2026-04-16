@@ -578,6 +578,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )
 
     out_dir = experiments_dir / "out" / "experiment1"
+    summary_dir = experiments_dir / "responses" / args.dataset
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
 
     # 1) Collect per-condition summaries into one CSV
@@ -732,8 +733,9 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "No *.summary.json found next to response CSVs. Run the evaluate step first."
         )
 
-    summary_csv = out_dir / f"{args.dataset}_summary.csv"
+    summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
+        summary_dir.mkdir(parents=True, exist_ok=True)
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=sorted({k for r in summary_rows for k in r.keys()}))
             writer.writeheader()
@@ -785,7 +787,7 @@ def main() -> None:
         "--include-enco-in-summary",
         action="store_true",
         default=True,
-        help="Append ENCO baseline cells into experiments/out/experiment1/<dataset>_summary.csv (default: enabled).",
+        help="Append ENCO baseline cells into experiments/responses/<dataset>/<dataset>_summary.csv (default: enabled).",
     )
     ap.add_argument(
         "--enco-responses-dir",
