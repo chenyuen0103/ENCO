@@ -25,6 +25,7 @@ try:
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
         canonicalize_cd_prompt,
+        default_format_hint_text,
         default_short_think_text,
     )
 except ModuleNotFoundError:
@@ -32,6 +33,7 @@ except ModuleNotFoundError:
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
         canonicalize_cd_prompt,
+        default_format_hint_text,
         default_short_think_text,
     )
 
@@ -43,6 +45,7 @@ except Exception:
 from datasets import Dataset, concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from transformers.trainer_callback import PrinterCallback
+from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model
 try:
     from torch.distributed.elastic.multiprocessing.errors import record as _elastic_record
@@ -55,12 +58,20 @@ from verifier_cd import (
     build_cd_partial_format_reward,
     build_cd_descendant_partial_format_reward,
     build_cd_descendant_answer_tail_partial_format_reward,
+    build_cd_descendant_cot_structure_reward,
+    build_cd_descendant_shift_ranking_reward,
+    build_cd_descendant_variable_classification_reward,
     build_cd_graph_reward,
     build_cd_descendant_f1_reward,
     build_cd_edge_f1_reward,
     build_cd_low_shd_reward,
     build_cd_acyclic_reward,
+    build_cd_cot_structure_reward,
+    build_cd_skeleton_f1_reward,
+    build_cd_vstruct_f1_reward,
+    build_cd_orientation_f1_reward,
     build_length_penalty_reward,
+    build_cd_stage_targets,
     completion_to_text as cd_completion_to_text,
     extract_answer_text as cd_extract_answer_text,
     format_ok as cd_format_ok,
@@ -236,44 +247,108 @@ def _set_csv_field_limit() -> None:
 
 
 class CompactMetricsCallback(TrainerCallback):
-    """Print a compact metric line instead of full raw log dictionaries."""
+    """Print a compact, task-aware metric line each logging step.
 
-    _KEYS = [
+    Causal discovery  → reward | f1 | lshd | skel
+    CD descendants    → reward | f1 (desc) | drank
+    Math              → reward | acc
+    Common prefix     → epoch | loss
+    """
+
+    # Keys always shown when present
+    _COMMON = [
         ("epoch", "epoch"),
         ("loss", "loss"),
         ("reward", "reward"),
+    ]
+
+    # Task-specific keys, detected from whichever key is present in logs
+    _CD_KEYS = [
+        ("rewards/cd_edge_f1_reward/mean",      "f1"),
+        ("rewards/cd_low_shd_reward/mean",       "lshd"),
+        ("rewards/cd_skeleton_f1_reward/mean",   "skel"),
+    ]
+
+    _DESC_KEYS = [
+        ("rewards/cd_descendant_f1_reward/mean",            "f1"),
+        ("rewards/cd_descendant_shift_ranking_reward/mean", "drank"),
+    ]
+
+    _MATH_KEYS = [
         ("rewards/accuracy_reward/mean", "acc"),
-        ("rewards/cd_partial_format_reward/mean", "pfmt"),
-        ("rewards/cd_descendant_partial_format_reward/mean", "dpfmt"),
-        ("rewards/cd_descendant_answer_tail_partial_format_reward/mean", "dpfmt"),
-        ("rewards/cd_descendant_f1_reward/mean", "desc"),
-        ("rewards/cd_graph_reward/mean", "cd"),
-        ("rewards/cd_edge_f1_reward/mean", "f1"),
-        ("rewards/cd_low_shd_reward/mean", "lshd"),
-        ("rewards/cd_acyclic_reward/mean", "dag"),
-        ("rewards/format_reward/mean", "fmt"),
-        ("rewards/cd_format_reward/mean", "fmt"),
-        ("rewards/length_penalty_reward/mean", "len"),
-        ("entropy", "ent"),
-        ("step_time", "step_s"),
     ]
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not state.is_local_process_zero or not logs:
             return
 
+        # Detect task from which reward keys are present
+        if "rewards/cd_descendant_f1_reward/mean" in logs:
+            task_keys = self._DESC_KEYS
+        elif "rewards/cd_edge_f1_reward/mean" in logs:
+            task_keys = self._CD_KEYS
+        else:
+            task_keys = self._MATH_KEYS
+
         parts = []
-        for key, name in self._KEYS:
+        for key, name in self._COMMON + task_keys:
             if key not in logs:
                 continue
             value = logs[key]
-            if isinstance(value, float):
-                parts.append(f"{name}={value:.4f}")
-            else:
-                parts.append(f"{name}={value}")
+            parts.append(f"{name}={value:.4f}" if isinstance(value, float) else f"{name}={value}")
 
         if parts:
             print("[train] " + " | ".join(parts))
+
+
+class RawMetricsCallback(TrainerCallback):
+    """Derive and print/log raw (unscaled) F1 and SHD from logged reward values.
+
+    TRL logs ``rewards/<name>/mean`` as the *scaled* reward average.  This
+    callback back-calculates the underlying metric by dividing by the known
+    scale so we see the actual F1 (0–1) and normalized SHD (0–1) each step.
+
+    Logged keys written to W&B (when a run is active):
+        metrics/raw_edge_f1      – directed-edge F1 averaged over the batch
+        metrics/normalized_shd   – normalized SHD  (0 = perfect, 1 = worst)
+    """
+
+    def __init__(self, edge_f1_scale: float = 0.0, shd_scale: float = 0.0):
+        self.edge_f1_scale = float(edge_f1_scale)
+        self.shd_scale = float(shd_scale)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        parts: list[str] = []
+        wandb_payload: dict = {}
+
+        if self.edge_f1_scale > 0.0:
+            scaled = logs.get("rewards/cd_edge_f1_reward/mean")
+            if scaled is not None:
+                raw_f1 = float(scaled) / self.edge_f1_scale
+                parts.append(f"raw_f1={raw_f1:.4f}")
+                wandb_payload["metrics/raw_edge_f1"] = raw_f1
+
+        if self.shd_scale > 0.0:
+            scaled = logs.get("rewards/cd_low_shd_reward/mean")
+            if scaled is not None:
+                # reward = (1 - norm_shd) * scale  →  norm_shd = 1 - reward/scale
+                norm_shd = 1.0 - float(scaled) / self.shd_scale
+                parts.append(f"norm_shd={norm_shd:.4f}")
+                wandb_payload["metrics/normalized_shd"] = norm_shd
+
+        if parts:
+            print("[raw_metrics] " + " | ".join(parts))
+
+        if wandb_payload:
+            try:
+                import wandb as _wandb
+                if _wandb.run is not None:
+                    _wandb.log(wandb_payload, step=int(state.global_step))
+            except Exception:
+                pass
 
 
 class JsonlMetricsCallback(TrainerCallback):
@@ -324,9 +399,45 @@ class TrainStateSnapshotCallback(TrainerCallback):
         self.state_ref["epoch"] = float(state.epoch) if state.epoch is not None else None
 
 
+def _build_launch_command(argv: list[str]) -> str:
+    """Reconstruct the full launch command including script name and torchrun args."""
+    script = shlex.quote(sys.argv[0])  # e.g. 'experiments/grpo.py'
+    n_gpus = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    script_args = " ".join(shlex.quote(p) for p in argv)
+    if n_gpus > 1:
+        return f"torchrun --standalone --nproc_per_node={n_gpus} {script} {script_args}"
+    else:
+        return f"python {script} {script_args}"
+
+
+class SaveLaunchCommandCallback(TrainerCallback):
+    """Write launch_command.sh into every checkpoint subdirectory when it is saved."""
+
+    def __init__(self, argv: list[str]):
+        self._command_text = _build_launch_command(argv)
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_local_process_zero:
+            return
+        ckpt_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if ckpt_dir.is_dir():
+            (ckpt_dir / "launch_command.sh").write_text(
+                "#!/usr/bin/env bash\n" + self._command_text + "\n",
+                encoding="utf-8",
+            )
+
+
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
     p.add_argument("--mode", type=str, default="train", choices=["train", "eval", "export_cd_csv"])
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume training from the latest checkpoint found in --output_dir. "
+            "Restores model weights, optimizer, scheduler, and RNG state."
+        ),
+    )
     p.add_argument(
         "--task",
         type=str,
@@ -335,6 +446,16 @@ def build_argparser():
         help="Training/eval task type. causal_discovery and cd_descendants expect prompt CSV inputs.",
     )
     p.add_argument("--model_id", type=str, default="Qwen/Qwen2-0.5B-Instruct")
+    p.add_argument(
+        "--base-model-override",
+        type=str,
+        default=None,
+        help=(
+            "When model_id is a PEFT adapter trained on a quantized base (e.g. BNB 4-bit), "
+            "provide the full-precision base model path/id here. The base will be loaded "
+            "in bfloat16 without quantization and the adapter applied on top."
+        ),
+    )
     p.add_argument("--dataset_id", type=str, default="AI-MO/NuminaMath-TIR")
     p.add_argument("--train_split", type=str, default="train[:5%]")
     p.add_argument("--test_split", type=str, default="test[:5%]")
@@ -368,7 +489,7 @@ def build_argparser():
     p.add_argument(
         "--sample_completions_every",
         type=int,
-        default=0,
+        default=10,
         help="Enable sampled prompt/completion logging (<=0 disables). Default is auto-enabled only for graphs with fewer than 6 nodes. When enabled, rows are emitted every save_steps trainer steps.",
     )
     p.add_argument(
@@ -380,7 +501,7 @@ def build_argparser():
     p.add_argument(
         "--sample_completions_max_chars",
         type=int,
-        default=320,
+        default=0,
         help="Max chars per logged prompt/completion sample.",
     )
 
@@ -528,7 +649,7 @@ def build_argparser():
     p.add_argument(
         "--cd-format-hint-text",
         type=str,
-        default=DEFAULT_FORMAT_HINT_TEXT,
+        default=default_format_hint_text("causal_discovery"),
     )
     p.add_argument(
         "--cd-grpo-prefill-answer",
@@ -583,6 +704,48 @@ def build_argparser():
         default=0.0,
         help="Optional separate acyclicity reward scale (0 disables).",
     )
+    p.add_argument(
+        "--cd-cot-structure-reward-scale",
+        type=float,
+        default=0.0,
+        help="Soft reward for mentioning all three staged-reasoning stages in <think> (0 disables).",
+    )
+    p.add_argument(
+        "--cd-skeleton-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: skeleton F1 parsed from Stage 1 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-vstruct-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: v-structure triple F1 parsed from Stage 2 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-orientation-f1-reward-scale",
+        type=float,
+        default=0.0,
+        help="Hard reward: directed edge F1 parsed from Stage 3 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-descendant-cot-structure-reward-scale",
+        type=float,
+        default=0.0,
+        help="Soft reward for descendant-task Stage 1/2/3 reasoning structure inside <think> (0 disables).",
+    )
+    p.add_argument(
+        "--cd-descendant-shift-ranking-reward-scale",
+        type=float,
+        default=0.0,
+        help="Reward for ranking variables by intervention shift magnitude in descendant-task Stage 1 (0 disables).",
+    )
+    p.add_argument(
+        "--cd-descendant-variable-classification-reward-scale",
+        type=float,
+        default=0.0,
+        help="Reward for per-variable shifted/stable and descendant/not-descendant labels in descendant-task Stage 2 (0 disables).",
+    )
     p.add_argument("--cd-reward-require-dag", dest="cd_reward_require_dag", action="store_true")
     p.add_argument("--no-cd-reward-require-dag", dest="cd_reward_require_dag", action="store_false")
     p.set_defaults(cd_reward_require_dag=True)
@@ -628,11 +791,12 @@ def build_argparser():
 
     # Logging
     p.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])
-    p.add_argument("--run_name", type=str, default="qwen2-grpo-vllm-server")
+    p.add_argument("--run_name", type=str, default=None,
+                   help="W&B run name. Defaults to the output_dir basename.")
     p.add_argument("--wandb_project", type=str, default="enco-grpo")
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
-    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--logging_steps", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=50)
     p.add_argument("--save_total_limit", type=int, default=1, help="Keep only the most recent N checkpoints.")
     p.add_argument("--dataloader_num_workers", type=int, default=4)
@@ -796,6 +960,7 @@ def _resolve_existing_path(path_str: str, *, csv_path: Path) -> Path:
 def _load_cd_rows_from_prompt_csv(
     csv_path: Path,
     *,
+    task: str = "causal_discovery",
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
@@ -804,10 +969,21 @@ def _load_cd_rows_from_prompt_csv(
 ) -> list[dict]:
     rows: list[dict] = []
     _set_csv_field_limit()
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            prompt_raw = (row.get("prompt_text") or "").strip()
+    is_jsonl = csv_path.suffix.lower() in (".jsonl", ".jsonlines")
+    if is_jsonl:
+        raw_rows = []
+        with csv_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    raw_rows.append(json.loads(line))
+        iter_rows = enumerate(raw_rows)
+    else:
+        _f = csv_path.open("r", encoding="utf-8", newline="")
+        iter_rows = enumerate(csv.DictReader(_f))
+    try:
+        for i, row in iter_rows:
+            prompt_raw = (row.get("prompt_text") or row.get("prompt") or "").strip()
             if not prompt_raw:
                 prompt_path_raw = (row.get("prompt_path") or "").strip()
                 if not prompt_path_raw:
@@ -820,6 +996,7 @@ def _load_cd_rows_from_prompt_csv(
             prompt_text = prompt_raw
             prompt_text = canonicalize_cd_prompt(
                 prompt_text,
+                task=task,
                 wrap_system_prompt=bool(wrap_system_prompt),
                 append_format_hint=bool(append_format_hint),
                 format_hint_text=str(format_hint_text),
@@ -840,18 +1017,29 @@ def _load_cd_rows_from_prompt_csv(
                 answer_raw = str(answer_path)
 
             rows.append(
-                {
-                    "prompt_raw": prompt_raw,
-                    "prompt": prompt_text,
-                    "answer": answer_raw,
-                }
+                (
+                    {
+                        "prompt_raw": prompt_raw,
+                        "prompt": prompt_text,
+                        "answer": answer_raw,
+                    }
+                    | (
+                        build_cd_stage_targets(prompt_raw, answer_raw) or {}
+                        if task == "causal_discovery"
+                        else {}
+                    )
+                )
             )
+    finally:
+        if not is_jsonl:
+            _f.close()
     return rows
 
 
 def _dataset_from_cd_csvs(
     csv_paths: list[str],
     *,
+    task: str = "causal_discovery",
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
@@ -865,6 +1053,7 @@ def _dataset_from_cd_csvs(
             raise FileNotFoundError(f"--cd-train/test-csv file not found: {p}")
         rows = _load_cd_rows_from_prompt_csv(
             p,
+            task=task,
             wrap_system_prompt=wrap_system_prompt,
             append_format_hint=append_format_hint,
             format_hint_text=format_hint_text,
@@ -963,9 +1152,13 @@ def _dataset_from_cd_config_file(
             intervene_vars=str(intervene_vars),
             thinking_tags=bool(thinking_tags),
         )
-        answer_raw = json.dumps(answer_obj, ensure_ascii=False)
         adj = answer_obj.get("adjacency_matrix") if isinstance(answer_obj, dict) else None
         variables_out = answer_obj.get("variables") if isinstance(answer_obj, dict) else None
+        # Export only adjacency_matrix — variables is internal metadata not used by reward fns.
+        if isinstance(answer_obj, dict) and "adjacency_matrix" in answer_obj:
+            answer_raw = json.dumps({"adjacency_matrix": answer_obj["adjacency_matrix"]}, ensure_ascii=False)
+        else:
+            answer_raw = json.dumps(answer_obj, ensure_ascii=False)
         descendants_map: dict[str, list[str]] = {}
         if (
             task == "cd_descendants"
@@ -1010,6 +1203,7 @@ def _dataset_from_cd_config_file(
                     prompt_text = prompt_raw
                     prompt_text = canonicalize_cd_prompt(
                         prompt_text,
+                        task=task,
                         wrap_system_prompt=bool(wrap_system_prompt),
                         append_format_hint=bool(append_format_hint),
                         format_hint_text=str(format_hint_text),
@@ -1036,6 +1230,7 @@ def _dataset_from_cd_config_file(
             prompt_text = prompt_raw
             prompt_text = canonicalize_cd_prompt(
                 prompt_text,
+                task=task,
                 wrap_system_prompt=bool(wrap_system_prompt),
                 append_format_hint=bool(append_format_hint),
                 format_hint_text=str(format_hint_text),
@@ -1044,11 +1239,18 @@ def _dataset_from_cd_config_file(
                 think_text=str(think_text),
             )
             rows.append(
-                {
-                    "prompt_raw": prompt_raw,
-                    "prompt": prompt_text,
-                    "answer": answer_raw,
-                }
+                (
+                    {
+                        "prompt_raw": prompt_raw,
+                        "prompt": prompt_text,
+                        "answer": answer_raw,
+                    }
+                    | (
+                        build_cd_stage_targets(prompt_raw, answer_raw) or {}
+                        if task == "causal_discovery"
+                        else {}
+                    )
+                )
             )
 
     if not rows:
@@ -1165,7 +1367,24 @@ def _apply_explicit_generation_config(
             pass
 
 
-def _wrap_generate_with_eval_mode(model):
+class _TokenSequenceStoppingCriteria:
+    """Stop generation when a specific token-ID sequence appears at the end of any sequence."""
+
+    def __init__(self, stop_token_ids: list[int], prompt_length: int):
+        self.stop_ids = stop_token_ids
+        self.n = len(stop_token_ids)
+        self.prompt_length = prompt_length
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # Only inspect newly generated tokens (after prompt)
+        generated = input_ids[:, self.prompt_length:]
+        if generated.shape[1] < self.n:
+            return False
+        tail = generated[:, -self.n:].tolist()
+        return all(seq == self.stop_ids for seq in tail)
+
+
+def _wrap_generate_with_eval_mode(model, stop_strings: list[str] | None = None, tokenizer=None):
     if getattr(model, "_grpo_eval_generate_wrapped", False):
         return model
 
@@ -1173,11 +1392,41 @@ def _wrap_generate_with_eval_mode(model):
     if original_generate is None:
         return model
 
+    # Pre-tokenize each stop string into its token-ID sequence.
+    stop_token_id_seqs: list[list[int]] = []
+    if stop_strings and tokenizer is not None:
+        for s in stop_strings:
+            ids = tokenizer.encode(s, add_special_tokens=False)
+            if ids:
+                stop_token_id_seqs.append(ids)
+                print(f"[generate] stop string {s!r} -> token ids {ids}")
+
     def _generate_with_eval_mode(*args, **kwargs):
         was_training = bool(getattr(model, "training", False))
         if was_training:
             model.eval()
         try:
+            # Inject StoppingCriteria for non-vLLM generation when stop strings are set.
+            if stop_token_id_seqs and "stopping_criteria" not in kwargs:
+                from transformers import StoppingCriteriaList
+
+                _kw_ids = kwargs.get("input_ids")
+                input_ids = _kw_ids if _kw_ids is not None else (args[0] if args else None)
+                prompt_len = int(input_ids.shape[1]) if input_ids is not None else 0
+                criteria = StoppingCriteriaList([
+                    _TokenSequenceStoppingCriteria(ids, prompt_len)
+                    for ids in stop_token_id_seqs
+                ])
+                kwargs["stopping_criteria"] = criteria
+
+            # Transformers requires a tokenizer when stop_strings are present in kwargs
+            # or the generation config. Inject it if not already provided.
+            if "tokenizer" not in kwargs and tokenizer is not None:
+                kwargs["tokenizer"] = tokenizer
+
+            if torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    return original_generate(*args, **kwargs)
             return original_generate(*args, **kwargs)
         finally:
             if was_training:
@@ -1186,6 +1435,36 @@ def _wrap_generate_with_eval_mode(model):
     setattr(model, "generate", _generate_with_eval_mode)
     setattr(model, "_grpo_eval_generate_wrapped", True)
     return model
+
+
+def _coerce_model_floating_dtype(model, target_dtype: torch.dtype) -> tuple[int, int]:
+    """Best-effort cast for floating params/buffers to avoid mixed-dtype matmul crashes."""
+    converted = 0
+    skipped = 0
+
+    for param in model.parameters():
+        try:
+            if not getattr(param, "is_floating_point", lambda: False)():
+                continue
+            if param.dtype == target_dtype:
+                continue
+            param.data = param.data.to(dtype=target_dtype)
+            converted += 1
+        except Exception:
+            skipped += 1
+
+    for buf in model.buffers():
+        try:
+            if not getattr(buf, "is_floating_point", lambda: False)():
+                continue
+            if buf.dtype == target_dtype:
+                continue
+            buf.data = buf.data.to(dtype=target_dtype)
+            converted += 1
+        except Exception:
+            skipped += 1
+
+    return converted, skipped
 
 
 def _write_eval_snapshot(output_json_path: str, payload: dict) -> None:
@@ -1424,6 +1703,7 @@ def _build_frozen_eval_dataset(args):
             )
         full_eval = _dataset_from_cd_csvs(
             eval_sources,
+            task=str(args.task),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -1552,6 +1832,7 @@ def run_export_cd_csv(args) -> None:
             )
         dataset = _dataset_from_cd_csvs(
             args.cd_train_csv,
+            task=str(args.task),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -1847,6 +2128,10 @@ def run_train(args, argv: list[str] | None = None):
     if args.use_vllm and args.enable_vllm_preflight:
         _preflight_vllm_communicator()
 
+    # Default run_name to the output_dir basename so W&B runs are self-labeling.
+    if not args.run_name:
+        args.run_name = Path(args.output_dir).name
+
     # ---- W&B import + TRL profiling workaround (prevents NameError you saw)
     if args.report_to == "wandb":
         # Configure W&B from CLI flags for reproducible logging behavior.
@@ -1893,8 +2178,9 @@ def run_train(args, argv: list[str] | None = None):
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
     else:
-        rollout_prefill_answer = bool(args.task == "cd_descendants" and args.cd_grpo_prefill_answer)
-        rollout_think_text = default_short_think_text("cd_descendants") if rollout_prefill_answer else ""
+        # Always prefill through <think> only; the model generates its own chain-of-thought.
+        rollout_prefill_answer = False
+        rollout_think_text = ""
         if args.cd_config_file and args.cd_train_csv:
             raise ValueError(
                 "Use either --cd-config-file (in-memory generation) or --cd-train-csv, not both."
@@ -1930,6 +2216,7 @@ def run_train(args, argv: list[str] | None = None):
 
             raw_train = _dataset_from_cd_csvs(
                 args.cd_train_csv,
+                task=str(args.task),
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                 append_format_hint=bool(args.cd_append_format_hint),
                 format_hint_text=str(args.cd_format_hint_text),
@@ -1939,6 +2226,7 @@ def run_train(args, argv: list[str] | None = None):
             if args.cd_test_csv:
                 raw_test = _dataset_from_cd_csvs(
                     args.cd_test_csv,
+                    task=str(args.task),
                     wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                     append_format_hint=bool(args.cd_append_format_hint),
                     format_hint_text=str(args.cd_format_hint_text),
@@ -1977,16 +2265,37 @@ def run_train(args, argv: list[str] | None = None):
 
         train_dataset = raw_train.map(_truncate_cd_prompt)
         test_dataset = raw_test.map(_truncate_cd_prompt)
+        print(raw_train[0]["prompt"])
+        print(train_dataset[0]["prompt"])
+        # breakpoint()
         _print_prompt_diagnostics(train_dataset, split_name="train")
         _print_prompt_diagnostics(test_dataset, split_name="test")
-        keep_cols = ["prompt", "prompt_raw", "answer"]
+        keep_cols = [
+            "prompt",
+            "prompt_raw",
+            "answer",
+            "target_stage1_skeleton_edges",
+            "target_stage2_vstructures",
+            "target_stage3_directed_edges",
+        ]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
+
+    # Debug: verify tokenized prompt before model load (fast, no GPU needed)
+    if int(os.environ.get("RANK", "0")) == 0:
+        _dbg_prompt = train_dataset[0]["prompt"]
+        _dbg_ids = tokenizer(_dbg_prompt, return_tensors="pt")["input_ids"][0]
+        _dbg_decoded = tokenizer.decode(_dbg_ids)
+        print(f"\n[DEBUG] First prompt token count: {len(_dbg_ids)}")
+        print(f"[DEBUG] First 300 chars:\n{_dbg_decoded[:300]}")
+        print(f"[DEBUG] Last 300 chars:\n{_dbg_decoded[-300:]}\n")
+        import sys; sys.stdout.flush()
 
     # ---- Model + LoRA
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     model_load_kwargs = {
         "dtype": "auto",
+        "attn_implementation": "flash_attention_2",
     }
     # `device_map="auto"` is incompatible with distributed Accelerate launches.
     if distributed_world_size == 1:
@@ -1994,19 +2303,29 @@ def run_train(args, argv: list[str] | None = None):
 
     is_adapter = (Path(args.model_id) / "adapter_config.json").exists()
     if is_adapter:
-        from peft import AutoPeftModelForCausalLM
+        from peft import AutoPeftModelForCausalLM, PeftModel
 
-        adapter_load_kwargs = dict(model_load_kwargs)
-        try:
-            adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
-            if "is_trainable" in adapter_params:
-                adapter_load_kwargs["is_trainable"] = True
-        except Exception:
-            pass
-        model = AutoPeftModelForCausalLM.from_pretrained(
-            args.model_id,
-            **adapter_load_kwargs,
-        )
+        if getattr(args, "base_model_override", None):
+            # Load full-precision base then apply adapter on top (bypasses quantized base).
+            print(f"[train] Loading full-precision base from {args.base_model_override}, "
+                  f"then applying adapter from {args.model_id}")
+            base = AutoModelForCausalLM.from_pretrained(
+                args.base_model_override,
+                **model_load_kwargs,
+            )
+            model = PeftModel.from_pretrained(base, args.model_id, is_trainable=True)
+        else:
+            adapter_load_kwargs = dict(model_load_kwargs)
+            try:
+                adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
+                if "is_trainable" in adapter_params:
+                    adapter_load_kwargs["is_trainable"] = True
+            except Exception:
+                pass
+            model = AutoPeftModelForCausalLM.from_pretrained(
+                args.model_id,
+                **adapter_load_kwargs,
+            )
         if hasattr(model, "train"):
             model.train()
         if hasattr(model, "set_adapter"):
@@ -2019,6 +2338,10 @@ def run_train(args, argv: list[str] | None = None):
                 model.enable_adapter_layers()
             except Exception:
                 pass
+        # Required for gradient checkpointing + LoRA: base weights are frozen,
+        # so we need embedding outputs to require grad for recomputation to work.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
@@ -2041,8 +2364,24 @@ def run_train(args, argv: list[str] | None = None):
             target_modules=["q_proj", "v_proj"],
         )
         model = get_peft_model(model, lora_config)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
-    _wrap_generate_with_eval_mode(model)
+    # Keep all floating modules in one dtype. Some adapter/base combinations can
+    # otherwise mix fp32 and bf16 and fail in Linear matmul.
+    if torch.cuda.is_available():
+        cast_dtype = torch.bfloat16
+        casted, skipped_cast = _coerce_model_floating_dtype(model, cast_dtype)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[train] dtype normalization -> {cast_dtype}: converted={casted}, skipped={skipped_cast}"
+            )
+
+    _wrap_generate_with_eval_mode(
+        model,
+        stop_strings=args.stop_sequence if not args.use_vllm else None,
+        tokenizer=tokenizer,
+    )
 
     # ---- Reward functions
     def format_reward_math(completions, **kwargs):
@@ -2076,21 +2415,37 @@ def run_train(args, argv: list[str] | None = None):
             reward_funcs.append(build_cd_low_shd_reward(scale=float(args.cd_low_shd_reward_scale)))
         if float(args.cd_acyclic_reward_scale) > 0.0:
             reward_funcs.append(build_cd_acyclic_reward(scale=float(args.cd_acyclic_reward_scale)))
+        if float(args.cd_cot_structure_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_cot_structure_reward(scale=float(args.cd_cot_structure_reward_scale)))
+        if float(args.cd_skeleton_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_skeleton_f1_reward(scale=float(args.cd_skeleton_f1_reward_scale)))
+        if float(args.cd_vstruct_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_vstruct_f1_reward(scale=float(args.cd_vstruct_f1_reward_scale)))
+        if float(args.cd_orientation_f1_reward_scale) > 0.0:
+            reward_funcs.append(build_cd_orientation_f1_reward(scale=float(args.cd_orientation_f1_reward_scale)))
         reward_funcs.append(cd_graph_reward)
     elif args.task == "cd_descendants":
         if float(args.cd_format_reward_scale) > 0.0:
             reward_funcs.append(build_cd_format_reward(scale=float(args.cd_format_reward_scale)))
         if float(args.cd_partial_format_reward_scale) > 0.0:
-            if bool(args.cd_grpo_prefill_answer):
-                reward_funcs.append(
-                    build_cd_descendant_answer_tail_partial_format_reward(
-                        scale=float(args.cd_partial_format_reward_scale)
-                    )
+            # Rollout always prefills through <think> only, so use the full-format reward.
+            reward_funcs.append(
+                build_cd_descendant_partial_format_reward(scale=float(args.cd_partial_format_reward_scale))
+            )
+        if float(args.cd_descendant_cot_structure_reward_scale) > 0.0:
+            reward_funcs.append(
+                build_cd_descendant_cot_structure_reward(scale=float(args.cd_descendant_cot_structure_reward_scale))
+            )
+        if float(args.cd_descendant_shift_ranking_reward_scale) > 0.0:
+            reward_funcs.append(
+                build_cd_descendant_shift_ranking_reward(scale=float(args.cd_descendant_shift_ranking_reward_scale))
+            )
+        if float(args.cd_descendant_variable_classification_reward_scale) > 0.0:
+            reward_funcs.append(
+                build_cd_descendant_variable_classification_reward(
+                    scale=float(args.cd_descendant_variable_classification_reward_scale)
                 )
-            else:
-                reward_funcs.append(
-                    build_cd_descendant_partial_format_reward(scale=float(args.cd_partial_format_reward_scale))
-                )
+            )
         reward_funcs.append(build_cd_descendant_f1_reward(scale=float(args.cd_graph_reward_scale)))
 
     logs_dir = Path(args.output_dir) / "grpo_log"
@@ -2122,6 +2477,13 @@ def run_train(args, argv: list[str] | None = None):
             f"[log] saving sampled prompt/completion rows to {sample_log_path} "
             "for every rollout on rank0"
         )
+
+    def _rollout_snippet(text: str, head: int = 120, tail: int = 120) -> str:
+        """Return '{first head chars}....{last tail chars}' for a rollout completion."""
+        s = str(text or "").replace("\n", " ")
+        if len(s) <= head + tail + 4:
+            return s
+        return f"{s[:head]}....{s[-tail:]}"
 
     def _truncate_text_for_log(text: str) -> str:
         s = str(text)
@@ -2185,6 +2547,34 @@ def run_train(args, argv: list[str] | None = None):
             except Exception:
                 return str(item)
         return str(item)
+
+    def _prompt_as_model_sees(text: str) -> str:
+        """Tokenize the prompt then decode with special tokens preserved.
+
+        This reflects what the model actually receives: if the tokenizer adds
+        BOS tokens or the text round-trips differently, it will show up here.
+        Truncates at the end of the assistant-prefill <think> tag so the logged
+        prompt does not include any prefilled chain-of-thought content.
+        """
+        if not text:
+            return text
+        try:
+            ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"][0]
+            decoded = tokenizer.decode(ids)  # skip_special_tokens=False by default
+        except Exception:
+            decoded = text
+        # Prefer the final assistant-prefill boundary. Descendant prompts also
+        # mention literal "<think>" tags inside the instructions, so trimming at
+        # the first occurrence can cut the prompt before the assistant turn.
+        assistant_prefill_matches = list(re.finditer(r"assistant\s*<think>", decoded))
+        if assistant_prefill_matches:
+            decoded = decoded[:assistant_prefill_matches[-1].end()]
+            return decoded
+        think_tag = "<think>"
+        idx = decoded.rfind(think_tag)
+        if idx != -1:
+            decoded = decoded[:idx + len(think_tag)]
+        return decoded
 
     def _extract_prompt_texts(kwargs: dict, batch_size: int):
         # TRL versions/providers may use different kwarg names.
@@ -2265,6 +2655,8 @@ def run_train(args, argv: list[str] | None = None):
             key = (generation_id, i)
             row = pending_reward_rows.get(key)
             if row is None:
+                completion_log_text = _truncate_text_for_log(completion_text)
+                answer_log_text = _truncate_text_for_log(answer_text)
                 row = {
                     "time_unix": ts,
                     "rank": rank,
@@ -2286,12 +2678,21 @@ def run_train(args, argv: list[str] | None = None):
                             else (prompt_texts[i] if i < len(prompt_texts) else "")
                         )
                     ),
-                    "prompt_model_input": _truncate_text_for_log(prompt_texts[i] if i < len(prompt_texts) else ""),
-                    "completion": _truncate_text_for_log(completion_text),
-                    "answer_text": _truncate_text_for_log(answer_text),
+                    "prompt_model_input": _truncate_text_for_log(
+                        _prompt_as_model_sees(prompt_texts[i] if i < len(prompt_texts) else "")
+                    ),
+                    "completion": completion_log_text,
+                    "answer_text": answer_log_text,
                     "target_answer": _truncate_text_for_log(_value_at(answers, i) or _value_at(solutions, i) or ""),
+                    "completion_chars": len(str(completion_text or "")),
+                    "answer_text_chars": len(str(answer_text or "")),
+                    "completion_truncated_for_eval_log": int(completion_log_text != str(completion_text or "")),
+                    "answer_text_truncated_for_eval_log": int(answer_log_text != str(answer_text or "")),
+                    "format_ok_scored_on_full_completion": 1,
                     "rewards": {},
                     "_sampled_for_log": i in sampled_indices,
+                    "_sample_completion_full": str(completion_text or "") if i in sampled_indices else "",
+                    "_sample_answer_text_full": str(answer_text or "") if i in sampled_indices else "",
                 }
                 pending_reward_rows[key] = row
 
@@ -2323,11 +2724,16 @@ def run_train(args, argv: list[str] | None = None):
                             "sample_idx": row["sample_idx"],
                             "prompt_key": row["prompt_key"],
                             "format_ok": row["format_ok"],
+                            "format_ok_scored_on_full_completion": row["format_ok_scored_on_full_completion"],
                             "prompt": _truncate_sample_text(row["prompt"]),
                             "prompt_model_input": _truncate_sample_text(row["prompt_model_input"]),
-                            "completion": _truncate_sample_text(row["completion"]),
-                            "answer_text": _truncate_sample_text(row["answer_text"]),
+                            "completion": _sanitize_for_log(row.get("_sample_completion_full", row["completion"]), 0),
+                            "answer_text": _sanitize_for_log(row.get("_sample_answer_text_full", row["answer_text"]), 0),
                             "target_answer": _truncate_sample_text(row["target_answer"]),
+                            "completion_chars": row["completion_chars"],
+                            "answer_text_chars": row["answer_text_chars"],
+                            "completion_truncated_for_eval_log": row["completion_truncated_for_eval_log"],
+                            "answer_text_truncated_for_eval_log": row["answer_text_truncated_for_eval_log"],
                             "rewards": rewards_map,
                             "reward_total": row["reward_total"],
                         }
@@ -2350,6 +2756,10 @@ def run_train(args, argv: list[str] | None = None):
                         active_generation_id["id"] = generation_counter["calls"]
                         generation_counter["calls"] += 1
                         _register_generation_logging(completions)
+                        if completions and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                            step = int(train_state_snapshot.get("global_step") or 0)
+                            text = _completion_to_text(completions[0])
+                            print(f"[rollout step={step}] {_rollout_snippet(text)}", flush=True)
                     rewards = inner_fn(completions, **kwargs)
                     _log_reward_evaluations(
                         active_generation_id["id"],
@@ -2428,7 +2838,11 @@ def run_train(args, argv: list[str] | None = None):
 
     train_generation_kwargs = {}
     if args.stop_sequence:
+        # "stop" is the vLLM kwarg; "stop_strings" is the HuggingFace generate kwarg
+        # (transformers >= 4.46). Pass both so the right one is used regardless of backend.
         train_generation_kwargs["stop"] = args.stop_sequence
+        if not args.use_vllm:
+            train_generation_kwargs["stop_strings"] = args.stop_sequence
     if args.train_temperature > 0:
         train_generation_kwargs["temperature"] = args.train_temperature
         train_generation_kwargs["top_p"] = args.train_top_p
@@ -2446,6 +2860,11 @@ def run_train(args, argv: list[str] | None = None):
 
         bf16=torch.cuda.is_available(),
 
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        torch_compile=False,  # set True for ~20% speedup if your torch version supports it
+
+        max_prompt_length=args.max_prompt_tokens,
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         generation_kwargs=train_generation_kwargs or None,
@@ -2472,10 +2891,36 @@ def run_train(args, argv: list[str] | None = None):
         f"top_p={args.train_top_p}"
     )
 
+    # Resolve resume checkpoint before building the trainer so we can log it.
+    resume_from_checkpoint = None
+    if args.resume:
+        resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+        if resume_from_checkpoint is None:
+            raise ValueError(
+                f"--resume was set but no checkpoint was found in {args.output_dir!r}. "
+                "Run without --resume to start a fresh training run."
+            )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[train] resuming from checkpoint: {resume_from_checkpoint}")
+
+    # Write launch command to output_dir immediately so it's saved even if training crashes.
+    if int(os.environ.get("RANK", "0")) == 0:
+        launch_cmd_path = Path(args.output_dir) / "launch_command.sh"
+        launch_cmd_path.parent.mkdir(parents=True, exist_ok=True)
+        launch_cmd_path.write_text(
+            "#!/usr/bin/env bash\n" + _build_launch_command(argv) + "\n",
+            encoding="utf-8",
+        )
+
     try:
         callbacks = [
             CompactMetricsCallback(),
+            RawMetricsCallback(
+                edge_f1_scale=float(args.cd_edge_f1_reward_scale),
+                shd_scale=float(args.cd_low_shd_reward_scale),
+            ),
             TrainStateSnapshotCallback(train_state_snapshot),
+            SaveLaunchCommandCallback(argv),
         ]
         metrics_jsonl_path = (
             Path(args.train_log_jsonl)
@@ -2486,6 +2931,14 @@ def run_train(args, argv: list[str] | None = None):
         callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
         print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
 
+        # Debug: verify the prompt the model actually sees (with special tokens)
+        if int(os.environ.get("RANK", "0")) == 0:
+            sample = train_dataset[0]["prompt"]
+            ids = tokenizer(sample, return_tensors="pt")["input_ids"][0]
+            decoded = tokenizer.decode(ids)  # keep special tokens to see chat template markers
+            print(f"\n[DEBUG] First prompt token count: {len(ids)}")
+            print(f"[DEBUG] Decoded (with special tokens):\n{decoded}\n")
+
         trainer = GRPOTrainer(
             model=model,
             processing_class=tokenizer,
@@ -2494,6 +2947,7 @@ def run_train(args, argv: list[str] | None = None):
             train_dataset=train_dataset,
             callbacks=callbacks,
         )
+        # breakpoint()
         trainer.remove_callback(PrinterCallback)
     except RuntimeError as e:
         msg = str(e)
@@ -2506,8 +2960,19 @@ def run_train(args, argv: list[str] | None = None):
             ) from e
         raise
 
+    # Sanity-check: ensure at least one parameter requires grad before launching training.
+    trainable_params = [n for n, p in model.named_parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError(
+            "No trainable parameters found before trainer.train(). "
+            "All parameters have requires_grad=False. "
+            "Check that the LoRA adapter is loaded correctly and enable_input_require_grads() was called."
+        )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"[train] trainable params: {len(trainable_params)} (first few: {trainable_params[:3]})")
+
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         trainer.save_model(args.output_dir)
         _write_training_config_to_model_card(args.output_dir, args, argv)
         print("Saved to:", args.output_dir)

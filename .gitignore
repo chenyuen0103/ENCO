@@ -159,7 +159,11 @@ unsloth_compiled_cache/*
 experiments/unsloth_compiled_cache/*
 .codex
 *.png
+
+.claude/
+
 CLAUDE.md
 refine-logs/
 paper_slices/
 !paper_slices/
+

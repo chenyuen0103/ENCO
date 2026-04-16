@@ -218,9 +218,34 @@ def build_sft_jsonl(
     return wrote, skipped
 
 
+def _looks_quantized_model_id(model_name: str) -> bool:
+    name = str(model_name or "").lower()
+    quant_markers = ("4bit", "8bit", "bnb", "gptq", "awq", "gguf", "nf4")
+    return any(tok in name for tok in quant_markers)
+
+
+def _derive_non_quantized_model_id(model_name: str) -> str:
+    # Heuristic: strip common quantization suffixes in Hub ids.
+    name = str(model_name or "")
+    patterns = [
+        r"(?i)[-_]?bnb[-_]?4bit$",
+        r"(?i)[-_]?bnb[-_]?8bit$",
+        r"(?i)[-_]?4bit$",
+        r"(?i)[-_]?8bit$",
+        r"(?i)[-_]?gptq$",
+        r"(?i)[-_]?awq$",
+    ]
+    candidate = name
+    for pat in patterns:
+        candidate = re.sub(pat, "", candidate)
+    candidate = re.sub(r"[-_]{2,}", "-", candidate).rstrip("-_")
+    return candidate or name
+
+
 def run_sft(
     *,
     base_model: str,
+    distributed_base_model: str | None,
     sft_jsonl: Path,
     sft_output_dir: Path,
     sft_epochs: float,
@@ -251,26 +276,63 @@ def run_sft(
     is_adapter = (Path(base_model) / "adapter_config.json").exists()
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    # DDP (torchrun, WORLD_SIZE>1) cannot handle 4-bit quantized models because
+    # they cannot be moved across devices. Force bfloat16 in distributed mode so
+    # that each rank loads a full-precision copy on its own GPU.
+    if distributed_world_size > 1:
+        load_dtype = torch.bfloat16
+        print(f"[sft] distributed mode (WORLD_SIZE={distributed_world_size}): forcing dtype=bfloat16 (4-bit incompatible with DDP)")
+    else:
+        load_dtype = "auto"
+
     model_load_kwargs: dict[str, Any] = {
-        "dtype": "auto",
+        "torch_dtype": load_dtype,
+        "attn_implementation": "flash_attention_2",
     }
     # Match grpo.py: avoid device_map='auto' when Accelerate sees distributed mode.
     if distributed_world_size == 1:
         model_load_kwargs["device_map"] = "auto"
     if bool(sft_load_in_4bit):
         print(
-            "[sft] note: ignoring sft_load_in_4bit and loading with dtype='auto' "
+            "[sft] note: ignoring sft_load_in_4bit and loading with torch_dtype setting "
             "to match grpo.py model setup and avoid device_map/distributed issues."
         )
     if is_adapter:
-        adapter_load_kwargs = dict(model_load_kwargs)
-        try:
-            adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
-            if "is_trainable" in adapter_params:
-                adapter_load_kwargs["is_trainable"] = True
-        except Exception:
-            pass
-        model = AutoPeftModelForCausalLM.from_pretrained(base_model, **adapter_load_kwargs)
+        # In distributed mode: load the base model in bfloat16 directly, then
+        # apply the LoRA adapter weights. This avoids inheriting the 4-bit
+        # quantization config from the checkpoint's base_model_name_or_path.
+        if distributed_world_size > 1:
+            adapter_cfg_path = Path(base_model) / "adapter_config.json"
+            adapter_cfg = json.loads(adapter_cfg_path.read_text(encoding="utf-8"))
+            base_model_name = adapter_cfg.get("base_model_name_or_path", "")
+            resolved_base_model_name = str(base_model_name or "")
+            if _looks_quantized_model_id(resolved_base_model_name):
+                if distributed_base_model:
+                    resolved_base_model_name = str(distributed_base_model)
+                else:
+                    resolved_base_model_name = _derive_non_quantized_model_id(resolved_base_model_name)
+                print(
+                    "[sft] distributed: adapter points to a quantized base; "
+                    f"switching to non-quantized base {resolved_base_model_name!r}"
+                )
+            else:
+                print(
+                    f"[sft] distributed: loading base model {resolved_base_model_name!r} in bfloat16, "
+                    "then applying adapter"
+                )
+            from peft import PeftModel
+            base = AutoModelForCausalLM.from_pretrained(resolved_base_model_name, **model_load_kwargs)
+            model = PeftModel.from_pretrained(base, base_model, is_trainable=True)
+        else:
+            adapter_load_kwargs = dict(model_load_kwargs)
+            try:
+                adapter_params = inspect.signature(AutoPeftModelForCausalLM.from_pretrained).parameters
+                if "is_trainable" in adapter_params:
+                    adapter_load_kwargs["is_trainable"] = True
+            except Exception:
+                pass
+            model = AutoPeftModelForCausalLM.from_pretrained(base_model, **adapter_load_kwargs)
         # Older PEFT paths may still leave the adapter frozen; make the adapter
         # trainable explicitly so stage-to-stage SFT continuation works.
         if hasattr(model, "train"):
@@ -357,7 +419,7 @@ def run_sft(
         f"trainable_pct={(100.0 * trainable_params / max(total_params, 1)):.4f}"
     )
 
-    ds = load_dataset("json", data_files=str(sft_jsonl), split="train")
+    ds = load_dataset("json", data_files=str(Path(sft_jsonl).resolve()), split="train")
     dataset_uses_prompt_completion = "prompt" in ds.column_names and "answer" in ds.column_names
     if dataset_uses_prompt_completion:
         keep = {"prompt", "answer"}
@@ -591,13 +653,9 @@ def run_format_check(
 ) -> None:
     import torch
     from tqdm.auto import tqdm
-    from unsloth import FastLanguageModel
-    from transformers import StoppingCriteria, StoppingCriteriaList
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
     from verifier_cd import extract_adjacency_matrix
-
-    # Transformers 5.2 + Unsloth can emit a malformed warning log call from
-    # modeling_attn_mask_utils; suppress that module's warning-level logs here.
-    logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
     _set_csv_field_limit()
     rows = list(csv.DictReader(train_csv.open("r", encoding="utf-8", newline="")))
@@ -606,12 +664,22 @@ def run_format_check(
     if not rows:
         raise RuntimeError(f"No rows found in {train_csv}")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=str(sft_model_dir),
-        max_seq_length=int(sft_max_seq_length),
-        load_in_4bit=bool(sft_load_in_4bit),
-    )
-    FastLanguageModel.for_inference(model)
+    is_adapter = (Path(sft_model_dir) / "adapter_config.json").exists()
+    check_load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else "auto",
+        "attn_implementation": "flash_attention_2",
+        "device_map": "auto",
+    }
+    if is_adapter:
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            str(sft_model_dir), **check_load_kwargs
+        ).eval()
+        tokenizer = AutoTokenizer.from_pretrained(str(sft_model_dir), use_fast=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(sft_model_dir), **check_load_kwargs
+        ).eval()
+        tokenizer = AutoTokenizer.from_pretrained(str(sft_model_dir), use_fast=True)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -765,6 +833,14 @@ def parse_args() -> argparse.Namespace:
         default="unsloth/qwen3-4b-thinking-2507-unsloth-bnb-4bit",
     )
     ap.add_argument(
+        "--distributed-base-model",
+        default=None,
+        help=(
+            "Optional non-quantized base model id to force when WORLD_SIZE>1. "
+            "If omitted, script auto-derives one from adapter/base model id."
+        ),
+    )
+    ap.add_argument(
         "--grpo-script",
         type=Path,
         default=Path("experiments/grpo_unsloth.py"),
@@ -851,13 +927,22 @@ def main() -> None:
             return
 
     if args.stage in ("all", "sft"):
-        prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+        # Under torchrun, WORLD_SIZE > 1 and each rank already has LOCAL_RANK set.
+        # Do NOT override CUDA_VISIBLE_DEVICES in that case — torchrun manages GPU
+        # assignment and overriding to a single device causes both ranks to collide
+        # on the same GPU (NCCL duplicate GPU error).
+        already_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+        if already_distributed:
+            prev_cvd = None
+        else:
+            prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
         try:
             run_sft(
                 base_model=args.base_model,
-                sft_jsonl=args.sft_jsonl,
-                sft_output_dir=args.sft_output_dir,
+                distributed_base_model=args.distributed_base_model,
+                sft_jsonl=Path(args.sft_jsonl).resolve(),
+                sft_output_dir=Path(args.sft_output_dir).resolve(),
                 sft_epochs=args.sft_epochs,
                 sft_lr=args.sft_lr,
                 sft_batch_size=args.sft_batch_size,
@@ -869,10 +954,11 @@ def main() -> None:
                 sft_use_unsloth_gc=args.sft_use_unsloth_gc,
             )
         finally:
-            if prev_cvd is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+            if not already_distributed:
+                if prev_cvd is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
         print(f"[sft] saved -> {args.sft_output_dir}")
         if args.stage == "sft":
             return

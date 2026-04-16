@@ -38,25 +38,35 @@ def _iter_rows_for_config(
     seed: int,
     anonymize: bool,
     thinking_tags: bool,
-) -> tuple[dict[str, Any], Any]:
-    _base_name, answer_obj, prompt_iter = iter_prompts_in_memory(
-        bif_file=str(bif_file),
-        num_prompts=int(num_prompts_per_config),
-        shuffles_per_graph=int(shuffles_per_graph),
-        seed=int(seed),
-        prompt_style=str(prompt_style),
-        obs_per_prompt=int(obs_per_prompt),
-        int_per_combo=int(int_per_combo),
-        row_order="random",
-        col_order="original",
-        anonymize=bool(anonymize),
-        causal_rules=False,
-        give_steps=False,
-        def_int=False,
-        intervene_vars="all",
-        thinking_tags=bool(thinking_tags),
-    )
-    return answer_obj, prompt_iter
+    col_order: str = "original",
+    col_perms: int = 1,
+):
+    """Yield (answer_obj, prompt_iter) once per column permutation.
+
+    When col_perms > 1 and col_order == "random", each permutation uses a
+    distinct seed offset (seed, seed+1, seed+2, ...) so the variable ordering
+    differs across repetitions while the graph structure stays fixed.
+    """
+    for perm_idx in range(max(1, int(col_perms))):
+        perm_seed = int(seed) + perm_idx
+        _base_name, answer_obj, prompt_iter = iter_prompts_in_memory(
+            bif_file=str(bif_file),
+            num_prompts=int(num_prompts_per_config),
+            shuffles_per_graph=int(shuffles_per_graph),
+            seed=perm_seed,
+            prompt_style=str(prompt_style),
+            obs_per_prompt=int(obs_per_prompt),
+            int_per_combo=int(int_per_combo),
+            row_order="random",
+            col_order=col_order,
+            anonymize=bool(anonymize),
+            causal_rules=False,
+            give_steps=False,
+            def_int=False,
+            intervene_vars="all",
+            thinking_tags=bool(thinking_tags),
+        )
+        yield answer_obj, prompt_iter
 
 
 def main() -> None:
@@ -105,7 +115,23 @@ def main() -> None:
         help="Number of prompts generated for each (graph,obs,int) config.",
     )
     ap.add_argument("--shuffles-per-graph", type=int, default=1)
+    ap.add_argument(
+        "--col-perms",
+        type=int,
+        default=1,
+        help=(
+            "Number of column (variable) orderings to generate per (graph,obs,int) config. "
+            "Each permutation uses seed+perm_idx, so variable order varies across repetitions. "
+            "Only meaningful when --col-order random."
+        ),
+    )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--col-order",
+        choices=["original", "reverse", "random", "topo", "reverse_topo"],
+        default="original",
+        help="Column (variable) ordering passed to iter_prompts_in_memory.",
+    )
     ap.add_argument("--anonymize", action="store_true", help="Use anonymized variable names (X1, X2, ...).")
     ap.add_argument(
         "--no-thinking-tags",
@@ -157,7 +183,7 @@ def main() -> None:
                     if obs_n == 0 and int_n == 0 and not args.include_names_only:
                         continue
 
-                    answer_obj, prompt_iter = _iter_rows_for_config(
+                    for answer_obj, prompt_iter in _iter_rows_for_config(
                         bif_file=bif_file,
                         prompt_style=args.prompt_style,
                         obs_per_prompt=int(obs_n),
@@ -167,26 +193,27 @@ def main() -> None:
                         seed=int(args.seed),
                         anonymize=bool(args.anonymize),
                         thinking_tags=bool(args.thinking_tags),
-                    )
-
-                    answer_json = json.dumps(answer_obj, ensure_ascii=False)
-                    for row in prompt_iter:
-                        writer.writerow(
-                            {
-                                "dataset": graph_name,
-                                "bif_file": str(bif_file),
-                                "prompt_style": args.prompt_style,
-                                "anonymize": int(bool(args.anonymize)),
-                                "obs_per_prompt": int(obs_n),
-                                "int_per_combo": int(int_n),
-                                "data_idx": int(row["data_idx"]),
-                                "shuffle_idx": int(row["shuffle_idx"]),
-                                "given_edges": row.get("given_edges"),
-                                "prompt_text": row["prompt_text"],
-                                "answer": answer_json,
-                            }
-                        )
-                        wrote += 1
+                        col_order=args.col_order,
+                        col_perms=int(args.col_perms),
+                    ):
+                        answer_json = json.dumps(answer_obj, ensure_ascii=False)
+                        for row in prompt_iter:
+                            writer.writerow(
+                                {
+                                    "dataset": graph_name,
+                                    "bif_file": str(bif_file),
+                                    "prompt_style": args.prompt_style,
+                                    "anonymize": int(bool(args.anonymize)),
+                                    "obs_per_prompt": int(obs_n),
+                                    "int_per_combo": int(int_n),
+                                    "data_idx": int(row["data_idx"]),
+                                    "shuffle_idx": int(row["shuffle_idx"]),
+                                    "given_edges": row.get("given_edges"),
+                                    "prompt_text": row["prompt_text"],
+                                    "answer": answer_json,
+                                }
+                            )
+                            wrote += 1
 
     print(f"[done] wrote={wrote} output={out_path}")
 
