@@ -24,7 +24,7 @@ def _context_window_for(model: str) -> int:
 
 
 _RESP_RE = re.compile(
-    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>.+))?$",
+    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<suffix>.*)$",
     flags=re.IGNORECASE,
 )
 
@@ -95,18 +95,43 @@ def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -
 
 def _infer_model_from_stem(stem: str) -> str:
     # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
-    m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+    m_names = re.match(r"^responses_names_only(?:_p\d+)?_(?P<model>.+)$", stem, flags=re.IGNORECASE)
     if m_names:
         return m_names.group("model")
     m_resp = re.match(
-        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-        r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_"
+        r"(?:(?:[A-Za-z0-9]+_)*)"
+        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases)"
+        r"_(?P<model>.+)$",
         stem,
         flags=re.IGNORECASE,
     )
     if m_resp:
         return m_resp.group("model")
     return "unknown"
+
+
+def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
+    """
+    Parse the filename suffix after `_shuf{n}` into:
+      1) the tag blob (may be empty, usually starts with `_p...`)
+      2) the model name
+
+    Example suffixes:
+      `_p5_anon_thinktags_summary_joint_gpt-5-mini`
+      `_p3_matrix_gpt-5.2-pro`
+      `_p100_thinktags_summary_joint_sft`
+    """
+    m = re.match(
+        r"^(?P<tags>_p\d+_(?:(?:[A-Za-z0-9]+_)*)"
+        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases))"
+        r"_(?P<model>.+)$",
+        suffix,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return suffix, "unknown"
+    return m.group("tags"), m.group("model").strip()
 
 
 def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
@@ -191,8 +216,10 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     obs_n = int(m.group("obs"))
     int_n = int(m.group("int"))
     shuf_n = int(m.group("shuf"))
-    tags = (m.group("tags") or "").lower()
-    model = (m.group("model") or _infer_model_from_stem(stem)).strip()
+    suffix = m.group("suffix") or ""
+    parsed_tags, parsed_model = _parse_prompt_suffix(suffix)
+    tags = parsed_tags.lower()
+    model = parsed_model if parsed_model != "unknown" else _infer_model_from_stem(stem)
 
     row_order = "random"
     col_order = "original"
@@ -578,13 +605,15 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )
 
     out_dir = experiments_dir / "out" / "experiment1"
+    responses_out_dir = experiments_dir / "responses" / args.dataset
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
+    _ensure_parent(responses_out_dir / "placeholder.txt", dry_run=dry_run)
 
     # 1) Collect per-condition summaries into one CSV
     summary_rows: list[dict[str, Any]] = []
     ordering_rows: list[dict[str, Any]] = []
 
-    def _parse_enco_csvs(responses_dir_override: Path | None) -> list[dict[str, Any]]:
+    def _parse_enco_csvs(responses_dir_override: Optional[Path]) -> list[dict[str, Any]]:
         """
         Parse ENCO baseline rows from prediction CSVs:
           predictions_obs{N}_int{M}_ENCO.csv
@@ -732,7 +761,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "No *.summary.json found next to response CSVs. Run the evaluate step first."
         )
 
-    summary_csv = out_dir / f"{args.dataset}_summary.csv"
+    summary_csv = responses_out_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=sorted({k for r in summary_rows for k in r.keys()}))
@@ -785,7 +814,7 @@ def main() -> None:
         "--include-enco-in-summary",
         action="store_true",
         default=True,
-        help="Append ENCO baseline cells into experiments/out/experiment1/<dataset>_summary.csv (default: enabled).",
+        help="Append ENCO baseline cells into experiments/responses/<dataset>/<dataset>_summary.csv (default: enabled).",
     )
     ap.add_argument(
         "--enco-responses-dir",

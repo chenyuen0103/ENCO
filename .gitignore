@@ -167,3 +167,4 @@ refine-logs/
 paper_slices/
 !paper_slices/
 
+collect_from_remotes.sh
