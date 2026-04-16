@@ -605,7 +605,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )
 
     out_dir = experiments_dir / "out" / "experiment1"
-    responses_out_dir = experiments_dir / "responses" / args.dataset
+    summary_dir = experiments_dir / "responses" / args.dataset
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
     _ensure_parent(responses_out_dir / "placeholder.txt", dry_run=dry_run)
 
@@ -761,8 +761,9 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "No *.summary.json found next to response CSVs. Run the evaluate step first."
         )
 
-    summary_csv = responses_out_dir / f"{args.dataset}_summary.csv"
+    summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
+        summary_dir.mkdir(parents=True, exist_ok=True)
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=sorted({k for r in summary_rows for k in r.keys()}))
             writer.writeheader()

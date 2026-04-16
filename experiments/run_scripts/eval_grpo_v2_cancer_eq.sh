@@ -5,7 +5,7 @@
 #   (1) obs=5000, int=200
 #   (2) obs=1000, int=50
 #
-# Results are appended to experiments/out/experiment1/sachs_summary.csv
+# Results are appended to experiments/responses/sachs/sachs_summary.csv
 # for comparison in collect_result.ipynb.
 #
 # Usage (from repo root):
@@ -29,7 +29,7 @@ EXPERIMENTS_DIR="${REPO_ROOT}/experiments"
 MODEL="Qwen/Qwen3-4B-Thinking-2507" 
 BIF="${REPO_ROOT}/causal_graphs/real_data/small_graphs/sachs.bif"
 RESPONSES_ROOT="${EXPERIMENTS_DIR}/responses"
-SUMMARY_CSV="${EXPERIMENTS_DIR}/out/experiment1/sachs_summary.csv"
+SUMMARY_CSV="${RESPONSES_ROOT}/sachs/sachs_summary.csv"
 NUM_PROMPTS="${NUM_PROMPTS:-5}"
 RUN_EXPERIMENT_SCRIPT="${EXPERIMENTS_DIR}/run_experiment1_in_memory.py"
 EVALUATE_SCRIPT="${EXPERIMENTS_DIR}/evaluate.py"

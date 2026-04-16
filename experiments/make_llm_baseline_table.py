@@ -351,14 +351,14 @@ def main() -> int:
         action="store_true",
         help=(
             "Build comparison tables across methods (summary/matrix/ENCO) using "
-            "experiments/out/experiment1/<dataset>_summary.csv."
+            "experiments/responses/<dataset>/<dataset>_summary.csv."
         ),
     )
     p.add_argument(
         "--summary-csv",
         type=Path,
         default=None,
-        help="Path to <dataset>_summary.csv (default: experiments/out/experiment1/<dataset>_summary.csv).",
+        help="Path to <dataset>_summary.csv (default: experiments/responses/<dataset>/<dataset>_summary.csv).",
     )
     p.add_argument(
         "--compare-styles",
@@ -467,7 +467,9 @@ def main() -> int:
             p.error("--model is required unless --compare --all-models-avg is set.")
 
     if args.compare:
-        summary_csv = args.summary_csv or (Path("experiments") / "out" / "experiment1" / f"{args.dataset}_summary.csv")
+        summary_csv = args.summary_csv or (
+            Path("experiments") / "responses" / args.dataset / f"{args.dataset}_summary.csv"
+        )
         rows = _read_summary_csv(Path(summary_csv))
 
         obs_sizes = _parse_int_list(args.obs_sizes) or [0, 100, 1000, 5000, 8000]
