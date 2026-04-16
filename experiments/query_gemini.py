@@ -12,7 +12,7 @@ from multiprocessing import get_context
 from queue import Empty as QueueEmpty  # <-- correct exception
 import numpy as np
 
-FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+FORMAT_RE = re.compile(r"(?s)^\s*(?:<think>)?.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
 
 # ---- OpenAI token counting helper ----

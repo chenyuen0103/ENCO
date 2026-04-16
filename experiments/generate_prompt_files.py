@@ -49,6 +49,11 @@ def main():
             '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
         ),
     )
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Canonicalize generated prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+    )
     args = ap.parse_args()
 
     dataset_name = Path(args.bif_file).stem
@@ -203,8 +208,8 @@ def main():
             parts.append(f"col{col_ord}")
 
         config_name = "_".join(parts)
-        # Always write under experiments/prompts/experiment1/<dataset>, regardless of invocation CWD.
-        out_dir = (Path(__file__).parent / "prompts" / "experiment1" / dataset_name / config_name).resolve()
+        # Write under experiments/prompts/<dataset>, regardless of invocation CWD.
+        out_dir = (Path(__file__).parent / "prompts" / dataset_name / config_name).resolve()
 
         print(
             f"[{count+1}] Generating: {config_name} (shuffles_per_graph={shuf_n}, Script: {current_script_path.name}) ..."
@@ -232,6 +237,9 @@ def main():
 
         if anon:
             cmd.append("--anonymize")
+
+        if args.cot_hint:
+            cmd.append("--cot-hint")
         
         if int_n > 0:
             cmd.extend(["--intervene-vars", "all"]) 

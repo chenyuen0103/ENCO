@@ -14,86 +14,55 @@
 # Set NPROC to use multiple GPUs (default: 1)
 #   NPROC=2 bash experiments/run_scripts/eval_grpo_v2_cancer_eq.sh
 
+# Re-exec under bash if the script was launched via `sh ...`.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-cd "${REPO_ROOT}/experiments"
+EXPERIMENTS_DIR="${REPO_ROOT}/experiments"
 
-MODEL="${REPO_ROOT}/experiments/checkpoints/grpo_v2_cancer_eq"
+# MODEL="${EXPERIMENTS_DIR}/checkpoints/grpo_v2_cancer_eq" 
+MODEL="Qwen/Qwen3-4B-Thinking-2507" 
 BIF="${REPO_ROOT}/causal_graphs/real_data/small_graphs/sachs.bif"
-RESPONSES_ROOT="${REPO_ROOT}/experiments/responses"
-SUMMARY_CSV="${REPO_ROOT}/experiments/out/experiment1/sachs_summary.csv"
+RESPONSES_ROOT="${EXPERIMENTS_DIR}/responses"
+SUMMARY_CSV="${EXPERIMENTS_DIR}/out/experiment1/sachs_summary.csv"
 NUM_PROMPTS="${NUM_PROMPTS:-5}"
+RUN_EXPERIMENT_SCRIPT="${EXPERIMENTS_DIR}/run_experiment1_in_memory.py"
+EVALUATE_SCRIPT="${EXPERIMENTS_DIR}/evaluate.py"
+CONFIG_FILE="${SCRIPT_DIR}/configs/grpo_v2_cancer_eq_sachs_both_anon.json"
+CONFIG_COT_HINT="$(
+python - "${CONFIG_FILE}" <<'PY'
+import json
+import sys
 
-echo "============================================"
-echo " Evaluating: grpo_v2_cancer_eq"
-echo " Model:      ${MODEL}"
-echo " BIF:        ${BIF}"
-echo " Prompts:    ${NUM_PROMPTS}"
-echo "============================================"
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    payload = json.load(f)
 
-# Build a single config file so HF model loading happens once inside one
-# run_experiment1_in_memory.py process and can reuse its in-memory pipeline cache.
-CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/eval_grpo_v2_cancer_eq.XXXXXX.json")"
-trap 'rm -f "${CONFIG_FILE}"' EXIT
+cfgs = payload.get("configs") if isinstance(payload, dict) else payload
+vals = {bool(c.get("cot_hint", False)) for c in cfgs if isinstance(c, dict)}
+if vals == {True}:
+    print("1")
+elif vals in ({False}, set()):
+    print("0")
+else:
+    print("mixed")
+PY
+)"
 
-cat > "${CONFIG_FILE}" <<'JSON'
-{
-  "configs": [
-    {
-      "prompt_style": "summary_joint",
-      "anonymize": false,
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
-      "row_order": "random",
-      "col_order": "original",
-      "shuffles_per_graph": 1
-    },
-    {
-      "prompt_style": "summary_joint",
-      "anonymize": false,
-      "obs_per_prompt": 1000,
-      "int_per_combo": 50,
-      "row_order": "random",
-      "col_order": "original",
-      "shuffles_per_graph": 1
-    },
-    {
-      "prompt_style": "summary_joint",
-      "anonymize": true,
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
-      "row_order": "random",
-      "col_order": "original",
-      "shuffles_per_graph": 1
-    },
-    {
-      "prompt_style": "summary_joint",
-      "anonymize": true,
-      "obs_per_prompt": 1000,
-      "int_per_combo": 50,
-      "row_order": "random",
-      "col_order": "original",
-      "shuffles_per_graph": 1
-    }
-  ]
-}
-JSON
+if [[ "${CONFIG_COT_HINT}" == "mixed" ]]; then
+    echo "[error] Mixed cot_hint values in ${CONFIG_FILE}. This wrapper expects a consistent setting across configs." >&2
+    exit 1
+fi
 
-echo ""
-echo "--- Running combined config batch via --config-file ---"
-python run_experiment1_in_memory.py \
-    --bif-file "${BIF}" \
-    --model "${MODEL}" \
-    --provider hf \
-    --num-prompts "${NUM_PROMPTS}" \
-    --prompt-style summary_joint \
-    --thinking-tags \
-    --config-file "${CONFIG_FILE}" \
-    --temperature 0.0 \
-    --hf-max-new-tokens 8192 \
-    --responses-root "${RESPONSES_ROOT}"
+COT_HINT_FLAG=()
+COT_HINT_TAG=""
+if [[ "${CONFIG_COT_HINT}" == "1" ]]; then
+    COT_HINT_TAG="cothint_"
+fi
 
 # ── Helper: evaluate one generated CSV ────────────────────────────────────
 # anon_flag: "" for real variable names, "--anonymize" for X1/X2/... names
@@ -112,29 +81,68 @@ eval_only() {
     echo ""
     echo "--- Config: obs=${obs}, int=${int_n}${anon_label} ---"
 
-    # Derive the exact filename that run_experiment1_in_memory.py writes
-    RESP_CSV="${RESPONSES_ROOT}/sachs/responses_obs${obs}_int${int_n}_shuf1_p${NUM_PROMPTS}_${anon_suffix}thinktags_summary_joint_grpo_v2_cancer_eq.csv"
+    if [[ ! -f "${EVALUATE_SCRIPT}" ]]; then
+        echo "[error] Could not find evaluate.py at: ${EVALUATE_SCRIPT}" >&2
+        return 1
+    fi
 
-    echo "[eval] Computing metrics: ${RESP_CSV}"
-    python evaluate.py \
-        --csv "${RESP_CSV}" \
+    # Derive the exact filename that run_experiment1_in_memory.py writes.
+    local resp_csv="${RESPONSES_ROOT}/sachs/responses_obs${obs}_int${int_n}_shuf1_p${NUM_PROMPTS}_${anon_suffix}thinktags_${COT_HINT_TAG}summary_joint_grpo_v2_cancer_eq.csv"
+
+    echo "[eval] Computing metrics: ${resp_csv}"
+    python "${EVALUATE_SCRIPT}" \
+        --csv "${resp_csv}" \
         --summary-csv "${SUMMARY_CSV}"
 
     echo "[done] obs=${obs}, int=${int_n}${anon_label}"
 }
 
-# ── Run both configurations × both anonymization settings ─────────────────
-# Non-anon: direct comparison with existing SFT baseline (real variable names)
-eval_only 5000 200
-eval_only 1000 50
+main() {
+    echo "============================================"
+    echo " Evaluating: grpo_v2_cancer_eq"
+    echo " Model:      ${MODEL}"
+    echo " BIF:        ${BIF}"
+    echo " Prompts:    ${NUM_PROMPTS}"
+    echo " CoT Hint:   ${CONFIG_COT_HINT}"
+    echo " Config:     ${CONFIG_FILE}"
+    echo "============================================"
 
-# Anon: shows improvement over SFT-anon baseline (X1/X2/... variable names,
-#       which is the setting grpo_v2_cancer_eq was trained on)
-eval_only 5000 200 "--anonymize"
-eval_only 1000 50  "--anonymize"
+    if [[ ! -f "${CONFIG_FILE}" ]]; then
+        echo "[error] Could not find config file at: ${CONFIG_FILE}" >&2
+        return 1
+    fi
 
-echo ""
-echo "============================================"
-echo " All done. Results appended to:"
-echo " ${SUMMARY_CSV}"
-echo "============================================"
+    echo ""
+    echo "--- Running combined anonymized + non-anonymized batch via --config-file ---"
+    python "${RUN_EXPERIMENT_SCRIPT}" \
+        --bif-file "${BIF}" \
+        --model "${MODEL}" \
+        --provider hf \
+        --num-prompts "${NUM_PROMPTS}" \
+        --prompt-style summary_joint \
+        --thinking-tags \
+        --config-file "${CONFIG_FILE}" \
+        --temperature 0.0 \
+        --hf-max-new-tokens 8192 \
+        --responses-root "${RESPONSES_ROOT}"
+
+    # ── Run both configurations × both anonymization settings ─────────────
+    # Non-anon: direct comparison with existing SFT baseline (real variable names)
+    eval_only 5000 200
+    eval_only 1000 50
+
+    # Anon: shows improvement over SFT-anon baseline (X1/X2/... variable names,
+    #       which is the setting grpo_v2_cancer_eq was trained on)
+    eval_only 5000 200 "--anonymize"
+    eval_only 1000 50 "--anonymize"
+
+    echo ""
+    echo "============================================"
+    echo " All done. Results appended to:"
+    echo " ${SUMMARY_CSV}"
+    echo "============================================"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -518,7 +518,7 @@ def load_gt_from_cell(
 
 # ------------------------ Parsing predictions ------------------------ #
 
-FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+FORMAT_RE = re.compile(r"(?s)^\s*(?:<think>)?.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
 
 

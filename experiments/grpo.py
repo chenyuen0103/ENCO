@@ -1046,7 +1046,7 @@ def _dataset_from_cd_csvs(
     prefill_answer: bool = False,
     think_text: str = "",
 ) -> Dataset:
-    datasets_list = []
+    all_rows: list = []
     for path_str in csv_paths:
         p = Path(path_str)
         if not p.exists():
@@ -1062,13 +1062,11 @@ def _dataset_from_cd_csvs(
         )
         if not rows:
             raise ValueError(f"No usable rows found in {p}")
-        datasets_list.append(Dataset.from_list(rows))
+        all_rows.extend(rows)
 
-    if not datasets_list:
+    if not all_rows:
         raise ValueError("No causal discovery CSV inputs were provided.")
-    if len(datasets_list) == 1:
-        return datasets_list[0]
-    return concatenate_datasets(datasets_list)
+    return Dataset.from_list(all_rows)
 
 
 def _dataset_from_cd_config_file(

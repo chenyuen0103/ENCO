@@ -234,10 +234,19 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
 
 
 def _find_prompt_csvs(experiments_dir: Path, dataset: str) -> tuple[list[Path], list[Path]]:
-    # Core prompts: prompts_obs*_int*_shuf*.csv
-    core = sorted((experiments_dir / "prompts" / "experiment1" / dataset).rglob("prompts_obs*_int*_shuf*.csv"))
-    # Names-only prompts (produced by generate_prompts_names_only.py inside experiment1 dirs)
-    names_only = sorted((experiments_dir / "prompts" / "experiment1" / dataset).rglob("prompts_names_only*.csv"))
+    prompt_roots = [
+        experiments_dir / "prompts" / dataset,
+        experiments_dir / "prompts" / "experiment1" / dataset,
+    ]
+    core_set: set[Path] = set()
+    names_only_set: set[Path] = set()
+    for root in prompt_roots:
+        if not root.exists():
+            continue
+        core_set.update(root.rglob("prompts_obs*_int*_shuf*.csv"))
+        names_only_set.update(root.rglob("prompts_names_only*.csv"))
+    core = sorted(p for p in core_set if p.is_file())
+    names_only = sorted(p for p in names_only_set if p.is_file())
     return core, names_only
 
 
@@ -380,7 +389,8 @@ def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run:
     core_csvs, names_only_csvs = _find_prompt_csvs(experiments_dir, args.dataset)
     if not core_csvs and not names_only_csvs:
         raise SystemExit(
-            f"No prompt CSVs found under {experiments_dir/'prompts'/'experiment1'/args.dataset}. "
+            f"No prompt CSVs found under {experiments_dir/'prompts'/args.dataset} "
+            f"or {experiments_dir/'prompts'/'experiment1'/args.dataset}. "
             "Run the generate step first."
         )
 
@@ -390,7 +400,7 @@ def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run:
             sys.executable,
             "run_api_models.py",
             "--base-root",
-            "prompts/experiment1",
+            "prompts",
             "--dataset",
             args.dataset,
             "--pattern",
