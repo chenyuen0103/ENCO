@@ -151,6 +151,12 @@ Baseline support:
 
 - Native to the original repo: `ENCO`
 - Added in this benchmark-builder extension: `PC` and `GES` via `experiments/run_classical_baselines.py`
+- Added external LLM baselines:
+  - `TakayamaSCP` via `experiments/run_takayama_scd.py`, a faithful PC-based implementation of the
+    Takayama et al. pipeline using pairwise prompts, repeated yes/no sampling with logprobs, and a
+    constrained PC rerun
+  - `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData` via
+    `experiments/run_external_llm_baselines.py`
 
 Authoring tutorial:
 

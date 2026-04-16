@@ -421,18 +421,25 @@ class BenchmarkRunner:
         datasets = {dataset.name: dataset for dataset in self.spec.datasets}
         evaluator = EvalScriptEvaluator(repo_root=self.repo_root)
         response_entries: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, int, int]] = set()
+        seen: set[tuple[Any, ...]] = set()
         for entry in prompt_bundle["entries"]:
             if entry["kind"] == "names_only":
-                continue
-            cell = next(
-                cell
-                for cell in self.spec.prompt_cells
-                if cell.style == entry["prompt_style"]
-                and cell.obs_per_prompt == entry["obs_n"]
-                and cell.int_per_combo == entry["int_n"]
-                and cell.naming_regime == entry["naming_regime"]
-            )
+                cell = PromptCellSpec(
+                    style="names_only",
+                    obs_per_prompt=0,
+                    int_per_combo=0,
+                    anonymize=False,
+                    enabled=True,
+                )
+            else:
+                cell = next(
+                    cell
+                    for cell in self.spec.prompt_cells
+                    if cell.style == entry["prompt_style"]
+                    and cell.obs_per_prompt == entry["obs_n"]
+                    and cell.int_per_combo == entry["int_n"]
+                    and cell.naming_regime == entry["naming_regime"]
+                )
             dataset = datasets[entry["dataset"]]
             graph_path = Path(entry["graph_file"])
             for baseline in self.spec.baselines:
@@ -440,10 +447,14 @@ class BenchmarkRunner:
                 if adapter is None:
                     raise RuntimeError(
                         f"Baseline `{baseline.name}` is enabled in manifest `{self.spec.name}` but no adapter is registered."
-                    )
+                )
                 if not adapter.applies_to(baseline, cell):
                     continue
-                dedupe_key = (baseline.name, dataset.name, cell.obs_per_prompt, cell.int_per_combo)
+                dedupe_fn = getattr(adapter, "dedupe_key", None)
+                if callable(dedupe_fn):
+                    dedupe_key = dedupe_fn(baseline=baseline, dataset=dataset, cell=cell, entry=entry)
+                else:
+                    dedupe_key = (baseline.name, dataset.name, cell.obs_per_prompt, cell.int_per_combo)
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
