@@ -1208,7 +1208,9 @@ _EDGE_UNDIRECTED_RE = re.compile(r"\b(\w+)\s*--\s*(\w+)\b")
 _COLLIDER_TRIPLE_RE = re.compile(r"\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)")
 
 # Variable block in prompt: "0: X1", "1: Pollution", etc.
+# Matches both "--- VARIABLES ---" and "--- VARIABLE ORDER (...) ---"
 _VAR_BLOCK_RE = re.compile(r"---\s*VARIABLES\s*---\s*\n(.*?)(?=\n---|\Z)", re.DOTALL)
+_VAR_ORDER_BLOCK_RE = re.compile(r"---\s*VARIABLE ORDER[^-]*---\s*\n(.*?)(?=\n---|\Z)", re.DOTALL)
 _VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(\S+)", re.MULTILINE)
 
 
@@ -1246,8 +1248,12 @@ def _extract_stage(think: str, start_re: re.Pattern, end_re: re.Pattern) -> str:
 
 
 def _variables_from_prompt(prompt: str) -> Optional[List[str]]:
-    """Extract ordered variable names from the VARIABLES block in a prompt."""
-    m = _VAR_BLOCK_RE.search(prompt or "")
+    """Extract ordered variable names from the VARIABLES block in a prompt.
+
+    Handles both summary_joint format (--- VARIABLES ---) and matrix format
+    (--- VARIABLE ORDER (ORDER MATTERS) ---).
+    """
+    m = _VAR_BLOCK_RE.search(prompt or "") or _VAR_ORDER_BLOCK_RE.search(prompt or "")
     if not m:
         return None
     names = _VAR_LINE_RE.findall(m.group(1))

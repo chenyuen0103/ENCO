@@ -219,6 +219,42 @@ def _visible_vram_bytes() -> int | None:
     return total if total > 0 else None
 
 
+def _hf_prompt_context_limit_tokens(hf_pipe: Any) -> int | None:
+    """
+    Best-effort HF context length (tokens) from tokenizer/model config.
+    Returns None when unavailable.
+    """
+    if hf_pipe is None:
+        return None
+
+    def _normalize_limit(value: Any) -> int | None:
+        try:
+            n = int(value)
+        except Exception:
+            return None
+        # Ignore unset/sentinel values often used by tokenizers.
+        if n <= 0 or n >= 1_000_000_000:
+            return None
+        return n
+
+    tok = getattr(hf_pipe, "tokenizer", None)
+    if tok is not None:
+        for attr in ("model_max_length", "max_len_single_sentence"):
+            lim = _normalize_limit(getattr(tok, attr, None))
+            if lim is not None:
+                return lim
+
+    model = getattr(hf_pipe, "model", None)
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for attr in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len"):
+            lim = _normalize_limit(getattr(cfg, attr, None))
+            if lim is not None:
+                return lim
+
+    return None
+
+
 def _load_configs_from_file(
     *,
     config_file: Path,
@@ -447,6 +483,7 @@ def _run_model_for_config(
             if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram)
             else None
         )
+        hf_prompt_context_limit = _hf_prompt_context_limit_tokens(hf_pipe) if provider == "hf" else None
         if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram):
             print(
                 f"[preflight] hf_visible_vram_bytes={visible_vram_bytes} "
@@ -569,6 +606,23 @@ def _run_model_for_config(
                 file=sys.stderr,
                 flush=True,
             )
+            if (
+                provider == "hf"
+                and hf_prompt_context_limit is not None
+                and prompt_tokens >= 0
+                and prompt_tokens > int(hf_prompt_context_limit)
+            ):
+                resp = f"[ERROR] Prompt too long (num tokens:{prompt_tokens})"
+                if log_calls:
+                    print(
+                        f"[skip] key={key} provider=hf reason=prompt_tokens_exceed_context "
+                        f"prompt_tokens={prompt_tokens} context_limit={hf_prompt_context_limit}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
+                continue
+
             if provider == "hf":
                 skip_reason = None
                 if int(hf_skip_if_prompt_tokens_over) > 0 and prompt_tokens >= 0 and prompt_tokens > int(hf_skip_if_prompt_tokens_over):
