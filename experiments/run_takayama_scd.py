@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import requests
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -26,6 +27,17 @@ def _require_openai():
     if not api_key:
         raise SystemExit("TakayamaSCP requires OPENAI_API_KEY for OpenAI chat-completions logprobs.")
     return OpenAI(api_key=api_key)
+
+
+def _require_illinois():
+    api_key = os.getenv("ILLINOIS_CHAT_API") or ""
+    if not api_key:
+        raise SystemExit("TakayamaSCP with provider=illinois requires ILLINOIS_CHAT_API.")
+    return {
+        "url": "https://chat.illinois.edu/api/chat-api/chat",
+        "api_key": api_key,
+        "course_name": os.getenv("ILLINOIS_CHAT_COURSE", "llm_cd"),
+    }
 
 
 def _require_causallearn():
@@ -250,8 +262,89 @@ def _extract_yes_no_prob(response: Any) -> tuple[float, float, str]:
     return prob_yes, prob_no, text
 
 
+def _extract_text_from_illinois_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("content", "response", "text", "message", "output"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            choice0 = choices[0]
+            if isinstance(choice0, dict):
+                message = choice0.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        return content
+                content = choice0.get("content")
+                if isinstance(content, str):
+                    return content
+        data = payload.get("data")
+        if data is not None:
+            return _extract_text_from_illinois_payload(data)
+    if isinstance(payload, list) and payload:
+        for item in payload:
+            text = _extract_text_from_illinois_payload(item)
+            if text:
+                return text
+    return ""
+
+
+def _chat_text_completion(
+    *,
+    provider: str,
+    client: Any,
+    model_name: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_new_tokens: int | None,
+    logprobs: bool = False,
+    top_logprobs: int = 5,
+) -> dict[str, Any]:
+    if provider == "openai":
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_new_tokens or (1500 if logprobs else 3000),
+            logprobs=logprobs if logprobs else None,
+            top_logprobs=top_logprobs if logprobs else None,
+        )
+        text = ""
+        try:
+            text = response.choices[0].message.content or ""
+        except Exception:
+            pass
+        return {"raw": response, "text": text}
+    if provider == "illinois":
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "api_key": client["api_key"],
+            "course_name": client["course_name"],
+            "temperature": temperature,
+            "stream": False,
+        }
+        response = requests.post(client["url"], json=payload, timeout=180)
+        response.raise_for_status()
+        raw = response.json()
+        return {"raw": raw, "text": _extract_text_from_illinois_payload(raw)}
+    raise SystemExit(f"Unsupported provider for TakayamaSCP: {provider}")
+
+
+def _extract_yes_no_prob_from_text(text: str) -> tuple[float, float]:
+    low = (text or "").strip().lower()
+    if low.startswith("<yes>") or low.startswith("yes"):
+        return 1.0, 0.0
+    if low.startswith("<no>") or low.startswith("no"):
+        return 0.0, 1.0
+    return 0.0, 0.0
+
+
 def _llm_probability_matrix(
     *,
+    provider: str,
     client: Any,
     model_name: str,
     labels: list[str],
@@ -283,32 +376,40 @@ def _llm_probability_matrix(
                 pc_undirected_prob=pc_undirected_prob,
                 anonymized=anonymized,
             )
-            first_response = client.chat.completions.create(
-                model=model_name,
+            first_result = _chat_text_completion(
+                provider=provider,
+                client=client,
+                model_name=model_name,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant for causal inference."},
                     {"role": "user", "content": first_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=max_new_tokens or 3000,
+                max_new_tokens=max_new_tokens or 3000,
             )
-            first_answer = first_response.choices[0].message.content or ""
+            first_answer = first_result["text"] or ""
             second_prompt = _build_second_prompt(first_prompt, first_answer, src=labels[j], dst=labels[i])
             probs: list[float] = []
             sample_logs: list[dict[str, Any]] = []
             for trial in range(max(1, num_samples)):
-                response = client.chat.completions.create(
-                    model=model_name,
+                second_result = _chat_text_completion(
+                    provider=provider,
+                    client=client,
+                    model_name=model_name,
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant for causal inference."},
                         {"role": "user", "content": second_prompt},
                     ],
                     temperature=temperature,
-                    max_tokens=max_new_tokens or 1500,
-                    logprobs=True,
+                    max_new_tokens=max_new_tokens or 1500,
+                    logprobs=(provider == "openai"),
                     top_logprobs=5,
                 )
-                prob_yes, prob_no, raw_text = _extract_yes_no_prob(response)
+                raw_text = second_result["text"] or ""
+                if provider == "openai":
+                    prob_yes, prob_no, raw_text = _extract_yes_no_prob(second_result["raw"])
+                else:
+                    prob_yes, prob_no = _extract_yes_no_prob_from_text(raw_text)
                 probs.append(prob_yes)
                 sample_logs.append(
                     {
@@ -456,10 +557,16 @@ def main() -> int:
 
     provider = args.provider
     if provider == "auto":
-        provider = "openai" if "gpt" in args.model.lower() or "o3-" in args.model.lower() or "o1-" in args.model.lower() else provider
-    if provider != "openai":
-        raise SystemExit("Faithful TakayamaSCP currently supports only OpenAI chat-completions with logprobs.")
-    client = _require_openai()
+        if "gpt" in args.model.lower() or "o3-" in args.model.lower() or "o1-" in args.model.lower():
+            provider = "openai"
+        else:
+            provider = "illinois"
+    if provider == "openai":
+        client = _require_openai()
+    elif provider == "illinois":
+        client = _require_illinois()
+    else:
+        raise SystemExit("TakayamaSCP supports provider=openai or provider=illinois.")
 
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
@@ -473,6 +580,7 @@ def main() -> int:
             labels = list(var_names)
 
         probability_matrix, transcript = _llm_probability_matrix(
+            provider=provider,
             client=client,
             model_name=args.model,
             labels=labels,

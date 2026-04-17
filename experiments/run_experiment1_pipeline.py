@@ -607,7 +607,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
     out_dir = experiments_dir / "out" / "experiment1"
     summary_dir = experiments_dir / "responses" / args.dataset
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
-    _ensure_parent(responses_out_dir / "placeholder.txt", dry_run=dry_run)
+    _ensure_parent(summary_dir / "placeholder.txt", dry_run=dry_run)
 
     # 1) Collect per-condition summaries into one CSV
     summary_rows: list[dict[str, Any]] = []
@@ -663,9 +663,10 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                         "dataset": args.dataset,
                         "model": "ENCO",
                         "prompt_style": "enco",
-                        # ENCO does not depend on variable names; treat it as anonymized by default
-                        # so it groups with anonymized LLM settings in downstream comparisons.
-                        "anonymize": 1,
+                        # ENCO filenames do not encode a naming regime. Keep this as the
+                        # default/non-anonymized value and let downstream plots place ENCO
+                        # explicitly where needed instead of forcing it into the anon slice.
+                        "anonymize": 0,
                         "is_names_only": 0,
                         "obs_n": meta.obs_n,
                         "int_n": meta.int_n,
