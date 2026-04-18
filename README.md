@@ -168,6 +168,43 @@ This requires approximately 600 MB of disk space.
 
 Alternatively, download the archive through [this link](https://drive.google.com/file/d/1mJXJpvkG8Ol4w6QlbzW4EETjpXmHPlMX/view?usp=sharing) and unzip it into `causal_graphs/`.
 
+### Downloading `bnlearn` BIF graphs
+
+The repo already includes a small hand-picked subset of BIF files under:
+
+- `causal_graphs/real_data/small_graphs/`
+- `causal_graphs/real_data/large_graphs/`
+
+To download the full discrete `bnlearn` Bayesian network collection as `.bif`
+files, run:
+
+```bash
+python causal_graphs/real_data/download_bnlearn_bifs.py
+```
+
+This mirrors the graphs into:
+
+```text
+causal_graphs/real_data/bnlearn/{small,medium,large,verylarge,massive}
+```
+
+The downloader keeps the full collection separate from the existing
+`small_graphs/` and `large_graphs/` directories so current experiment globs do
+not change unexpectedly.
+
+Useful options:
+
+```bash
+# Download only a few named graphs
+python causal_graphs/real_data/download_bnlearn_bifs.py --only survey water andes
+
+# Redownload files even if they already exist
+python causal_graphs/real_data/download_bnlearn_bifs.py --refresh
+```
+
+The upstream source is the `bnlearn` Bayesian Network Repository:
+https://www.bnlearn.com/bnrepository/
+
 ## Running experiments
 
 The repository is structured in three main folders:
@@ -225,6 +262,15 @@ Yes, a GPU is not a strict constraint to run ENCO. Especially for small graphs (
 <br>
 
 If your causal graph/dataset is specified in a `.bif` format as the real-world graphs, you can directly start an experiment on it using `experiments/run_exported_graphs.py`. The alternative format is a `.npz` file which contains a observational and interventional dataset. The file needs to contain the following keys:
+
+If you need additional benchmark BIFs beyond the small bundled subset, use:
+
+```bash
+python causal_graphs/real_data/download_bnlearn_bifs.py
+```
+
+This downloads the discrete `bnlearn` collection into
+`causal_graphs/real_data/bnlearn/`.
    
 * `data_obs`: A dataset of observational samples. This array must be of shape [M, num_vars] where M is the number of data points. For categorical data, it should be any integer data type (e.g. np.int32 or np.uint8).
 * `data_int`: A dataset of interventional samples. This array must be of shape [num_vars, K, num_vars] where K is the number of data points per intervention. The first axis indicates the variables on which has been intervened to gain this dataset.
