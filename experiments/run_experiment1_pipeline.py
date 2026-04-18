@@ -24,7 +24,7 @@ def _context_window_for(model: str) -> int:
 
 
 _RESP_RE = re.compile(
-    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<tags>.*?)(?:_(?P<model>.+))?$",
+    r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<suffix>.*)$",
     flags=re.IGNORECASE,
 )
 
@@ -95,18 +95,43 @@ def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -
 
 def _infer_model_from_stem(stem: str) -> str:
     # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
-    m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+    m_names = re.match(r"^responses_names_only(?:_p\d+)?_(?P<model>.+)$", stem, flags=re.IGNORECASE)
     if m_names:
         return m_names.group("model")
     m_resp = re.match(
-        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-        r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+        r"^responses_obs\d+_int\d+_shuf\d+_p\d+_"
+        r"(?:(?:[A-Za-z0-9]+_)*)"
+        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases)"
+        r"_(?P<model>.+)$",
         stem,
         flags=re.IGNORECASE,
     )
     if m_resp:
         return m_resp.group("model")
     return "unknown"
+
+
+def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
+    """
+    Parse the filename suffix after `_shuf{n}` into:
+      1) the tag blob (may be empty, usually starts with `_p...`)
+      2) the model name
+
+    Example suffixes:
+      `_p5_anon_thinktags_summary_joint_gpt-5-mini`
+      `_p3_matrix_gpt-5.2-pro`
+      `_p100_thinktags_summary_joint_sft`
+    """
+    m = re.match(
+        r"^(?P<tags>_p\d+_(?:(?:[A-Za-z0-9]+_)*)"
+        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases))"
+        r"_(?P<model>.+)$",
+        suffix,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return suffix, "unknown"
+    return m.group("tags"), m.group("model").strip()
 
 
 def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
@@ -191,8 +216,10 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     obs_n = int(m.group("obs"))
     int_n = int(m.group("int"))
     shuf_n = int(m.group("shuf"))
-    tags = (m.group("tags") or "").lower()
-    model = (m.group("model") or _infer_model_from_stem(stem)).strip()
+    suffix = m.group("suffix") or ""
+    parsed_tags, parsed_model = _parse_prompt_suffix(suffix)
+    tags = parsed_tags.lower()
+    model = parsed_model if parsed_model != "unknown" else _infer_model_from_stem(stem)
 
     row_order = "random"
     col_order = "original"
@@ -234,10 +261,19 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
 
 
 def _find_prompt_csvs(experiments_dir: Path, dataset: str) -> tuple[list[Path], list[Path]]:
-    # Core prompts: prompts_obs*_int*_shuf*.csv
-    core = sorted((experiments_dir / "prompts" / "experiment1" / dataset).rglob("prompts_obs*_int*_shuf*.csv"))
-    # Names-only prompts (produced by generate_prompts_names_only.py inside experiment1 dirs)
-    names_only = sorted((experiments_dir / "prompts" / "experiment1" / dataset).rglob("prompts_names_only*.csv"))
+    prompt_roots = [
+        experiments_dir / "prompts" / dataset,
+        experiments_dir / "prompts" / "experiment1" / dataset,
+    ]
+    core_set: set[Path] = set()
+    names_only_set: set[Path] = set()
+    for root in prompt_roots:
+        if not root.exists():
+            continue
+        core_set.update(root.rglob("prompts_obs*_int*_shuf*.csv"))
+        names_only_set.update(root.rglob("prompts_names_only*.csv"))
+    core = sorted(p for p in core_set if p.is_file())
+    names_only = sorted(p for p in names_only_set if p.is_file())
     return core, names_only
 
 
@@ -380,7 +416,8 @@ def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run:
     core_csvs, names_only_csvs = _find_prompt_csvs(experiments_dir, args.dataset)
     if not core_csvs and not names_only_csvs:
         raise SystemExit(
-            f"No prompt CSVs found under {experiments_dir/'prompts'/'experiment1'/args.dataset}. "
+            f"No prompt CSVs found under {experiments_dir/'prompts'/args.dataset} "
+            f"or {experiments_dir/'prompts'/'experiment1'/args.dataset}. "
             "Run the generate step first."
         )
 
@@ -390,7 +427,7 @@ def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run:
             sys.executable,
             "run_api_models.py",
             "--base-root",
-            "prompts/experiment1",
+            "prompts",
             "--dataset",
             args.dataset,
             "--pattern",
@@ -568,13 +605,15 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )
 
     out_dir = experiments_dir / "out" / "experiment1"
+    summary_dir = experiments_dir / "responses" / args.dataset
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
+    _ensure_parent(summary_dir / "placeholder.txt", dry_run=dry_run)
 
     # 1) Collect per-condition summaries into one CSV
     summary_rows: list[dict[str, Any]] = []
     ordering_rows: list[dict[str, Any]] = []
 
-    def _parse_enco_csvs(responses_dir_override: Path | None) -> list[dict[str, Any]]:
+    def _parse_enco_csvs(responses_dir_override: Optional[Path]) -> list[dict[str, Any]]:
         """
         Parse ENCO baseline rows from prediction CSVs:
           predictions_obs{N}_int{M}_ENCO.csv
@@ -624,9 +663,10 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                         "dataset": args.dataset,
                         "model": "ENCO",
                         "prompt_style": "enco",
-                        # ENCO does not depend on variable names; treat it as anonymized by default
-                        # so it groups with anonymized LLM settings in downstream comparisons.
-                        "anonymize": 1,
+                        # ENCO filenames do not encode a naming regime. Keep this as the
+                        # default/non-anonymized value and let downstream plots place ENCO
+                        # explicitly where needed instead of forcing it into the anon slice.
+                        "anonymize": 0,
                         "is_names_only": 0,
                         "obs_n": meta.obs_n,
                         "int_n": meta.int_n,
@@ -722,8 +762,9 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "No *.summary.json found next to response CSVs. Run the evaluate step first."
         )
 
-    summary_csv = out_dir / f"{args.dataset}_summary.csv"
+    summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
+        summary_dir.mkdir(parents=True, exist_ok=True)
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=sorted({k for r in summary_rows for k in r.keys()}))
             writer.writeheader()
@@ -775,7 +816,7 @@ def main() -> None:
         "--include-enco-in-summary",
         action="store_true",
         default=True,
-        help="Append ENCO baseline cells into experiments/out/experiment1/<dataset>_summary.csv (default: enabled).",
+        help="Append ENCO baseline cells into experiments/responses/<dataset>/<dataset>_summary.csv (default: enabled).",
     )
     ap.add_argument(
         "--enco-responses-dir",

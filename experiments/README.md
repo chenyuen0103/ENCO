@@ -93,7 +93,7 @@ python experiments/run_experiment1_pipeline.py \
   - `experiments/responses/<dataset>/*.csv.consensus_tau*.json`
   - `experiments/responses/<dataset>/*.csv.probplot.pdf`
 - Aggregated analysis tables:
-  - `experiments/out/experiment1/<dataset>_summary.csv`
+  - `experiments/responses/<dataset>/<dataset>_summary.csv`
   - `experiments/out/experiment1/<dataset>_ordering_bias.csv`
 
 ### Running all table dimensions (recommended workflow)
@@ -264,7 +264,7 @@ After ENCO CSVs exist under `experiments/responses/<dataset>/`, you can re-run:
 python run_experiment1_pipeline.py --steps evaluate,analyze --dataset cancer
 ```
 
-This will include `predictions_obs*_int*_ENCO.csv` in `experiments/out/experiment1/cancer_summary.csv`.
+This will include `predictions_obs*_int*_ENCO.csv` in `experiments/responses/cancer/cancer_summary.csv`.
 
 ## GRPO Training
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .interfaces import BaselineAdapter
 from .schema import BaselineSpec, BenchmarkSpec, DatasetSpec, PromptCellSpec
@@ -15,12 +16,18 @@ def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
     subprocess.run([str(c) for c in cmd], cwd=str(cwd), check=True)
 
 
+def _is_names_only_cell(cell: PromptCellSpec) -> bool:
+    return cell.style == "names_only" or (cell.obs_per_prompt == 0 and cell.int_per_combo == 0)
+
+
 @dataclass
 class ClassicalBaselineAdapter(BaselineAdapter):
     repo_root: Path
     method_name: str
 
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
+        if _is_names_only_cell(cell):
+            return False
         if not baseline.enabled:
             return False
         scope = baseline.scope.lower()
@@ -89,6 +96,8 @@ class ENCOBaselineAdapter(BaselineAdapter):
     repo_root: Path
 
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
+        if _is_names_only_cell(cell):
+            return False
         if not baseline.enabled:
             return False
         scope = baseline.scope.lower()
@@ -136,9 +145,130 @@ class ENCOBaselineAdapter(BaselineAdapter):
         )
 
 
+@dataclass
+class ExternalLLMBaselineAdapter(BaselineAdapter):
+    repo_root: Path
+    method_name: str
+
+    def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
+        if not baseline.enabled:
+            return False
+        semantic_only = self.method_name in {"JiralerspongBFS", "CausalLLMPrompt"}
+        if semantic_only:
+            return _is_names_only_cell(cell)
+        if self.method_name == "TakayamaSCP":
+            return (not _is_names_only_cell(cell)) and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
+        if self.method_name == "CausalLLMData":
+            return (not _is_names_only_cell(cell)) and cell.style == "summary_joint"
+        return False
+
+    def dedupe_key(
+        self,
+        *,
+        baseline: BaselineSpec,
+        dataset: DatasetSpec,
+        cell: PromptCellSpec,
+        entry: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        if self.method_name == "TakayamaSCP":
+            return (baseline.name, dataset.name, entry["obs_n"], entry["naming_regime"])
+        return (baseline.name, dataset.name, entry["config_name"])
+
+    def run(
+        self,
+        *,
+        baseline: BaselineSpec,
+        dataset: DatasetSpec,
+        graph_path: Path,
+        cell: PromptCellSpec,
+        spec: BenchmarkSpec,
+        dry_run: bool,
+    ) -> Path:
+        sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
+        sample_size_inters = baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
+        naming_regime = "names_only" if _is_names_only_cell(cell) else cell.naming_regime
+        naming_suffix = ""
+        if naming_regime == "anonymized":
+            naming_suffix = "_anon"
+        elif naming_regime == "names_only":
+            naming_suffix = "_names_only"
+        out_csv = self.repo_root / "experiments" / "responses" / dataset.name / (
+            f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{naming_suffix}.csv"
+        )
+        model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
+        if self.method_name == "TakayamaSCP":
+            cmd = [
+                "python3",
+                "run_takayama_scd.py",
+                "--graph_files",
+                str(graph_path),
+                "--sample_size_obs",
+                str(sample_size_obs),
+                "--seed",
+                str(baseline.seed if baseline.seed is not None else spec.seed),
+                "--out_dir",
+                "responses",
+                "--model",
+                model_name,
+                "--provider",
+                baseline.provider,
+                "--temperature",
+                str(baseline.temperature),
+                "--num_samples",
+                str(baseline.num_samples),
+                "--takayama_pattern",
+                str(baseline.takayama_pattern),
+                "--bootstrap_samples",
+                str(baseline.takayama_bootstrap_samples),
+                "--naming_regime",
+                naming_regime,
+            ]
+            if baseline.max_new_tokens is not None:
+                cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
+        else:
+            cmd = [
+                "python3",
+                "run_external_llm_baselines.py",
+                "--method",
+                self.method_name,
+                "--graph_files",
+                str(graph_path),
+                "--sample_size_obs",
+                str(sample_size_obs),
+                "--sample_size_inters",
+                str(sample_size_inters),
+                "--seed",
+                str(baseline.seed if baseline.seed is not None else spec.seed),
+                "--out_dir",
+                "responses",
+                "--model",
+                model_name,
+                "--provider",
+                baseline.provider,
+                "--temperature",
+                str(baseline.temperature),
+                "--num_samples",
+                str(baseline.num_samples),
+                "--edge_threshold",
+                str(baseline.edge_threshold),
+                "--prompt_mode",
+                "names_only" if _is_names_only_cell(cell) else "summary_joint",
+                "--naming_regime",
+                naming_regime,
+            ]
+            if baseline.max_new_tokens is not None:
+                cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
+        _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+        return out_csv
+
+
 def build_baseline_adapters(repo_root: Path) -> dict[str, BaselineAdapter]:
     return {
         "ENCO": ENCOBaselineAdapter(repo_root=repo_root),
         "PC": ClassicalBaselineAdapter(repo_root=repo_root, method_name="PC"),
         "GES": ClassicalBaselineAdapter(repo_root=repo_root, method_name="GES"),
+        "TakayamaSCP": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="TakayamaSCP"),
+        "JiralerspongBFS": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="JiralerspongBFS"),
+        "CausalLLMPrompt": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMPrompt"),
+        "CausalLLMData": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMData"),
     }

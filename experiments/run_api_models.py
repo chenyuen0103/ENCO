@@ -22,6 +22,31 @@ def _iter_prompt_csvs(search_root: Path, pattern: str) -> list[Path]:
     return sorted([p for p in search_root.rglob(pattern) if p.is_file()])
 
 
+def _resolve_base_roots(base_root_arg: Path) -> list[Path]:
+    if base_root_arg.is_absolute():
+        return [base_root_arg]
+
+    candidate1 = (Path(__file__).parent / base_root_arg).resolve()
+    candidate2 = (Path(__file__).parent.parent / base_root_arg).resolve()
+    candidates = [candidate1, candidate2]
+
+    # Compatibility fallback during migration from prompts/experiment1/<dataset>
+    if base_root_arg == Path("prompts"):
+        candidates.extend([
+            (Path(__file__).parent / "prompts" / "experiment1").resolve(),
+            (Path(__file__).parent.parent / "experiments" / "prompts" / "experiment1").resolve(),
+        ])
+
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 def _parse_obs_int_shuf(path: Path) -> Optional[tuple[int, int, int]]:
     m = _PROMPT_RE.search(path.stem)
     if not m:
@@ -40,8 +65,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run query_gemini.py over generated prompt CSVs.")
     ap.add_argument(
         "--base-root",
-        default="prompts/experiment1",
-        help="Root directory containing dataset subfolders (default: prompts/experiment1).",
+        default="prompts",
+        help="Root directory containing dataset subfolders (default: prompts).",
     )
     ap.add_argument(
         "--dataset",
@@ -137,36 +162,26 @@ def main() -> None:
     if not args.model:
         args.model = ["gpt-5-mini"]
 
-    base_root_arg = Path(args.base_root)
-    if base_root_arg.is_absolute():
-        base_root = base_root_arg
-    else:
-        # Most scripts live in experiments/, so base roots are often given as
-        # either "prompts/experiment1" (relative to experiments/) or
-        # "experiments/prompts/experiment1" (relative to repo root).
-        # Try both to avoid accidentally resolving to experiments/experiments/...
-        candidate1 = (Path(__file__).parent / base_root_arg).resolve()
-        candidate2 = (Path(__file__).parent.parent / base_root_arg).resolve()
-        if candidate1.exists():
-            base_root = candidate1
-        elif candidate2.exists():
-            base_root = candidate2
-        else:
-            base_root = candidate1
-    datasets = _infer_datasets(base_root)
+    base_root_candidates = _resolve_base_roots(Path(args.base_root))
+    datasets: list[str] = []
+    for root in base_root_candidates:
+        ds = _infer_datasets(root)
+        if ds:
+            datasets = ds
+            break
     if args.dataset is None:
         if len(datasets) == 1:
             dataset = datasets[0]
         else:
             ds_display = ", ".join(datasets) if datasets else "(none found)"
             raise SystemExit(
-                f"Please pass --dataset. Found datasets under {base_root}: {ds_display}"
+                f"Please pass --dataset. Found datasets under {base_root_candidates[0]}: {ds_display}"
             )
     else:
         dataset = args.dataset
 
-    search_root = base_root / dataset
-    csv_paths = _iter_prompt_csvs(search_root, args.pattern)
+    search_roots = [root / dataset for root in base_root_candidates]
+    csv_paths = sorted({p for root in search_roots for p in _iter_prompt_csvs(root, args.pattern)})
 
     selected: list[Path] = []
     skipped_by_filter = 0
@@ -192,7 +207,7 @@ def main() -> None:
         selected.append(p)
 
     print(f"[info] Dataset: {dataset}")
-    print(f"[info] Search root: {search_root}")
+    print(f"[info] Search roots: {', '.join(str(p) for p in search_roots)}")
     print(f"[info] Discovered CSVs: {len(csv_paths)} (pattern={args.pattern})")
     print(f"[info] Selected CSVs: {len(selected)} (skipped_by_filter={skipped_by_filter}, skipped_by_rule={skipped_by_rule})")
 

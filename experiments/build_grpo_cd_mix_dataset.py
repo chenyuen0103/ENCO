@@ -38,6 +38,7 @@ def _iter_rows_for_config(
     seed: int,
     anonymize: bool,
     thinking_tags: bool,
+    cot_hint: bool,
     col_order: str = "original",
     col_perms: int = 1,
 ):
@@ -65,6 +66,7 @@ def _iter_rows_for_config(
             def_int=False,
             intervene_vars="all",
             thinking_tags=bool(thinking_tags),
+            cot_hint=bool(cot_hint),
         )
         yield answer_obj, prompt_iter
 
@@ -145,6 +147,11 @@ def main() -> None:
         action="store_true",
         help="Include obs=0,int=0 names-only rows (off by default).",
     )
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+    )
     args = ap.parse_args()
 
     graph_names = _parse_name_list(args.graph_names)
@@ -193,6 +200,7 @@ def main() -> None:
                         seed=int(args.seed),
                         anonymize=bool(args.anonymize),
                         thinking_tags=bool(args.thinking_tags),
+                        cot_hint=bool(args.cot_hint),
                         col_order=args.col_order,
                         col_perms=int(args.col_perms),
                     ):

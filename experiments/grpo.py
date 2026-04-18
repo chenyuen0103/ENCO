@@ -330,6 +330,7 @@ class RawMetricsCallback(TrainerCallback):
                 raw_f1 = float(scaled) / self.edge_f1_scale
                 parts.append(f"raw_f1={raw_f1:.4f}")
                 wandb_payload["metrics/raw_edge_f1"] = raw_f1
+                logs["metrics/raw_edge_f1"] = raw_f1
 
         if self.shd_scale > 0.0:
             scaled = logs.get("rewards/cd_low_shd_reward/mean")
@@ -338,6 +339,7 @@ class RawMetricsCallback(TrainerCallback):
                 norm_shd = 1.0 - float(scaled) / self.shd_scale
                 parts.append(f"norm_shd={norm_shd:.4f}")
                 wandb_payload["metrics/normalized_shd"] = norm_shd
+                logs["metrics/normalized_shd"] = norm_shd
 
         if parts:
             print("[raw_metrics] " + " | ".join(parts))
@@ -510,6 +512,7 @@ def build_argparser():
     p.add_argument("--num_train_epochs", type=float, default=1.0)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument(
         "--grpo-beta",
         type=float,
@@ -1046,7 +1049,7 @@ def _dataset_from_cd_csvs(
     prefill_answer: bool = False,
     think_text: str = "",
 ) -> Dataset:
-    datasets_list = []
+    all_rows: list = []
     for path_str in csv_paths:
         p = Path(path_str)
         if not p.exists():
@@ -1062,13 +1065,11 @@ def _dataset_from_cd_csvs(
         )
         if not rows:
             raise ValueError(f"No usable rows found in {p}")
-        datasets_list.append(Dataset.from_list(rows))
+        all_rows.extend(rows)
 
-    if not datasets_list:
+    if not all_rows:
         raise ValueError("No causal discovery CSV inputs were provided.")
-    if len(datasets_list) == 1:
-        return datasets_list[0]
-    return concatenate_datasets(datasets_list)
+    return Dataset.from_list(all_rows)
 
 
 def _dataset_from_cd_config_file(
@@ -1132,7 +1133,7 @@ def _dataset_from_cd_config_file(
         return sorted(seen)
 
     rows: list[dict[str, str]] = []
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, _cot_hint in configs:
         if obs_n == 0 and int_n == 0 and int(shuf_n) != 1:
             continue
         _base_name, answer_obj, prompt_iter = _iter_cfg_prompts(
@@ -1151,6 +1152,7 @@ def _dataset_from_cd_config_file(
             def_int=bool(def_int),
             intervene_vars=str(intervene_vars),
             thinking_tags=bool(thinking_tags),
+            cot_hint=bool(_cot_hint),
         )
         adj = answer_obj.get("adjacency_matrix") if isinstance(answer_obj, dict) else None
         variables_out = answer_obj.get("variables") if isinstance(answer_obj, dict) else None
@@ -2856,6 +2858,7 @@ def run_train(args, argv: list[str] | None = None):
 
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
         ddp_find_unused_parameters=False,
 
         bf16=torch.cuda.is_available(),

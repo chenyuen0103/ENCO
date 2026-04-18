@@ -16,6 +16,10 @@ LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
 # Allow running from experiments/ with repo root one level up
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 try:
+    from cd_training_format import canonicalize_cd_prompt, default_format_hint_text
+except Exception:
+    from experiments.cd_training_format import canonicalize_cd_prompt, default_format_hint_text
+try:
     from benchmark_builder.graph_io import load_causal_graph as _load_graph_file_full  # type: ignore
 except Exception:
     _load_graph_file_full = None
@@ -79,6 +83,21 @@ def _build_output_contract_lines(
         "No extra text before, between, or after the two blocks.",
         'The JSON in <answer> must start with "{" and end with "}".',
     ]
+
+
+def _maybe_apply_cot_hint(prompt_text: str, *, cot_hint: bool) -> str:
+    if not cot_hint:
+        return prompt_text
+    return canonicalize_cd_prompt(
+        prompt_text,
+        task="causal_discovery",
+        wrap_system_prompt=True,
+        append_format_hint=True,
+        format_hint_text=default_format_hint_text("causal_discovery"),
+        prefill_think=True,
+        prefill_answer=False,
+        think_text="",
+    )
 
 # ------------------------ Helpers ------------------------ #
 
@@ -156,6 +175,7 @@ def iter_names_only_prompts_in_memory(
     anonymize: bool,
     causal_rules: bool,
     thinking_tags: bool = True,
+    cot_hint: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate names-only prompts in-memory.
@@ -213,6 +233,8 @@ def iter_names_only_prompts_in_memory(
         answer_obj["adjacency_matrix"] = adj_bin
 
     base_name = f"prompts_names_only_p{num_prompts}"
+    if cot_hint:
+        base_name += "_cothint"
     if col_order != "original":
         base_name += f"_col{col_order.capitalize()}"
 
@@ -225,6 +247,7 @@ def iter_names_only_prompts_in_memory(
         require_think_answer_blocks=thinking_tags,
         anonymize=anonymize,
     )
+    prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(cot_hint))
 
     def _iter() -> Iterator[dict[str, Any]]:
         for i in range(num_prompts):
@@ -259,6 +282,11 @@ def main():
         "--thinking-tags",
         action="store_true",
         help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+    )
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
     )
     
     # --- Dummy Arguments (Accepted to ignore) ---
@@ -326,6 +354,8 @@ def main():
     prompt_txt_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = f"prompts_names_only_p{args.num_prompts}"
+    if args.cot_hint:
+        base_name += "_cothint"
     if args.col_order != "original": base_name += f"_col{args.col_order.capitalize()}"
     
     csv_path = out_dir / f"{base_name}.csv"
@@ -364,6 +394,7 @@ def main():
         require_think_answer_blocks=args.thinking_tags,
         anonymize=args.anonymize,
     )
+    prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(args.cot_hint))
     
     print(f"Generating 'Names Only' prompts into {out_dir}...")
 

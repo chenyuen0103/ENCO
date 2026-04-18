@@ -10,7 +10,7 @@ This matches the shape of the `experiments/collect_result.ipynb` snippet:
   - compute a macro-average across grid cells
 
 Works with:
-  - `experiments/out/experiment1/<dataset>_summary.csv` (recommended), or
+  - `experiments/responses/<dataset>/<dataset>_summary.csv` (recommended), or
   - a summary CSV produced by `experiments/evaluate.py --summary-csv ...`
 """
 

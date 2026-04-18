@@ -26,7 +26,7 @@ from query_gemini import (
     count_openai_tokens,
 )
 
-FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
+FORMAT_RE = re.compile(r"(?s)^\s*(?:<think>)?.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
 
 
@@ -219,6 +219,42 @@ def _visible_vram_bytes() -> int | None:
     return total if total > 0 else None
 
 
+def _hf_prompt_context_limit_tokens(hf_pipe: Any) -> int | None:
+    """
+    Best-effort HF context length (tokens) from tokenizer/model config.
+    Returns None when unavailable.
+    """
+    if hf_pipe is None:
+        return None
+
+    def _normalize_limit(value: Any) -> int | None:
+        try:
+            n = int(value)
+        except Exception:
+            return None
+        # Ignore unset/sentinel values often used by tokenizers.
+        if n <= 0 or n >= 1_000_000_000:
+            return None
+        return n
+
+    tok = getattr(hf_pipe, "tokenizer", None)
+    if tok is not None:
+        for attr in ("model_max_length", "max_len_single_sentence"):
+            lim = _normalize_limit(getattr(tok, attr, None))
+            if lim is not None:
+                return lim
+
+    model = getattr(hf_pipe, "model", None)
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for attr in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len"):
+            lim = _normalize_limit(getattr(cfg, attr, None))
+            if lim is not None:
+                return lim
+
+    return None
+
+
 def _load_configs_from_file(
     *,
     config_file: Path,
@@ -226,7 +262,7 @@ def _load_configs_from_file(
     allowed_styles: set[str],
     allowed_row_orders: set[str],
     allowed_col_orders: set[str],
-) -> list[tuple[str, bool, int, int, str, str, int]]:
+) -> list[tuple[str, bool, int, int, str, str, int, bool]]:
     try:
         payload = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception as e:
@@ -242,7 +278,7 @@ def _load_configs_from_file(
     if not isinstance(raw_configs, list) or not raw_configs:
         raise SystemExit("--config-file contains no configs.")
 
-    out: list[tuple[str, bool, int, int, str, str, int]] = []
+    out: list[tuple[str, bool, int, int, str, str, int, bool]] = []
     for i, item in enumerate(raw_configs):
         if not isinstance(item, dict):
             raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
@@ -282,7 +318,17 @@ def _load_configs_from_file(
         else:
             anon = False
 
-        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n))
+        cot_hint_raw = item.get("cot_hint", False)
+        if isinstance(cot_hint_raw, bool):
+            cot_hint = cot_hint_raw
+        elif isinstance(cot_hint_raw, str):
+            cot_hint = cot_hint_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+        elif isinstance(cot_hint_raw, (int, float)):
+            cot_hint = bool(int(cot_hint_raw))
+        else:
+            cot_hint = False
+
+        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cot_hint))
 
     return out
 
@@ -331,6 +377,7 @@ def _iter_prompts_for_config(
     def_int: bool,
     intervene_vars: str,
     thinking_tags: bool,
+    cot_hint: bool,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     is_names_only = (obs_per_prompt == 0 and int_per_combo == 0)
     if is_names_only:
@@ -342,6 +389,7 @@ def _iter_prompts_for_config(
             anonymize=anonymize,
             causal_rules=causal_rules,
             thinking_tags=thinking_tags,
+            cot_hint=cot_hint,
         )
     try:
         from generate_prompts import iter_prompts_in_memory
@@ -366,6 +414,7 @@ def _iter_prompts_for_config(
         def_int=def_int,
         intervene_vars=intervene_vars,
         thinking_tags=thinking_tags,
+        cot_hint=cot_hint,
     )
 
 
@@ -434,6 +483,7 @@ def _run_model_for_config(
             if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram)
             else None
         )
+        hf_prompt_context_limit = _hf_prompt_context_limit_tokens(hf_pipe) if provider == "hf" else None
         if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram):
             print(
                 f"[preflight] hf_visible_vram_bytes={visible_vram_bytes} "
@@ -556,6 +606,23 @@ def _run_model_for_config(
                 file=sys.stderr,
                 flush=True,
             )
+            if (
+                provider == "hf"
+                and hf_prompt_context_limit is not None
+                and prompt_tokens >= 0
+                and prompt_tokens > int(hf_prompt_context_limit)
+            ):
+                resp = f"[ERROR] Prompt too long (num tokens:{prompt_tokens})"
+                if log_calls:
+                    print(
+                        f"[skip] key={key} provider=hf reason=prompt_tokens_exceed_context "
+                        f"prompt_tokens={prompt_tokens} context_limit={hf_prompt_context_limit}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
+                continue
+
             if provider == "hf":
                 skip_reason = None
                 if int(hf_skip_if_prompt_tokens_over) > 0 and prompt_tokens >= 0 and prompt_tokens > int(hf_skip_if_prompt_tokens_over):
@@ -793,6 +860,11 @@ def main() -> None:
         help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
     )
     ap.set_defaults(thinking_tags=True)
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+    )
     ap.add_argument("--single-config", action="store_true")
     ap.add_argument(
         "--config-file",
@@ -868,6 +940,7 @@ def main() -> None:
             args.row_order,
             args.col_order,
             int(shuf_values[0] if shuf_values else 1),
+            bool(args.cot_hint),
         )]
     elif args.config_file is not None:
         configs = _load_configs_from_file(
@@ -879,7 +952,7 @@ def main() -> None:
         )
     else:
         configs = [
-            (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n)
+            (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, bool(args.cot_hint))
             for style in styles
             for anon in anonymize_opts
             for obs_n in obs_sizes
@@ -891,7 +964,7 @@ def main() -> None:
 
     hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
 
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cot_hint in configs:
                                 is_names_only = (obs_n == 0 and int_n == 0)
                                 is_payload_without_obs = (style in {"payload", "payload_topk"} and obs_n == 0 and int_n > 0)
                                 if is_payload_without_obs:
@@ -952,6 +1025,7 @@ def main() -> None:
                                     def_int=args.def_int,
                                     intervene_vars=args.intervene_vars,
                                     thinking_tags=bool(args.thinking_tags),
+                                    cot_hint=bool(cot_hint),
                                 )
 
                                 if args.save_example_prompt:
@@ -989,6 +1063,7 @@ def main() -> None:
                                                 "col_order": col_ord,
                                                 "shuffles_per_graph": shuf_n,
                                                 "base_name": base_name,
+                                                "cot_hint": bool(cot_hint),
                                             },
                                             ensure_ascii=False,
                                             indent=2,
@@ -1025,6 +1100,7 @@ def main() -> None:
                                             def_int=args.def_int,
                                             intervene_vars=args.intervene_vars,
                                             thinking_tags=bool(args.thinking_tags),
+                                            cot_hint=bool(cot_hint),
                                         )
                                         n_rows = 0
                                         for tok_row in token_iter:
@@ -1099,6 +1175,7 @@ def main() -> None:
                                         def_int=args.def_int,
                                         intervene_vars=args.intervene_vars,
                                         thinking_tags=bool(args.thinking_tags),
+                                        cot_hint=bool(cot_hint),
                                     )
                                     _run_model_for_config(
                                         dataset=dataset,

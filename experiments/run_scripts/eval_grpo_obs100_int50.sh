@@ -27,14 +27,14 @@ EXPERIMENTS_DIR="${REPO_ROOT}/experiments"
 
 # MODEL="${EXPERIMENTS_DIR}/checkpoints/grpo_v2_cancer_eq" 
 # MODEL="Qwen/Qwen3-4B-Thinking-2507" 
-MODEL="${EXPERIMENTS_DIR}/checkpoints/causal_grpo_sachs_v1/checkpoint-300"
+MODEL="${EXPERIMENTS_DIR}/checkpoints/causal_grpo_sachs_v1/checkpoint-400"
 BIF="${REPO_ROOT}/causal_graphs/real_data/small_graphs/sachs.bif"
 RESPONSES_ROOT="${EXPERIMENTS_DIR}/responses"
 SUMMARY_CSV="${RESPONSES_ROOT}/sachs/sachs_summary.csv"
 NUM_PROMPTS="${NUM_PROMPTS:-5}"
 RUN_EXPERIMENT_SCRIPT="${EXPERIMENTS_DIR}/run_experiment1_in_memory.py"
 EVALUATE_SCRIPT="${EXPERIMENTS_DIR}/evaluate.py"
-CONFIG_FILE="${SCRIPT_DIR}/configs/grpo_v2_cancer_eq_sachs_both_anon.json"
+CONFIG_FILE="${SCRIPT_DIR}/configs/obs100_int50.json"
 MODEL_TAG="${MODEL##*/}"
 MODEL_TAG="${MODEL_TAG//:/_}"
 MODEL_TAG="${MODEL_TAG// /_}"
@@ -154,13 +154,13 @@ main() {
 
     # ── Run both configurations × both anonymization settings ─────────────
     # Non-anon: direct comparison with existing SFT baseline (real variable names)
-    eval_only 5000 200
-    eval_only 1000 100
+    eval_only 100 10
+    eval_only 100 10
 
     # Anon: shows improvement over SFT-anon baseline (X1/X2/... variable names,
     #       which is the setting grpo_v2_cancer_eq was trained on)
-    eval_only 5000 200 "--anonymize"
-    eval_only 1000 100 "--anonymize"
+    eval_only 100 10 "--anonymize"
+    eval_only 100 10 "--anonymize"
 
     echo ""
     echo "============================================"

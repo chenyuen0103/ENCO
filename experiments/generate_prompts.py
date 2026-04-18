@@ -15,6 +15,11 @@ import numpy as np
 # Allow running from experiments/ with repo root one level up
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
+try:
+    from cd_training_format import canonicalize_cd_prompt, default_format_hint_text
+except Exception:
+    from experiments.cd_training_format import canonicalize_cd_prompt, default_format_hint_text
+
 # NOTE: We intentionally avoid importing torch-dependent graph loaders at module import time.
 # This file also contains prompt formatting utilities that are useful without torch installed.
 # When sampling from BIF graphs, we lazy-import the loader inside the relevant functions.
@@ -24,6 +29,21 @@ LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
 
 def _use_edge_list_output(variables: List[str]) -> bool:
     return len(variables) > LARGE_GRAPH_EDGE_LIST_THRESHOLD
+
+
+def _maybe_apply_cot_hint(prompt_text: str, *, cot_hint: bool, task: str = "causal_discovery") -> str:
+    if not cot_hint:
+        return prompt_text
+    return canonicalize_cd_prompt(
+        prompt_text,
+        task=task,
+        wrap_system_prompt=True,
+        append_format_hint=True,
+        format_hint_text=default_format_hint_text(task),
+        prefill_think=True,
+        prefill_answer=False,
+        think_text="",
+    )
 
 def _load_graph_file(path: str):  # type: ignore
     from benchmark_builder.graph_io import load_causal_graph  # type: ignore
@@ -182,6 +202,7 @@ def iter_prompts_in_memory(
     def_int: bool,
     intervene_vars: str,
     thinking_tags: bool = True,
+    cot_hint: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate prompts in-memory (no prompt files, no prompt CSV).
@@ -264,6 +285,8 @@ def iter_prompts_in_memory(
         tags.append("steps")
     if thinking_tags:
         tags.append("thinktags")
+    if cot_hint:
+        tags.append("cothint")
     if prompt_style in {"matrix", "summary_joint"}:
         tags.append(prompt_style)
     if row_order != "random":
@@ -412,6 +435,7 @@ def iter_prompts_in_memory(
                         f"Unsupported prompt_style={prompt_style!r}. "
                         "Only 'matrix' and 'summary_joint' are enabled."
                     )
+                prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(cot_hint))
 
                 yield {
                     "data_idx": i,
@@ -2346,6 +2370,11 @@ def main():
         help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
     )
     ap.set_defaults(thinking_tags=True)
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+    )
     ap.add_argument("--def-int", action="store_true", help="Include a brief definition of interventions when interventional data are present.")
     ap.add_argument("--shuffles-per-graph", type=int, default=1)
     ap.add_argument("--given-edge-frac", type=float, default=0.0)
@@ -2465,6 +2494,7 @@ def main():
     if getattr(args, "causal_rules", False): tags.append("rules")
     if getattr(args, "give_steps", False): tags.append("steps")
     if getattr(args, "thinking_tags", False): tags.append("thinktags")
+    if getattr(args, "cot_hint", False): tags.append("cothint")
     if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary_joint"}:
         tags.append(args.prompt_style)
     
@@ -2662,6 +2692,7 @@ def main():
                         f"Unsupported prompt_style={args.prompt_style!r}. "
                         "Only 'matrix' and 'summary_joint' are enabled."
                     )
+                prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(args.cot_hint))
                 
                 # Write Prompt File
                 p_filename = f"{base_name}_data{i}_shuf{rep}.txt"

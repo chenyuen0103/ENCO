@@ -167,6 +167,4 @@ refine-logs/
 paper_slices/
 !paper_slices/
 
-
-*.npy
-*.tar
+collect_from_remotes.sh
