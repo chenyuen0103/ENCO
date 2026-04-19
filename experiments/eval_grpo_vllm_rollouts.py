@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import json
 import os
 import random
@@ -64,6 +65,66 @@ DEFAULT_CSVS = [
 def _safe_slug(text: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
     return slug.strip("._-") or "model"
+
+
+def _is_local_model_arg(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if raw.startswith((".", "/", "~")):
+        return True
+    return any(sep in raw for sep in (os.sep, "/"))
+
+
+def _iter_checkpoint_dirs() -> list[str]:
+    base = _HERE / "checkpoints"
+    if not base.is_dir():
+        return []
+    return sorted(
+        str(path.relative_to(_repo_root))
+        for path in base.iterdir()
+        if path.is_dir()
+    )
+
+
+def _resolve_model_arg(model_arg: str) -> str:
+    raw = str(model_arg or "").strip()
+    if not raw:
+        raise ValueError("--model must not be empty")
+    if not _is_local_model_arg(raw):
+        return raw
+
+    expanded = Path(raw).expanduser()
+    candidates = [expanded]
+    if not expanded.is_absolute():
+        candidates.append((Path.cwd() / expanded).resolve())
+        candidates.append((_repo_root / expanded).resolve())
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return str(resolved)
+
+    checkpoint_dirs = _iter_checkpoint_dirs()
+    suggestion_pool = checkpoint_dirs + [Path(item).name for item in checkpoint_dirs]
+    suggestions = difflib.get_close_matches(raw, suggestion_pool, n=3, cutoff=0.45)
+    if not suggestions:
+        suggestions = difflib.get_close_matches(Path(raw).name, suggestion_pool, n=3, cutoff=0.45)
+
+    message = (
+        f"Local model path not found: {raw}. "
+        f"Checked: {', '.join(str(path) for path in seen)}."
+    )
+    if suggestions:
+        message += " Did you mean: " + ", ".join(sorted(dict.fromkeys(suggestions))) + "?"
+    raise FileNotFoundError(message)
 
 
 def _looks_like_inline_text(raw: str) -> bool:
@@ -714,6 +775,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    resolved_model = _resolve_model_arg(args.model)
 
     csv_paths = list(args.csv or DEFAULT_CSVS)
     sampled_records = _sample_records(
@@ -741,11 +803,13 @@ def main() -> None:
         f" | task={task} | rollouts_per_prompt={args.rollouts}",
         flush=True,
     )
+    if resolved_model != args.model:
+        print(f"[info] resolved local model path: {resolved_model}", flush=True)
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model,
+        resolved_model,
         trust_remote_code=bool(args.trust_remote_code),
     )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -810,7 +874,7 @@ def main() -> None:
     )
 
     llm_kwargs: dict[str, Any] = {
-        "model": args.model,
+        "model": resolved_model,
         "tensor_parallel_size": int(args.tensor_parallel_size),
         "dtype": args.vllm_dtype,
         "gpu_memory_utilization": float(resolved_gpu_mem_util),
