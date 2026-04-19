@@ -524,8 +524,6 @@ def run_sft(
         "dtype": load_dtype,
         "attn_implementation": "sdpa",
     }
-    if distributed_world_size == 1:
-        model_load_kwargs["device_map"] = "auto"
 
     if is_adapter:
         if distributed_world_size > 1:
@@ -763,6 +761,35 @@ def run_grpo(
     subprocess.run(cmd, env=child_env, check=True)
 
 
+def merge_sft_adapter(
+    *,
+    sft_model_dir: Path,
+    merged_output_dir: Path,
+) -> Path:
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoTokenizer
+
+    sft_model_dir = Path(sft_model_dir).resolve()
+    merged_output_dir = Path(merged_output_dir).resolve()
+
+    if not (sft_model_dir / "adapter_config.json").exists():
+        raise ValueError(f"{sft_model_dir} is not a PEFT adapter directory (missing adapter_config.json)")
+
+    print(f"[merge] loading adapter from {sft_model_dir}")
+    model = AutoPeftModelForCausalLM.from_pretrained(
+        str(sft_model_dir),
+        torch_dtype="auto",
+    )
+    merged = model.merge_and_unload()
+    tokenizer = AutoTokenizer.from_pretrained(str(sft_model_dir), use_fast=True)
+
+    merged_output_dir.mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(str(merged_output_dir))
+    tokenizer.save_pretrained(str(merged_output_dir))
+    print(f"[merge] saved merged model -> {merged_output_dir}")
+    return merged_output_dir
+
+
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 
 
@@ -949,7 +976,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--python-exe", default=sys.executable)
     ap.add_argument(
         "--cuda-visible-devices",
-        default="0,1",
+        default="0",
         help="CUDA_VISIBLE_DEVICES for GPU stages (default: 0,1).",
     )
 
@@ -1038,6 +1065,27 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Extra args passed through to GRPO script.",
     )
+    ap.add_argument(
+        "--merge-after-sft",
+        action="store_true",
+        help="After SFT finishes, merge the LoRA adapter into a full model checkpoint.",
+    )
+    ap.add_argument(
+        "--no-merge-after-sft",
+        dest="merge_after_sft",
+        action="store_false",
+        help="Do not merge the LoRA adapter into a full model checkpoint after SFT.",
+    )
+    ap.add_argument(
+        "--merged-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output dir for the merged full model checkpoint. "
+            "Defaults to <sft_output_dir>_merged when --merge-after-sft is set."
+        ),
+    )
+    ap.set_defaults(merge_after_sft=True)
     return ap.parse_args()
 
 
@@ -1059,7 +1107,15 @@ def main() -> None:
         already_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
         if not already_distributed:
             prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+            requested_cvd = str(args.cuda_visible_devices)
+            if prev_cvd:
+                if prev_cvd != requested_cvd:
+                    print(
+                        f"[sft] respecting existing CUDA_VISIBLE_DEVICES={prev_cvd!r}; "
+                        f"ignoring script default {requested_cvd!r}"
+                    )
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = requested_cvd
         try:
             run_sft(
                 base_model=args.base_model,
@@ -1088,6 +1144,16 @@ def main() -> None:
                 else:
                     os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
         print(f"[sft] saved -> {args.sft_output_dir}")
+        if args.merge_after_sft:
+            merged_output_dir = (
+                Path(args.merged_output_dir).resolve()
+                if args.merged_output_dir is not None
+                else Path(str(args.sft_output_dir) + "_merged").resolve()
+            )
+            merge_sft_adapter(
+                sft_model_dir=Path(args.sft_output_dir).resolve(),
+                merged_output_dir=merged_output_dir,
+            )
         if args.stage == "sft":
             return
 
