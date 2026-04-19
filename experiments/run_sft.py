@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 import inspect
+import importlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,43 @@ def _derive_non_quantized_model_id(model_name: str) -> str:
         candidate = re.sub(pat, "", candidate)
     candidate = re.sub(r"[-_]{2,}", "-", candidate).rstrip("-_")
     return candidate or name
+
+
+def _import_trl_sft() -> tuple[Any, Any]:
+    """
+    Import TRL SFT classes without letting TRL's vLLM compatibility shim fire.
+
+    SFT in this script does not use vLLM, but recent TRL builds still probe the
+    installed vLLM package during import and emit noisy compatibility warnings.
+    Hiding vLLM for this import keeps the SFT path decoupled from local vLLM
+    versions and avoids repeated per-rank warnings.
+    """
+    from transformers.utils import import_utils as tf_import_utils
+
+    orig_is_pkg_available = tf_import_utils._is_package_available
+
+    def _patched_is_package_available(package_name: str, *args: Any, **kwargs: Any) -> Any:
+        return_version = kwargs.get("return_version", args[0] if args else False)
+        if package_name in {"vllm", "vllm_ascend"}:
+            return (False, "0.0.0") if return_version else False
+        return orig_is_pkg_available(package_name, *args, **kwargs)
+
+    tf_import_utils._is_package_available = _patched_is_package_available
+    try:
+        if "trl" in sys.modules:
+            stale = [name for name in sys.modules if name == "trl" or name.startswith("trl.")]
+            for name in stale:
+                sys.modules.pop(name, None)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"TRL currently only supports vLLM version `0\.10\.2`.*",
+                category=UserWarning,
+            )
+            trl = importlib.import_module("trl")
+        return trl.SFTConfig, trl.SFTTrainer
+    finally:
+        tf_import_utils._is_package_available = orig_is_pkg_available
 
 
 def _build_format_check_prompt(
@@ -298,7 +337,7 @@ def _run_sft_unsloth(
     )
     print(f"[sft/unsloth] rows={len(tokenized_ds)} supervised_tokens_total={supervised_total}")
 
-    from trl import SFTTrainer, SFTConfig
+    SFTConfig, SFTTrainer = _import_trl_sft()
     metrics_jsonl_path = _resolve_train_log_path(sft_output_dir, train_log_jsonl)
     print(f"[sft/unsloth] JSONL logging enabled: {metrics_jsonl_path}")
     cfg = SFTConfig(
