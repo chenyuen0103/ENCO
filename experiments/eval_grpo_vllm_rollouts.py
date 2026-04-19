@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import re
 import statistics
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,6 +19,7 @@ from typing import Any, Optional
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
+os.environ.setdefault("ENCO_PATCH_VLLM_TQDM", "1")
 
 from verifier_cd import (
     build_cd_acyclic_reward,
@@ -369,7 +372,99 @@ def _summarize_results(
     return summary
 
 
-def _infer_vllm_max_model_len(tokenizer, prompts: list[str], max_new_tokens: int) -> int:
+def _get_tokenizer_declared_max_length(tokenizer) -> Optional[int]:
+    raw_value = getattr(tokenizer, "model_max_length", None)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    # Transformers uses very large sentinels when the limit is effectively unset.
+    if value <= 0 or value >= 1_000_000:
+        return None
+    return value
+
+
+def _install_vllm_tokenizer_compat_shims(tokenizer) -> list[str]:
+    patched: list[str] = []
+    tokenizer_cls = tokenizer.__class__
+
+    if not hasattr(tokenizer_cls, "all_special_tokens_extended"):
+        setattr(
+            tokenizer_cls,
+            "all_special_tokens_extended",
+            property(lambda self: list(getattr(self, "all_special_tokens", []) or [])),
+        )
+        patched.append("all_special_tokens_extended")
+
+    if not hasattr(tokenizer_cls, "special_tokens_map_extended"):
+        setattr(
+            tokenizer_cls,
+            "special_tokens_map_extended",
+            property(lambda self: dict(getattr(self, "special_tokens_map", {}) or {})),
+        )
+        patched.append("special_tokens_map_extended")
+
+    if not hasattr(tokenizer_cls, "num_special_tokens_to_add"):
+        def _num_special_tokens_to_add(self, pair: bool = False) -> int:
+            build_inputs = getattr(self, "build_inputs_with_special_tokens", None)
+            if callable(build_inputs):
+                try:
+                    built = build_inputs([], []) if pair else build_inputs([])
+                    return max(0, len(built))
+                except Exception:
+                    pass
+            return 0
+
+        setattr(tokenizer_cls, "num_special_tokens_to_add", _num_special_tokens_to_add)
+        patched.append("num_special_tokens_to_add")
+
+    return patched
+
+
+def _patch_tqdm_for_vllm() -> Optional[str]:
+    """Patch vLLM's DisabledTqdm helper for newer huggingface_hub versions.
+
+    vLLM 0.11.0 defines DisabledTqdm as:
+        super().__init__(*args, **kwargs, disable=True)
+    but newer huggingface_hub.snapshot_download already passes disable=..., which
+    triggers "got multiple values for keyword argument 'disable'".
+    """
+    try:
+        import vllm.model_executor.model_loader.weight_utils as weight_utils  # type: ignore
+    except Exception:
+        return None
+
+    disabled_tqdm_cls = getattr(weight_utils, "DisabledTqdm", None)
+    if disabled_tqdm_cls is None:
+        return None
+    if getattr(disabled_tqdm_cls, "_enco_disable_patch", False):
+        return None
+
+    base_tqdm_cls = disabled_tqdm_cls.__mro__[1] if len(disabled_tqdm_cls.__mro__) > 1 else None
+    if base_tqdm_cls is None:
+        return None
+
+    class PatchedDisabledTqdm(base_tqdm_cls):  # type: ignore[misc, valid-type]
+        _enco_disable_patch = True
+
+        def __init__(self, *args, **kwargs):
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+    PatchedDisabledTqdm.__name__ = getattr(disabled_tqdm_cls, "__name__", "PatchedDisabledTqdm")
+    PatchedDisabledTqdm.__qualname__ = getattr(disabled_tqdm_cls, "__qualname__", PatchedDisabledTqdm.__name__)
+    weight_utils.DisabledTqdm = PatchedDisabledTqdm
+    return (
+        "patched vLLM DisabledTqdm for huggingface_hub compatibility "
+        f"(base={base_tqdm_cls.__module__}.{base_tqdm_cls.__name__})"
+    )
+
+
+def _infer_vllm_max_model_len(
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens: int,
+) -> tuple[int, int, int, Optional[int], Optional[str]]:
     tokenized = tokenizer(
         prompts,
         add_special_tokens=False,
@@ -378,7 +473,18 @@ def _infer_vllm_max_model_len(tokenizer, prompts: list[str], max_new_tokens: int
     )["input_ids"]
     max_prompt_tokens = max((len(ids) for ids in tokenized), default=0)
     buffer_tokens = max(256, min(2048, max(64, max_prompt_tokens // 8)))
-    return int(max_prompt_tokens + int(max_new_tokens) + buffer_tokens)
+    inferred = int(max_prompt_tokens + int(max_new_tokens) + buffer_tokens)
+    declared_max_length = _get_tokenizer_declared_max_length(tokenizer)
+    warning: Optional[str] = None
+    if declared_max_length is not None and inferred > declared_max_length:
+        remaining_completion_budget = max(0, declared_max_length - max_prompt_tokens)
+        warning = (
+            f"[warn] capping inferred vLLM max_model_len from {inferred} to tokenizer.model_max_length="
+            f"{declared_max_length}. Longest sampled prompt uses {max_prompt_tokens} tokens, leaving at most "
+            f"{remaining_completion_budget} tokens for generation before hitting the declared context limit."
+        )
+        inferred = declared_max_length
+    return inferred, max_prompt_tokens, buffer_tokens, declared_max_length, warning
 
 
 def _auto_adjust_vllm_gpu_mem_util(
@@ -386,46 +492,64 @@ def _auto_adjust_vllm_gpu_mem_util(
     tensor_parallel_size: int,
 ) -> tuple[float, Optional[str]]:
     try:
-        import torch
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     except Exception:
         return float(requested_util), None
 
-    if not torch.cuda.is_available():
+    rows: list[tuple[int, int, int]] = []
+    for physical_idx, line in enumerate(completed.stdout.splitlines()):
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            free_mb = int(float(parts[0]))
+            total_mb = int(float(parts[1]))
+        except ValueError:
+            continue
+        if total_mb > 0:
+            rows.append((physical_idx, free_mb, total_mb))
+    if not rows:
         return float(requested_util), None
 
-    visible = torch.cuda.device_count()
-    if visible <= 0:
-        return float(requested_util), None
+    visible_spec = str(os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if visible_spec and visible_spec != "-1":
+        remapped_rows: list[tuple[int, int, int]] = []
+        requested_devices = [token.strip() for token in visible_spec.split(",") if token.strip()]
+        for local_idx, token in enumerate(requested_devices):
+            if not token.isdigit():
+                remapped_rows = []
+                break
+            physical_idx = int(token)
+            if 0 <= physical_idx < len(rows):
+                _, free_mb, total_mb = rows[physical_idx]
+                remapped_rows.append((local_idx, free_mb, total_mb))
+        if remapped_rows:
+            rows = remapped_rows
 
-    world = min(int(tensor_parallel_size), visible)
+    world = min(int(tensor_parallel_size), len(rows))
     free_ratios: list[float] = []
     details: list[str] = []
-    for device_idx in range(world):
-        try:
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
-        except Exception:
-            return float(requested_util), None
-        if total_bytes <= 0:
-            continue
-        free_ratio = float(free_bytes) / float(total_bytes)
+    for device_idx, free_mb, total_mb in rows[:world]:
+        free_ratio = float(free_mb) / float(total_mb)
         free_ratios.append(free_ratio)
         details.append(
-            f"cuda:{device_idx} free={free_bytes / (1024 ** 3):.2f}GiB total={total_bytes / (1024 ** 3):.2f}GiB"
+            f"cuda:{device_idx} free={free_mb / 1024.0:.2f}GiB total={total_mb / 1024.0:.2f}GiB"
         )
 
     if not free_ratios:
         return float(requested_util), None
 
     min_free_ratio = min(free_ratios)
-    safe_util = max(0.25, min(0.98, min_free_ratio * 0.92))
-    if min_free_ratio < 0.05:
-        message = (
-            f"[warn] very low currently free GPU memory detected (min free ratio={min_free_ratio:.3f}); "
-            f"keeping requested --vllm-gpu-mem-util={float(requested_util):.3f} because lower values can be "
-            f"too small to load model weights. GPU snapshot: "
-            + "; ".join(details)
-        )
-        return float(requested_util), message
+    safe_util = max(0.01, min(0.98, min_free_ratio * 0.92))
     if float(requested_util) <= safe_util:
         return float(requested_util), None
 
@@ -435,36 +559,6 @@ def _auto_adjust_vllm_gpu_mem_util(
         + "; ".join(details)
     )
     return float(safe_util), message
-
-
-def _init_vllm_with_fallback(
-    llm_cls,
-    *,
-    base_kwargs: dict[str, Any],
-    auto_max_model_len: bool,
-) -> tuple[Any, dict[str, Any], Optional[str]]:
-    try:
-        return llm_cls(**base_kwargs), dict(base_kwargs), None
-    except Exception as first_exc:
-        if not auto_max_model_len:
-            raise
-
-        first_max_len = int(base_kwargs["max_model_len"])
-        retry_max_len = max(4096, min(16384, first_max_len // 2))
-        if retry_max_len >= first_max_len:
-            raise
-
-        retry_kwargs = dict(base_kwargs)
-        retry_kwargs["max_model_len"] = retry_max_len
-        try:
-            llm = llm_cls(**retry_kwargs)
-            message = (
-                f"[warn] initial vLLM init failed with max_model_len={first_max_len}; "
-                f"retrying succeeded with max_model_len={retry_max_len}."
-            )
-            return llm, retry_kwargs, message
-        except Exception:
-            raise first_exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,12 +599,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
-    parser.add_argument(
-        "--vllm-auto-max-model-len-cap",
-        type=int,
-        default=16384,
-        help="Upper bound used only when --vllm-max-model-len is not explicitly set.",
-    )
     parser.add_argument("--vllm-gpu-mem-util", type=float, default=0.9)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -602,21 +690,48 @@ def main() -> None:
     reward_funcs = _build_reward_funcs(args, tokenizer, task)
     reward_names = [name for name, _ in reward_funcs]
 
+    patched_tokenizer_attrs = _install_vllm_tokenizer_compat_shims(tokenizer)
+    if patched_tokenizer_attrs:
+        print(
+            "[info] installed tokenizer compatibility shims for vLLM on "
+            f"{tokenizer.__class__.__name__}: {', '.join(patched_tokenizer_attrs)}",
+            flush=True,
+        )
+
+    tqdm_patch_message = _patch_tqdm_for_vllm()
+    if tqdm_patch_message:
+        print(f"[info] {tqdm_patch_message}", flush=True)
+
     from vllm import LLM, SamplingParams
 
     prompts = [_make_generation_prompt(record) for record in sampled_records]
     if args.vllm_max_model_len is not None:
         resolved_max_model_len = int(args.vllm_max_model_len)
+        max_prompt_tokens = max(
+            (
+                len(ids)
+                for ids in tokenizer(
+                    prompts,
+                    add_special_tokens=False,
+                    padding=False,
+                    truncation=False,
+                )["input_ids"]
+            ),
+            default=0,
+        )
+        buffer_tokens = max(256, min(2048, max(64, max_prompt_tokens // 8)))
+        declared_max_model_len = _get_tokenizer_declared_max_length(tokenizer)
+        max_len_warning = None
     else:
-        inferred_max_model_len = _infer_vllm_max_model_len(tokenizer, prompts, int(args.max_new_tokens))
-        auto_cap = max(1024, int(args.vllm_auto_max_model_len_cap))
-        resolved_max_model_len = min(int(inferred_max_model_len), auto_cap)
-        if resolved_max_model_len < int(inferred_max_model_len):
-            print(
-                f"[warn] inferred max_model_len={inferred_max_model_len} exceeds "
-                f"--vllm-auto-max-model-len-cap={auto_cap}; using capped value {resolved_max_model_len}",
-                flush=True,
-            )
+        (
+            resolved_max_model_len,
+            max_prompt_tokens,
+            buffer_tokens,
+            declared_max_model_len,
+            max_len_warning,
+        ) = _infer_vllm_max_model_len(tokenizer, prompts, int(args.max_new_tokens))
+    if max_len_warning:
+        print(max_len_warning, flush=True)
     resolved_gpu_mem_util, gpu_mem_message = _auto_adjust_vllm_gpu_mem_util(
         float(args.vllm_gpu_mem_util),
         int(args.tensor_parallel_size),
@@ -625,7 +740,9 @@ def main() -> None:
         print(gpu_mem_message, flush=True)
     print(
         f"[info] using vLLM max_model_len={resolved_max_model_len} "
-        f"and gpu_memory_utilization={resolved_gpu_mem_util:.3f}",
+        f"(longest_prompt_tokens={max_prompt_tokens}, buffer_tokens={buffer_tokens}, "
+        f"tokenizer_model_max_length={declared_max_model_len}) and "
+        f"gpu_memory_utilization={resolved_gpu_mem_util:.3f}",
         flush=True,
     )
 
@@ -639,26 +756,15 @@ def main() -> None:
         "max_model_len": int(resolved_max_model_len),
     }
     try:
-        llm, used_llm_kwargs, retry_message = _init_vllm_with_fallback(
-            LLM,
-            base_kwargs=llm_kwargs,
-            auto_max_model_len=args.vllm_max_model_len is None,
-        )
-        if retry_message:
-            print(retry_message, flush=True)
+        llm = LLM(**llm_kwargs)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to initialize vLLM. Try lowering --vllm-gpu-mem-util, "
-            "reducing --max-new-tokens, or explicitly setting --vllm-max-model-len. "
+            f"Failed to initialize vLLM ({type(exc).__name__}: {exc}). "
+            "Try lowering --vllm-gpu-mem-util, reducing --max-new-tokens, "
+            "or explicitly setting --vllm-max-model-len. "
             f"Resolved settings were max_model_len={resolved_max_model_len}, "
-            f"gpu_memory_utilization={resolved_gpu_mem_util:.3f}. "
-            "Also ensure enough free VRAM (for example, check nvidia-smi)."
+            f"gpu_memory_utilization={resolved_gpu_mem_util:.3f}."
         ) from exc
-    print(
-        f"[info] vLLM initialized with max_model_len={int(used_llm_kwargs['max_model_len'])} "
-        f"and gpu_memory_utilization={float(used_llm_kwargs['gpu_memory_utilization']):.3f}",
-        flush=True,
-    )
     sampling_params = SamplingParams(
         n=int(args.rollouts),
         temperature=float(args.temperature),
