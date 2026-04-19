@@ -189,6 +189,35 @@ def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
 
 
+def _resolve_model_reference_for_attention(args) -> str:
+    if getattr(args, "base_model_override", None):
+        return str(args.base_model_override)
+
+    model_id = str(getattr(args, "model_id", "") or "")
+    adapter_cfg_path = Path(model_id) / "adapter_config.json"
+    if adapter_cfg_path.exists():
+        try:
+            adapter_cfg = json.loads(adapter_cfg_path.read_text(encoding="utf-8"))
+            base_model_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            if base_model_name:
+                return base_model_name
+        except Exception:
+            pass
+    return model_id
+
+
+def _resolve_attn_implementation(args) -> str:
+    requested = str(getattr(args, "attn_implementation", "auto") or "auto").strip().lower()
+    if requested != "auto":
+        return requested
+
+    model_ref = _resolve_model_reference_for_attention(args).lower()
+    # Qwen3 has been unreliable with Flash Attention 2 under GRPO's masked/varlen batches.
+    if "qwen3" in model_ref:
+        return "sdpa"
+    return "flash_attention_2"
+
+
 def _probe_trl_vllm_server(base_url: str, timeout: float) -> tuple[bool, str]:
     base = base_url.rstrip("/")
     probes = (
@@ -590,6 +619,16 @@ def build_argparser():
             "When model_id is a PEFT adapter trained on a quantized base (e.g. BNB 4-bit), "
             "provide the full-precision base model path/id here. The base will be loaded "
             "in bfloat16 without quantization and the adapter applied on top."
+        ),
+    )
+    p.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+        help=(
+            "Attention backend for the training model. "
+            "'auto' prefers Flash Attention 2, but falls back to SDPA for Qwen3."
         ),
     )
     p.add_argument("--dataset_id", type=str, default="AI-MO/NuminaMath-TIR")
@@ -2478,9 +2517,16 @@ def run_train(args, argv: list[str] | None = None):
 
     # ---- Model + LoRA
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    resolved_attn_implementation = _resolve_attn_implementation(args)
+    if int(os.environ.get("RANK", "0")) == 0:
+        model_ref = _resolve_model_reference_for_attention(args)
+        print(
+            f"[attn] using attn_implementation={resolved_attn_implementation} "
+            f"for model reference {model_ref}"
+        )
     model_load_kwargs = {
         "dtype": "auto",
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": resolved_attn_implementation,
     }
     # `device_map="auto"` is incompatible with distributed Accelerate launches.
     if distributed_world_size == 1:
