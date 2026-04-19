@@ -410,6 +410,7 @@ def _summarize_results(
     reward_names: list[str],
 ) -> dict[str, Any]:
     totals = [float(item["reward_total"]) for item in rollout_outputs]
+    completions = [str(item.get("completion") or "") for item in rollout_outputs]
     summary: dict[str, Any] = {
         "num_rollouts": len(rollout_outputs),
         "reward_total_mean": statistics.fmean(totals) if totals else 0.0,
@@ -419,6 +420,22 @@ def _summarize_results(
     for reward_name in reward_names:
         vals = [float(item["rewards"][reward_name]) for item in rollout_outputs]
         summary[f"{reward_name}_mean"] = statistics.fmean(vals) if vals else 0.0
+    if completions:
+        format_progress = {
+            "has_close_think": sum("</think>" in text for text in completions),
+            "has_open_answer": sum("<answer>" in text for text in completions),
+            "has_close_answer": sum("</answer>" in text for text in completions),
+            "has_adjacency_matrix": sum("adjacency_matrix" in text for text in completions),
+            "strict_format_ok": sum(bool(item.get("score_meta", {}).get("format_ok")) for item in rollout_outputs),
+            "parse_ok": sum(bool(item.get("score_meta", {}).get("parse_ok")) for item in rollout_outputs),
+        }
+        summary["format_progress"] = {
+            key: {
+                "count": value,
+                "rate": (float(value) / len(completions)),
+            }
+            for key, value in format_progress.items()
+        }
 
     by_source: dict[str, list[dict[str, Any]]] = {}
     by_dataset: dict[str, list[dict[str, Any]]] = {}

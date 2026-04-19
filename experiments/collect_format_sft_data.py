@@ -71,6 +71,7 @@ from generate_staged_sft_data import (  # noqa: E402
     _load_adj,
     _extract_variables,
     build_evidence_grounded_sections,
+    build_staged_sections,
 )
 from generate_prompts import iter_prompts_in_memory  # noqa: E402
 
@@ -105,6 +106,20 @@ def _sample_rows(path: Path, n: int, rng: random.Random) -> List[dict]:
     return reservoir
 
 
+def _build_think_sections(
+    *,
+    prompt_text: str,
+    adj: List[List[int]],
+    variables: List[str],
+    think_style: str,
+) -> Tuple[str, str, str]:
+    if think_style == "strict":
+        return build_staged_sections(adj, variables)
+    if think_style == "evidence":
+        return build_evidence_grounded_sections(prompt_text, adj, variables)
+    raise ValueError(f"unsupported think_style={think_style!r}")
+
+
 # ---------------------------------------------------------------------------
 # Mode B: record builder
 # ---------------------------------------------------------------------------
@@ -115,6 +130,7 @@ def _build_record(
     graph_name: str,
     prompt_col: str,
     answer_col: str,
+    think_style: str,
 ) -> Optional[dict]:
     """Return a validated SFT record or None if anything fails."""
     prompt_raw = (row.get(prompt_col) or "").strip()
@@ -133,10 +149,11 @@ def _build_record(
         variables = [f"X{k+1}" for k in range(n)]
 
     try:
-        stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
-            prompt_raw,
-            adj,
-            variables,
+        stage1_text, stage2_text, stage3_text = _build_think_sections(
+            prompt_text=prompt_raw,
+            adj=adj,
+            variables=variables,
+            think_style=think_style,
         )
         think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
     except ValueError:
@@ -163,6 +180,7 @@ def _build_record(
         "gold_stage3": stage3_text,
         "source": source_name,
         "graph": row_graph_name,
+        "think_style": think_style,
     }
 
 
@@ -221,6 +239,7 @@ def _build_records_in_memory(
     seed: int,
     anonymize: bool,
     col_perms: int,
+    think_style: str,
 ) -> List[dict]:
     """
     Generate SFT records directly from a BIF file without writing intermediate CSVs.
@@ -275,10 +294,11 @@ def _build_records_in_memory(
             )
 
             try:
-                stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
-                    prompt_raw,
-                    adj,
-                    variables,
+                stage1_text, stage2_text, stage3_text = _build_think_sections(
+                    prompt_text=prompt_raw,
+                    adj=adj,
+                    variables=variables,
+                    think_style=think_style,
                 )
                 think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
             except ValueError:
@@ -302,6 +322,7 @@ def _build_records_in_memory(
                 "gold_stage3": stage3_text,
                 "source": source_tag,
                 "graph": graph_name,
+                "think_style": think_style,
             })
 
     return records
@@ -542,6 +563,7 @@ def _build_records_perm_csv(
     rng: random.Random,
     prompt_col: str = "prompt",
     answer_col: str = "answer",
+    think_style: str = "evidence",
 ) -> Tuple[List[dict], int, int]:
     """
     Build SFT records from one CSV by enumerating variable-order permutations.
@@ -597,10 +619,11 @@ def _build_records_perm_csv(
                 update_prompt_to_current_format(prompt_perm)
             )
             try:
-                stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
-                    prompt_perm,
-                    adj_perm,
-                    new_var_names,
+                stage1_text, stage2_text, stage3_text = _build_think_sections(
+                    prompt_text=prompt_perm,
+                    adj=adj_perm,
+                    variables=new_var_names,
+                    think_style=think_style,
                 )
                 think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
             except ValueError:
@@ -626,6 +649,7 @@ def _build_records_perm_csv(
                 "source": source_name,
                 "graph": row_graph_name,
                 "perm": perm,
+                "think_style": think_style,
             })
             built += 1
 
@@ -709,6 +733,16 @@ def main() -> None:
     ap.add_argument("--prompt-col", default="prompt")
     ap.add_argument("--answer-col", default="answer")
     ap.add_argument(
+        "--think-style",
+        choices=["evidence", "strict"],
+        default="evidence",
+        help=(
+            "Gold reasoning target style. "
+            "'evidence' injects Evidence: summaries into each stage; "
+            "'strict' keeps only the Stage 1/2/3 edge lists."
+        ),
+    )
+    ap.add_argument(
         "--csv", action="append", default=[], metavar="PATH[:GRAPH]",
         help=(
             "Explicit CSV file to include (repeatable). "
@@ -783,6 +817,7 @@ def main() -> None:
                         seed=config_seed,
                         anonymize=args.anonymize,
                         col_perms=args.col_perms,
+                        think_style=args.think_style,
                     )
                     config_seed += 1000
                     all_records.extend(recs)
@@ -856,6 +891,7 @@ def main() -> None:
                     rng=rng,
                     prompt_col=args.prompt_col,
                     answer_col=args.answer_col,
+                    think_style=args.think_style,
                 )
                 all_records.extend(recs)
                 for rec in recs:
@@ -877,6 +913,7 @@ def main() -> None:
                         graph_name=graph_name,
                         prompt_col=args.prompt_col,
                         answer_col=args.answer_col,
+                        think_style=args.think_style,
                     )
                     if rec is None:
                         skipped += 1
