@@ -197,6 +197,79 @@ def _resolve_train_log_path(sft_output_dir: Path, train_log_jsonl: Path | None) 
     return out
 
 
+def _validate_sft_jsonl(path: Path, *, allow_legacy_text: bool = False, sample_limit: int = 8) -> dict[str, Any]:
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"SFT JSONL not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"SFT JSONL is not a file: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(
+            f"SFT JSONL is empty: {path}. "
+            "Regenerate it before training; for staged CD data use generate_staged_sft_data.py "
+            "or collect_format_sft_data.py."
+        )
+
+    total = 0
+    prompt_answer_rows = 0
+    text_rows = 0
+    sample_keys: set[str] = set()
+    sample_issues: list[str] = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s:
+                continue
+            total += 1
+            try:
+                row = json.loads(s)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"SFT JSONL has invalid JSON on line {lineno}: {exc.msg}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"SFT JSONL line {lineno} must decode to an object, got {type(row).__name__}")
+
+            sample_keys.update(str(k) for k in row.keys())
+            has_prompt_answer = "prompt" in row and "answer" in row
+            has_text = isinstance(row.get("text"), str) and bool(str(row.get("text") or "").strip())
+            if has_prompt_answer:
+                prompt_answer_rows += 1
+                if len(sample_issues) < sample_limit:
+                    issues = validate_sft_example(str(row.get("prompt") or ""), str(row.get("answer") or ""))
+                    if issues:
+                        sample_issues.append(f"line {lineno}: {'; '.join(issues)}")
+            if has_text:
+                text_rows += 1
+
+    if total == 0:
+        raise ValueError(
+            f"SFT JSONL has no non-empty records: {path}. "
+            "Regenerate it before training."
+        )
+    if sample_issues:
+        raise ValueError(
+            f"SFT JSONL sample validation failed for {path}:\n- " + "\n- ".join(sample_issues)
+        )
+    if allow_legacy_text:
+        if prompt_answer_rows == 0 and text_rows == 0:
+            raise ValueError(
+                f"SFT JSONL must contain either 'prompt'+'answer' or legacy 'text' rows; "
+                f"observed keys: {sorted(sample_keys)}"
+            )
+    elif prompt_answer_rows == 0:
+        raise ValueError(
+            f"SFT JSONL must contain 'prompt' and 'answer' columns; observed keys: {sorted(sample_keys)}. "
+            "Use generate_staged_sft_data.py to produce a compatible JSONL."
+        )
+
+    return {
+        "rows": total,
+        "prompt_answer_rows": prompt_answer_rows,
+        "text_rows": text_rows,
+        "keys": sorted(sample_keys),
+    }
+
+
 def _build_jsonl_metrics_callback(output_path: Path):
     from transformers import TrainerCallback
 
@@ -402,6 +475,12 @@ def run_sft(
     wandb_project: str | None = None,
     wandb_run_name: str | None = None,
 ) -> None:
+    sft_summary = _validate_sft_jsonl(sft_jsonl)
+    print(
+        f"[sft] validated dataset: rows={sft_summary['rows']} "
+        f"prompt_answer_rows={sft_summary['prompt_answer_rows']} path={Path(sft_jsonl).resolve()}"
+    )
+
     if use_unsloth:
         _run_sft_unsloth(
             base_model=base_model,

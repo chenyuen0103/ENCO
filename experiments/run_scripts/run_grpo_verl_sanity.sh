@@ -13,9 +13,6 @@
 
 mkdir -p /u/chenyuen0103/ENCO/experiments/logs
 
-# Ensure model symlink exists (recreate if /tmp was cleared)
-mkdir -p /tmp/chenyuen0103
-ln -sfn /work/hdd/bdeb/chenyuen0103/.cache/hub/models--unsloth--qwen3-4b-thinking-2507/snapshots/fb56efbd0f60c5bcd531901fa5fe3ee3157b5135 /tmp/chenyuen0103/qwen3-4b-thinking
 
 cd /u/chenyuen0103/ENCO
 export PYTHONPATH=/u/chenyuen0103/ENCO:$PYTHONPATH
@@ -30,7 +27,7 @@ conda run -n verl bash -c 'export PYTHONPATH=/u/chenyuen0103/ENCO:$PYTHONPATH &&
   data.max_response_length=1024 \
   data.filter_overlong_prompts=True \
   data.truncation=error \
-  actor_rollout_ref.model.path=/tmp/chenyuen0103/qwen3-4b-thinking \
+  actor_rollout_ref.model.path=/work/hdd/bdeb/chenyuen0103/.cache/hub/models--unsloth--qwen3-4b-thinking-2507/snapshots/fb56efbd0f60c5bcd531901fa5fe3ee3157b5135 \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   actor_rollout_ref.actor.optim.lr=5e-6 \
