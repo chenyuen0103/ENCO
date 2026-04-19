@@ -152,6 +152,14 @@ def _import_trl_grpo(*, use_vllm: bool = True):
         tf_import_utils._is_package_available = orig_is_pkg_available
 
 
+def _filter_supported_kwargs(callable_obj, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        params = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 def _load_graph_num_nodes(graph_path: str) -> int | None:
     try:
         from causal_graphs.graph_real_world import load_graph_file  # type: ignore
@@ -2974,45 +2982,42 @@ def run_train(args, argv: list[str] | None = None):
     if args.train_temperature > 0:
         train_generation_kwargs["temperature"] = args.train_temperature
         train_generation_kwargs["top_p"] = args.train_top_p
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        remove_unused_columns=False,
-        num_train_epochs=args.num_train_epochs,
-        beta=float(args.grpo_beta),
-
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_grad_norm=args.max_grad_norm,
-        ddp_find_unused_parameters=False,
-
-        bf16=torch.cuda.is_available(),
-
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        torch_compile=False,  # set True for ~20% speedup if your torch version supports it
-
-        max_prompt_length=args.max_prompt_tokens,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        generation_kwargs=train_generation_kwargs or None,
-
-        report_to=report_to,
-        run_name=args.run_name,
-        disable_tqdm=False,
-        logging_steps=args.logging_steps,
-        dataloader_num_workers=args.dataloader_num_workers,
-        dataloader_pin_memory=True,
-
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        push_to_hub=False,
-
-        # vLLM integration
-        use_vllm=args.use_vllm,
+    training_kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "remove_unused_columns": False,
+        "num_train_epochs": args.num_train_epochs,
+        "beta": float(args.grpo_beta),
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "max_grad_norm": args.max_grad_norm,
+        "ddp_find_unused_parameters": False,
+        "bf16": torch.cuda.is_available(),
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "torch_compile": False,  # set True for ~20% speedup if your torch version supports it
+        "max_prompt_length": args.max_prompt_tokens,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "generation_kwargs": train_generation_kwargs or None,
+        "report_to": report_to,
+        "run_name": args.run_name,
+        "disable_tqdm": False,
+        "logging_steps": args.logging_steps,
+        "dataloader_num_workers": args.dataloader_num_workers,
+        "dataloader_pin_memory": True,
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "push_to_hub": False,
+        "use_vllm": args.use_vllm,
         **grpo_kwargs,
-    )
+    }
+    supported_training_kwargs = _filter_supported_kwargs(GRPOConfig.__init__, training_kwargs)
+    dropped_training_kwargs = sorted(set(training_kwargs) - set(supported_training_kwargs))
+    if dropped_training_kwargs and int(os.environ.get("RANK", "0")) == 0:
+        print(f"[warn] dropping unsupported GRPOConfig kwargs: {', '.join(dropped_training_kwargs)}")
+    training_args = GRPOConfig(**supported_training_kwargs)
     print(f"[train] generation stop sequences: {args.stop_sequence if args.stop_sequence else 'none'}")
     print(
         f"[train] generation sampling: temperature={args.train_temperature}, "
