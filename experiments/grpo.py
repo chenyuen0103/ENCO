@@ -301,6 +301,8 @@ class CompactMetricsCallback(TrainerCallback):
         ("epoch", "epoch"),
         ("loss", "loss"),
         ("reward", "reward"),
+        ("reward_min", "reward_min"),
+        ("reward_max", "reward_max"),
     ]
 
     # Task-specific keys, detected from whichever key is present in logs
@@ -392,6 +394,67 @@ class RawMetricsCallback(TrainerCallback):
                     _wandb.log(wandb_payload, step=int(state.global_step))
             except Exception:
                 pass
+
+
+class RewardExtremaCallback(TrainerCallback):
+    """Inject per-step reward min/max statistics captured during rollout logging."""
+
+    def __init__(self, stats_ref: dict):
+        self.stats_ref = stats_ref
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = self.stats_ref.get("latest")
+        if not payload:
+            return
+
+        for key, value in payload.items():
+            logs[key] = value
+
+        try:
+            import wandb as _wandb
+            if _wandb.run is not None:
+                _wandb.log(payload, step=int(state.global_step))
+        except Exception:
+            pass
+
+
+class JsonMetricsCallback(TrainerCallback):
+    """Persist per-log training metrics as a JSON array (rewritten on each log)."""
+
+    def __init__(self, output_path: str):
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.history: list[dict] = []
+
+    @staticmethod
+    def _to_jsonable(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return JsonMetricsCallback._to_jsonable(value.item())
+            except Exception:
+                pass
+        return str(value)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = {
+            "global_step": int(state.global_step),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "time_unix": time.time(),
+        }
+        payload.update({k: self._to_jsonable(v) for k, v in logs.items()})
+        self.history.append(payload)
+        self.output_path.write_text(
+            json.dumps(self.history, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 class JsonlMetricsCallback(TrainerCallback):
@@ -700,8 +763,8 @@ def build_argparser():
         dest="cd_grpo_prefill_answer",
         action="store_true",
         help=(
-            "For cd_descendants training rollouts, prefill the assistant through the short think "
-            "trace and opening <answer>, so GRPO only generates the JSON payload and closing tag."
+            "For causal-discovery training rollouts, prefill the assistant through the short think "
+            "trace and opening <answer>, so GRPO only generates the answer payload and closing tag."
         ),
     )
     p.add_argument(
@@ -2230,8 +2293,8 @@ def run_train(args, argv: list[str] | None = None):
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
     else:
-        # Always prefill through <think> only; the model generates its own chain-of-thought.
-        rollout_prefill_answer = False
+        # Honor the rollout answer-prefill flag so GRPO can generate only the answer tail.
+        rollout_prefill_answer = bool(args.cd_grpo_prefill_answer)
         rollout_think_text = ""
         if args.cd_config_file and args.cd_train_csv:
             raise ValueError(
@@ -2317,9 +2380,6 @@ def run_train(args, argv: list[str] | None = None):
 
         train_dataset = raw_train.map(_truncate_cd_prompt)
         test_dataset = raw_test.map(_truncate_cd_prompt)
-        print(raw_train[0]["prompt"])
-        print(train_dataset[0]["prompt"])
-        # breakpoint()
         _print_prompt_diagnostics(train_dataset, split_name="train")
         _print_prompt_diagnostics(test_dataset, split_name="test")
         keep_cols = [
@@ -2518,6 +2578,7 @@ def run_train(args, argv: list[str] | None = None):
     pending_reward_rows = {}
     generation_log_decisions = {}
     train_state_snapshot = {"global_step": 0, "epoch": None}
+    reward_extrema_snapshot = {"latest": {}}
 
     if int(os.environ.get("LOCAL_RANK", "0")) == 0 and args.save_eval_responses:
         print(
@@ -2758,11 +2819,16 @@ def run_train(args, argv: list[str] | None = None):
             emit_keys = sorted(k for k in pending_reward_rows.keys() if k[0] == generation_id)
             sample_file = sample_log_path.open("a", encoding="utf-8") if decision.get("persist_sample") else None
             eval_file = eval_response_log_path.open("a", encoding="utf-8") if decision.get("persist_eval") else None
+            step_totals = []
+            step_reward_values = {}
             try:
                 for key in emit_keys:
                     row = pending_reward_rows.pop(key)
                     rewards_map = row.get("rewards", {})
                     row["reward_total"] = float(sum(float(v) for v in rewards_map.values()))
+                    step_totals.append(float(row["reward_total"]))
+                    for reward_key, reward_value in rewards_map.items():
+                        step_reward_values.setdefault(str(reward_key), []).append(float(reward_value))
                     if eval_file is not None:
                         eval_file.write(json.dumps(row, ensure_ascii=False) + "\n")
                     if sample_file is not None and row.get("_sampled_for_log"):
@@ -2790,6 +2856,16 @@ def run_train(args, argv: list[str] | None = None):
                             "reward_total": row["reward_total"],
                         }
                         sample_file.write(json.dumps(sample_row, ensure_ascii=False) + "\n")
+                payload = {}
+                if step_totals:
+                    payload["reward_min"] = min(step_totals)
+                    payload["reward_max"] = max(step_totals)
+                for reward_key, values in step_reward_values.items():
+                    if not values:
+                        continue
+                    payload[f"rewards/{reward_key}/min"] = min(values)
+                    payload[f"rewards/{reward_key}/max"] = max(values)
+                reward_extrema_snapshot["latest"] = payload
             finally:
                 if eval_file is not None:
                     eval_file.close()
@@ -2971,6 +3047,7 @@ def run_train(args, argv: list[str] | None = None):
                 edge_f1_scale=float(args.cd_edge_f1_reward_scale),
                 shd_scale=float(args.cd_low_shd_reward_scale),
             ),
+            RewardExtremaCallback(reward_extrema_snapshot),
             TrainStateSnapshotCallback(train_state_snapshot),
             SaveLaunchCommandCallback(argv),
         ]
@@ -2979,9 +3056,12 @@ def run_train(args, argv: list[str] | None = None):
             if args.train_log_jsonl
             else (logs_dir / "train_metrics.jsonl")
         )
+        metrics_json_path = metrics_jsonl_path.with_suffix(".json")
         metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
+        callbacks.append(JsonMetricsCallback(str(metrics_json_path)))
         print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
+        print(f"[train] JSON logging enabled: {metrics_json_path}")
 
         # Debug: verify the prompt the model actually sees (with special tokens)
         if int(os.environ.get("RANK", "0")) == 0:
