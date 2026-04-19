@@ -417,7 +417,15 @@ def _auto_adjust_vllm_gpu_mem_util(
         return float(requested_util), None
 
     min_free_ratio = min(free_ratios)
-    safe_util = max(0.01, min(0.98, min_free_ratio * 0.92))
+    safe_util = max(0.25, min(0.98, min_free_ratio * 0.92))
+    if min_free_ratio < 0.05:
+        message = (
+            f"[warn] very low currently free GPU memory detected (min free ratio={min_free_ratio:.3f}); "
+            f"keeping requested --vllm-gpu-mem-util={float(requested_util):.3f} because lower values can be "
+            f"too small to load model weights. GPU snapshot: "
+            + "; ".join(details)
+        )
+        return float(requested_util), message
     if float(requested_util) <= safe_util:
         return float(requested_util), None
 
@@ -427,6 +435,36 @@ def _auto_adjust_vllm_gpu_mem_util(
         + "; ".join(details)
     )
     return float(safe_util), message
+
+
+def _init_vllm_with_fallback(
+    llm_cls,
+    *,
+    base_kwargs: dict[str, Any],
+    auto_max_model_len: bool,
+) -> tuple[Any, dict[str, Any], Optional[str]]:
+    try:
+        return llm_cls(**base_kwargs), dict(base_kwargs), None
+    except Exception as first_exc:
+        if not auto_max_model_len:
+            raise
+
+        first_max_len = int(base_kwargs["max_model_len"])
+        retry_max_len = max(4096, min(16384, first_max_len // 2))
+        if retry_max_len >= first_max_len:
+            raise
+
+        retry_kwargs = dict(base_kwargs)
+        retry_kwargs["max_model_len"] = retry_max_len
+        try:
+            llm = llm_cls(**retry_kwargs)
+            message = (
+                f"[warn] initial vLLM init failed with max_model_len={first_max_len}; "
+                f"retrying succeeded with max_model_len={retry_max_len}."
+            )
+            return llm, retry_kwargs, message
+        except Exception:
+            raise first_exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -467,6 +505,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument(
+        "--vllm-auto-max-model-len-cap",
+        type=int,
+        default=16384,
+        help="Upper bound used only when --vllm-max-model-len is not explicitly set.",
+    )
     parser.add_argument("--vllm-gpu-mem-util", type=float, default=0.9)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -561,11 +605,18 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     prompts = [_make_generation_prompt(record) for record in sampled_records]
-    resolved_max_model_len = (
-        int(args.vllm_max_model_len)
-        if args.vllm_max_model_len is not None
-        else _infer_vllm_max_model_len(tokenizer, prompts, int(args.max_new_tokens))
-    )
+    if args.vllm_max_model_len is not None:
+        resolved_max_model_len = int(args.vllm_max_model_len)
+    else:
+        inferred_max_model_len = _infer_vllm_max_model_len(tokenizer, prompts, int(args.max_new_tokens))
+        auto_cap = max(1024, int(args.vllm_auto_max_model_len_cap))
+        resolved_max_model_len = min(int(inferred_max_model_len), auto_cap)
+        if resolved_max_model_len < int(inferred_max_model_len):
+            print(
+                f"[warn] inferred max_model_len={inferred_max_model_len} exceeds "
+                f"--vllm-auto-max-model-len-cap={auto_cap}; using capped value {resolved_max_model_len}",
+                flush=True,
+            )
     resolved_gpu_mem_util, gpu_mem_message = _auto_adjust_vllm_gpu_mem_util(
         float(args.vllm_gpu_mem_util),
         int(args.tensor_parallel_size),
@@ -588,14 +639,26 @@ def main() -> None:
         "max_model_len": int(resolved_max_model_len),
     }
     try:
-        llm = LLM(**llm_kwargs)
+        llm, used_llm_kwargs, retry_message = _init_vllm_with_fallback(
+            LLM,
+            base_kwargs=llm_kwargs,
+            auto_max_model_len=args.vllm_max_model_len is None,
+        )
+        if retry_message:
+            print(retry_message, flush=True)
     except Exception as exc:
         raise RuntimeError(
             "Failed to initialize vLLM. Try lowering --vllm-gpu-mem-util, "
             "reducing --max-new-tokens, or explicitly setting --vllm-max-model-len. "
             f"Resolved settings were max_model_len={resolved_max_model_len}, "
-            f"gpu_memory_utilization={resolved_gpu_mem_util:.3f}."
+            f"gpu_memory_utilization={resolved_gpu_mem_util:.3f}. "
+            "Also ensure enough free VRAM (for example, check nvidia-smi)."
         ) from exc
+    print(
+        f"[info] vLLM initialized with max_model_len={int(used_llm_kwargs['max_model_len'])} "
+        f"and gpu_memory_utilization={float(used_llm_kwargs['gpu_memory_utilization']):.3f}",
+        flush=True,
+    )
     sampling_params = SamplingParams(
         n=int(args.rollouts),
         temperature=float(args.temperature),
