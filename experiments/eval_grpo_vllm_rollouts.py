@@ -20,6 +20,16 @@ from typing import Any, Optional
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 os.environ.setdefault("ENCO_PATCH_VLLM_TQDM", "1")
+os.environ.setdefault("ENCO_PATCH_VLLM_TOKENIZER", "1")
+_repo_root = _HERE.parent
+_py_path_parts = [
+    str(_HERE),
+    str(_repo_root),
+]
+_existing_pythonpath = str(os.environ.get("PYTHONPATH") or "")
+if _existing_pythonpath:
+    _py_path_parts.append(_existing_pythonpath)
+os.environ["PYTHONPATH"] = os.pathsep.join(_py_path_parts)
 
 from verifier_cd import (
     build_cd_acyclic_reward,
@@ -372,6 +382,54 @@ def _summarize_results(
     return summary
 
 
+def _build_grouped_rollout_records(
+    sampled_records: list[dict[str, Any]],
+    rollout_outputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped_records: list[dict[str, Any]] = []
+    rollouts_by_sample: dict[int, list[dict[str, Any]]] = {}
+    for item in rollout_outputs:
+        rollouts_by_sample.setdefault(int(item["sample_idx"]), []).append(item)
+
+    meta_keys = [
+        "source_csv",
+        "source_name",
+        "row_index",
+        "dataset",
+        "bif_file",
+        "prompt_style",
+        "anonymize",
+        "obs_per_prompt",
+        "int_per_combo",
+        "data_idx",
+        "shuffle_idx",
+    ]
+
+    for sample_idx, record in enumerate(sampled_records):
+        grouped_rollouts = sorted(
+            rollouts_by_sample.get(sample_idx, []),
+            key=lambda item: int(item["rollout_idx"]),
+        )
+        grouped_record: dict[str, Any] = {
+            "sample_idx": sample_idx,
+            "prompt": record["prompt"],
+            "answer": record["answer"],
+            "num_completions": len(grouped_rollouts),
+        }
+        for key in meta_keys:
+            grouped_record[key] = record.get(key, "")
+
+        for rollout_idx, rollout in enumerate(grouped_rollouts):
+            grouped_record[f"completion_{rollout_idx}"] = rollout["completion"]
+            grouped_record[f"score_meta_{rollout_idx}"] = rollout["score_meta"]
+            grouped_record[f"rewards_{rollout_idx}"] = rollout.get("rewards", {})
+            grouped_record[f"reward_total_{rollout_idx}"] = rollout.get("reward_total", 0.0)
+
+        grouped_records.append(grouped_record)
+
+    return grouped_records
+
+
 def _get_tokenizer_declared_max_length(tokenizer) -> Optional[int]:
     raw_value = getattr(tokenizer, "model_max_length", None)
     try:
@@ -620,7 +678,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-prompts",
         action="store_true",
-        help="Include the full prompt text in each rollout record.",
+        help="Include the full prompt text in flat per-rollout output records.",
+    )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help="Write one JSONL row per rollout instead of the default grouped-by-prompt format.",
     )
 
     # Reward defaults match grpo.py.
@@ -787,9 +850,8 @@ def main() -> None:
         record = sampled_records[sample_idx]
         outputs = sorted(request_output.outputs, key=lambda item: item.index)
         for rollout_idx, completion_output in enumerate(outputs):
-            completion_tail = str(completion_output.text)
-            full_completion = f"{str(record['prompt'])}{completion_tail}"
-            score_meta = _score_completion(task, completion_tail, record["answer"], args)
+            completion = str(completion_output.text)
+            score_meta = _score_completion(task, completion, record["answer"], args)
             rollout_record: dict[str, Any] = {
                 "sample_idx": sample_idx,
                 "rollout_idx": rollout_idx,
@@ -804,9 +866,7 @@ def main() -> None:
                 "int_per_combo": record.get("int_per_combo", ""),
                 "data_idx": record.get("data_idx", ""),
                 "shuffle_idx": record.get("shuffle_idx", ""),
-                "completion_tail": completion_tail,
-                "completion": completion_tail,
-                "full_completion": full_completion,
+                "completion": completion,
                 "answer": record["answer"],
                 "score_meta": score_meta,
             }
@@ -838,15 +898,24 @@ def main() -> None:
         "generation_seconds": round(generation_seconds, 4),
         "output_jsonl": str(args.output_jsonl),
         "summary_json": str(args.summary_json),
+        "output_format": "flat_per_rollout" if bool(args.flat_output) else "grouped_by_prompt",
         "aggregate": _summarize_results(rollout_outputs, reward_names),
     }
 
+    output_records = rollout_outputs if bool(args.flat_output) else _build_grouped_rollout_records(
+        sampled_records,
+        rollout_outputs,
+    )
     with args.output_jsonl.open("w", encoding="utf-8") as handle:
-        for item in rollout_outputs:
+        for item in output_records:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     args.summary_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    print(f"[done] wrote {len(rollout_outputs)} rollout rows to {args.output_jsonl}", flush=True)
+    print(
+        f"[done] wrote {len(output_records)} JSONL rows to {args.output_jsonl}"
+        f" ({summary['output_format']})",
+        flush=True,
+    )
     print(
         f"[done] mean reward_total={summary['aggregate']['reward_total_mean']:.4f}"
         f" | min={summary['aggregate']['reward_total_min']:.4f}"

@@ -70,7 +70,7 @@ from cd_training_format import ensure_assistant_think_prefill, validate_sft_exam
 from generate_staged_sft_data import (  # noqa: E402
     _load_adj,
     _extract_variables,
-    build_staged_think,
+    build_evidence_grounded_sections,
 )
 from generate_prompts import iter_prompts_in_memory  # noqa: E402
 
@@ -133,7 +133,12 @@ def _build_record(
         variables = [f"X{k+1}" for k in range(n)]
 
     try:
-        think_text = build_staged_think(adj, variables)
+        stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
+            prompt_raw,
+            adj,
+            variables,
+        )
+        think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
     except ValueError:
         return None
 
@@ -147,11 +152,17 @@ def _build_record(
     if issues:
         return None
 
+    row_graph_name = _resolve_graph_name_from_row(row, fallback=graph_name)
+
     return {
         "prompt": prompt,
         "answer": completion,
+        "gold_think": think_text,
+        "gold_stage1": stage1_text,
+        "gold_stage2": stage2_text,
+        "gold_stage3": stage3_text,
         "source": source_name,
-        "graph": graph_name,
+        "graph": row_graph_name,
     }
 
 
@@ -176,6 +187,23 @@ def _resolve_variables_for_record(
         return [str(v) for v in fallback_variables]
 
     return [f"X{k+1}" for k in range(n)]
+
+
+def _resolve_graph_name_from_row(row: dict, *, fallback: str) -> str:
+    """Prefer row-level graph metadata over file-level source naming."""
+    dataset = (row.get("dataset") or "").strip()
+    if dataset:
+        return dataset
+
+    graph = (row.get("graph") or "").strip()
+    if graph:
+        return graph
+
+    bif_file = (row.get("bif_file") or "").strip()
+    if bif_file:
+        return Path(bif_file).stem
+
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +275,12 @@ def _build_records_in_memory(
             )
 
             try:
-                think_text = build_staged_think(adj, variables)
+                stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
+                    prompt_raw,
+                    adj,
+                    variables,
+                )
+                think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
             except ValueError:
                 continue
 
@@ -263,6 +296,10 @@ def _build_records_in_memory(
             records.append({
                 "prompt": prompt,
                 "answer": completion,
+                "gold_think": think_text,
+                "gold_stage1": stage1_text,
+                "gold_stage2": stage2_text,
+                "gold_stage3": stage3_text,
                 "source": source_tag,
                 "graph": graph_name,
             })
@@ -537,6 +574,7 @@ def _build_records_perm_csv(
             continue
 
         row_var_names = _extract_varnames_from_prompt(prompt_raw) or var_names_0
+        row_graph_name = _resolve_graph_name_from_row(row, fallback=graph_name)
         row_seen: set = set()
 
         for perm in perms:
@@ -555,15 +593,19 @@ def _build_records_perm_csv(
                 skipped += 1
                 continue
 
-            try:
-                think_text = build_staged_think(adj_perm, new_var_names)
-            except ValueError:
-                skipped += 1
-                continue
-
             prompt_final = ensure_assistant_think_prefill(
                 update_prompt_to_current_format(prompt_perm)
             )
+            try:
+                stage1_text, stage2_text, stage3_text = build_evidence_grounded_sections(
+                    prompt_perm,
+                    adj_perm,
+                    new_var_names,
+                )
+                think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
+            except ValueError:
+                skipped += 1
+                continue
             completion = (
                 f"{think_text}</think>"
                 f"<answer>{json.dumps({'adjacency_matrix': adj_perm}, ensure_ascii=False)}</answer>"
@@ -577,8 +619,12 @@ def _build_records_perm_csv(
             records.append({
                 "prompt": prompt_final,
                 "answer": completion,
+                "gold_think": think_text,
+                "gold_stage1": stage1_text,
+                "gold_stage2": stage2_text,
+                "gold_stage3": stage3_text,
                 "source": source_name,
-                "graph": graph_name,
+                "graph": row_graph_name,
                 "perm": perm,
             })
             built += 1
