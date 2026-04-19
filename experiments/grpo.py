@@ -13,11 +13,12 @@ import io
 import inspect
 import shlex
 import warnings
+from typing import Any
 from contextlib import redirect_stdout, redirect_stderr
 import torch
 from pathlib import Path
 from tqdm.auto import tqdm
-from urllib import request, error
+from urllib import request
 from urllib.parse import urlparse
 
 try:
@@ -186,6 +187,27 @@ def _load_graph_num_nodes(graph_path: str) -> int | None:
 
 def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
+
+
+def _probe_trl_vllm_server(base_url: str, timeout: float) -> tuple[bool, str]:
+    base = base_url.rstrip("/")
+    probes = (
+        ("health", f"{base}/health/", None),
+        ("world_size", f"{base}/get_world_size/", "world_size"),
+    )
+    for probe_name, url, required_key in probes:
+        try:
+            with request.urlopen(url, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                body = resp.read()
+            if required_key is not None:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if required_key not in payload:
+                    raise RuntimeError(f"missing JSON key {required_key!r}")
+        except Exception as e:
+            return False, f"{probe_name} probe failed for {url}: {e}"
+    return True, ""
 
 
 def _to_jsonable_config(value):
@@ -576,7 +598,7 @@ def build_argparser():
     p.add_argument("--output_dir", type=str, default="Qwen2-0.5B-GRPO-vLLM-server")
 
     # Prompt / generation
-    p.add_argument("--max_prompt_tokens", type=int, default=256000)
+    p.add_argument("--max_prompt_tokens", type=int, default=4096)
     p.add_argument("--max_completion_length", type=int, default=8192)
     p.add_argument(
         "--train_temperature",
@@ -910,6 +932,21 @@ def build_argparser():
         help="Max model length for auto-launched vLLM server (<=0 lets vLLM pick a default).",
     )
     p.add_argument("--vllm_server_log_file", type=str, default="vllm_server.log")
+    p.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.3,
+        help="GPU memory utilization for colocated vLLM (only applies with --vllm-mode colocate).",
+    )
+    p.add_argument(
+        "--vllm_max_model_length",
+        type=int,
+        default=None,
+        help=(
+            "Context window for colocated vLLM. Defaults to "
+            "--max_prompt_tokens + --max_completion_length."
+        ),
+    )
 
     # Logging
     p.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])
@@ -2025,7 +2062,7 @@ def _build_trl_vllm_serve_cmd(args, host: str, port: int):
         str(args.vllm_server_gpu_memory_utilization),
     ]
     # <=0 is treated as "unset" so vLLM can choose a safe default.
-    if args.vllm_server_max_model_len > 0:
+    if args.vllm_server_max_model_len is not None and args.vllm_server_max_model_len > 0:
         cmd.extend(["--max-model-len", str(args.vllm_server_max_model_len)])
     return cmd
 
@@ -2133,17 +2170,58 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
 
 def run_train(args, argv: list[str] | None = None):
     argv = list(argv or [])
+    args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
+    explicit_use_vllm = _argv_has_flag(argv, "--use-vllm")
+    explicit_no_use_vllm = _argv_has_flag(argv, "--no-use-vllm")
+
+    # if args.use_vllm and args.vllm_mode == "server":
+    #     timeout_s = min(max(float(args.vllm_server_timeout), 1.0), 10.0)
+    #     server_ok, server_error = _probe_trl_vllm_server(args.vllm_server_base_url, timeout=timeout_s)
+    #     if not server_ok:
+    #         if not explicit_use_vllm and not explicit_no_use_vllm:
+    #             args.use_vllm = False
+    #             if int(os.environ.get("RANK", "0")) == 0:
+    #                 print(
+    #                     "[warn] no reachable TRL vLLM server at "
+    #                     f"{args.vllm_server_base_url}; defaulting to Transformers generation "
+    #                     "because neither --use-vllm nor --no-use-vllm was passed. "
+    #                     f"Probe error: {server_error}"
+    #                 )
+    #         else:
+    #             raise RuntimeError(
+    #                 f"Could not reach a TRL vLLM server at {args.vllm_server_base_url}. "
+    #                 "Start TRL's server (`trl vllm-serve`) or rerun with --no-use-vllm "
+    #                 "to use Transformers generation directly. "
+    #                 f"Probe error: {server_error}"
+    #             )
+
     GRPOConfig, GRPOTrainer = _import_trl_grpo(use_vllm=bool(args.use_vllm))
     _patch_ddp_config_attr()
     _suppress_transformers_attn_mask_warning_bug()
 
-    args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
     if args.max_prompt_tokens <= 0:
         args.max_prompt_tokens = 2048
         print("[warn] max_prompt_tokens <= 0; using safer default 2048.")
     if args.max_completion_length <= 0:
         args.max_completion_length = 512
         print("[warn] max_completion_length <= 0; using safer default 512.")
+    if args.use_vllm and args.vllm_mode == "colocate":
+        if not (0 < float(args.vllm_gpu_memory_utilization) <= 1.0):
+            raise ValueError("--vllm_gpu_memory_utilization must be in (0, 1].")
+        target_vllm_max_model_length = int(args.max_prompt_tokens) + int(args.max_completion_length)
+        if args.vllm_max_model_length is None or args.vllm_max_model_length <= 0:
+            args.vllm_max_model_length = target_vllm_max_model_length
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "[train] auto-set colocated vLLM max model length to "
+                    f"{args.vllm_max_model_length} "
+                    "(max_prompt_tokens + max_completion_length)."
+                )
+        elif args.vllm_max_model_length < target_vllm_max_model_length and int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "[warn] colocated vLLM max model length is smaller than "
+                "max_prompt_tokens + max_completion_length; long prompts or completions may be truncated."
+            )
     if args.train_temperature < 0:
         raise ValueError("--train_temperature must be >= 0.")
     if not (0 < args.train_top_p <= 1.0):
@@ -2159,19 +2237,6 @@ def run_train(args, argv: list[str] | None = None):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-
-    # if args.use_vllm and args.vllm_mode == "server":
-    #     # Fail fast if the configured vLLM endpoint is unreachable.
-    #     health_url = f"{args.vllm_server_base_url}/health"
-    #     try:
-    #         with request.urlopen(health_url, timeout=10) as resp:
-    #             if resp.status >= 400:
-    #                 raise RuntimeError(f"HTTP {resp.status} from {health_url}")
-    #     except (error.URLError, RuntimeError) as e:
-    #         raise RuntimeError(
-    #             f"Could not reach vLLM server at {health_url}. "
-    #             "Start the server first or set --vllm_server_base_url / VLLM_SERVER_BASE_URL."
-    #         ) from e
 
     def _json_get(url, timeout=5.0):
         with request.urlopen(url, timeout=timeout) as resp:
@@ -2969,6 +3034,13 @@ def run_train(args, argv: list[str] | None = None):
                 {
                     "vllm_server_base_url": args.vllm_server_base_url,
                     "vllm_server_timeout": args.vllm_server_timeout,
+                }
+            )
+        elif args.vllm_mode == "colocate":
+            grpo_kwargs.update(
+                {
+                    "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+                    "vllm_max_model_length": args.vllm_max_model_length,
                 }
             )
 
