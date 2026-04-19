@@ -802,7 +802,7 @@ def build_argparser():
         dest="cd_grpo_prefill_answer",
         action="store_false",
     )
-    p.set_defaults(cd_grpo_prefill_answer=True)
+    p.set_defaults(cd_grpo_prefill_answer=False)
     p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
     p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
     p.add_argument(
@@ -2173,6 +2173,22 @@ def run_train(args, argv: list[str] | None = None):
     args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
     explicit_use_vllm = _argv_has_flag(argv, "--use-vllm")
     explicit_no_use_vllm = _argv_has_flag(argv, "--no-use-vllm")
+    startup_t0 = time.perf_counter()
+    startup_last_t = startup_t0
+
+    def _log_startup_timing(stage: str) -> None:
+        nonlocal startup_last_t
+        now = time.perf_counter()
+        delta_s = now - startup_last_t
+        total_s = now - startup_t0
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        print(
+            f"[startup][rank={rank} local_rank={local_rank}] {stage}: "
+            f"+{delta_s:.2f}s (total {total_s:.2f}s)",
+            flush=True,
+        )
+        startup_last_t = now
 
     # if args.use_vllm and args.vllm_mode == "server":
     #     timeout_s = min(max(float(args.vllm_server_timeout), 1.0), 10.0)
@@ -2198,6 +2214,7 @@ def run_train(args, argv: list[str] | None = None):
     GRPOConfig, GRPOTrainer = _import_trl_grpo(use_vllm=bool(args.use_vllm))
     _patch_ddp_config_attr()
     _suppress_transformers_attn_mask_warning_bug()
+    _log_startup_timing("TRL import and startup checks")
 
     if args.max_prompt_tokens <= 0:
         args.max_prompt_tokens = 2048
@@ -2231,6 +2248,26 @@ def run_train(args, argv: list[str] | None = None):
     if not args.stop_sequence:
         args.stop_sequence = ["</answer>"]
     args.stop_sequence = [s for s in args.stop_sequence if isinstance(s, str) and s]
+
+    if args.task == "causal_discovery" and args.cd_grpo_prefill_answer:
+        staged_reward_scales = {
+            "cd-cot-structure": float(args.cd_cot_structure_reward_scale),
+            "cd-skeleton-f1": float(args.cd_skeleton_f1_reward_scale),
+            "cd-vstruct-f1": float(args.cd_vstruct_f1_reward_scale),
+            "cd-orientation-f1": float(args.cd_orientation_f1_reward_scale),
+        }
+        enabled_staged_rewards = [
+            name for name, scale in staged_reward_scales.items() if scale > 0.0
+        ]
+        if enabled_staged_rewards:
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "[warn] --cd-grpo-prefill-answer is incompatible with staged "
+                    "causal-discovery rewards because the model does not generate "
+                    "Stage 1/2/3 text in that mode. Falling back to assistant "
+                    f"<think> prefill. Enabled staged rewards: {', '.join(enabled_staged_rewards)}"
+                )
+            args.cd_grpo_prefill_answer = False
 
     # Throughput-oriented defaults for Ampere/Hopper GPUs.
     if torch.cuda.is_available():
@@ -2330,12 +2367,14 @@ def run_train(args, argv: list[str] | None = None):
         import wandb  # noqa: F401
         import trl.extras.profiling as trl_profiling
         trl_profiling.wandb = __import__("wandb")
+    _log_startup_timing("W&B setup")
 
     # ---- Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    _log_startup_timing("Tokenizer load")
 
     # ---- Dataset
     if args.task == "math":
@@ -2465,6 +2504,7 @@ def run_train(args, argv: list[str] | None = None):
         ]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
+    _log_startup_timing("Dataset load and preprocessing")
 
     # Debug: verify tokenized prompt before model load (fast, no GPU needed)
     if int(os.environ.get("RANK", "0")) == 0:
@@ -2532,6 +2572,7 @@ def run_train(args, argv: list[str] | None = None):
             args.model_id,
             **model_load_kwargs,
         )
+    _log_startup_timing("Model load")
     _apply_explicit_generation_config(
         model,
         max_prompt_tokens=args.max_prompt_tokens,
@@ -2561,6 +2602,7 @@ def run_train(args, argv: list[str] | None = None):
             print(
                 f"[train] dtype normalization -> {cast_dtype}: converted={casted}, skipped={skipped_cast}"
             )
+    _log_startup_timing("LoRA/adapters and dtype normalization")
 
     _wrap_generate_with_eval_mode(
         model,
@@ -3156,6 +3198,7 @@ def run_train(args, argv: list[str] | None = None):
             train_dataset=train_dataset,
             callbacks=callbacks,
         )
+        _log_startup_timing("GRPOTrainer construction")
         # breakpoint()
         trainer.remove_callback(PrinterCallback)
     except RuntimeError as e:
