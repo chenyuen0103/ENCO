@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 import inspect
+import importlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +104,43 @@ def _derive_non_quantized_model_id(model_name: str) -> str:
     return candidate or name
 
 
+def _import_trl_sft() -> tuple[Any, Any]:
+    """
+    Import TRL SFT classes without letting TRL's vLLM compatibility shim fire.
+
+    SFT in this script does not use vLLM, but recent TRL builds still probe the
+    installed vLLM package during import and emit noisy compatibility warnings.
+    Hiding vLLM for this import keeps the SFT path decoupled from local vLLM
+    versions and avoids repeated per-rank warnings.
+    """
+    from transformers.utils import import_utils as tf_import_utils
+
+    orig_is_pkg_available = tf_import_utils._is_package_available
+
+    def _patched_is_package_available(package_name: str, *args: Any, **kwargs: Any) -> Any:
+        return_version = kwargs.get("return_version", args[0] if args else False)
+        if package_name in {"vllm", "vllm_ascend"}:
+            return (False, "0.0.0") if return_version else False
+        return orig_is_pkg_available(package_name, *args, **kwargs)
+
+    tf_import_utils._is_package_available = _patched_is_package_available
+    try:
+        if "trl" in sys.modules:
+            stale = [name for name in sys.modules if name == "trl" or name.startswith("trl.")]
+            for name in stale:
+                sys.modules.pop(name, None)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"TRL currently only supports vLLM version `0\.10\.2`.*",
+                category=UserWarning,
+            )
+            trl = importlib.import_module("trl")
+        return trl.SFTConfig, trl.SFTTrainer
+    finally:
+        tf_import_utils._is_package_available = orig_is_pkg_available
+
+
 def _build_format_check_prompt(
     prompt_text: str,
     *,
@@ -156,6 +195,79 @@ def _resolve_train_log_path(sft_output_dir: Path, train_log_jsonl: Path | None) 
         out = Path(sft_output_dir) / "train_metrics.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _validate_sft_jsonl(path: Path, *, allow_legacy_text: bool = False, sample_limit: int = 8) -> dict[str, Any]:
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"SFT JSONL not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"SFT JSONL is not a file: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(
+            f"SFT JSONL is empty: {path}. "
+            "Regenerate it before training; for staged CD data use generate_staged_sft_data.py "
+            "or collect_format_sft_data.py."
+        )
+
+    total = 0
+    prompt_answer_rows = 0
+    text_rows = 0
+    sample_keys: set[str] = set()
+    sample_issues: list[str] = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s:
+                continue
+            total += 1
+            try:
+                row = json.loads(s)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"SFT JSONL has invalid JSON on line {lineno}: {exc.msg}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"SFT JSONL line {lineno} must decode to an object, got {type(row).__name__}")
+
+            sample_keys.update(str(k) for k in row.keys())
+            has_prompt_answer = "prompt" in row and "answer" in row
+            has_text = isinstance(row.get("text"), str) and bool(str(row.get("text") or "").strip())
+            if has_prompt_answer:
+                prompt_answer_rows += 1
+                if len(sample_issues) < sample_limit:
+                    issues = validate_sft_example(str(row.get("prompt") or ""), str(row.get("answer") or ""))
+                    if issues:
+                        sample_issues.append(f"line {lineno}: {'; '.join(issues)}")
+            if has_text:
+                text_rows += 1
+
+    if total == 0:
+        raise ValueError(
+            f"SFT JSONL has no non-empty records: {path}. "
+            "Regenerate it before training."
+        )
+    if sample_issues:
+        raise ValueError(
+            f"SFT JSONL sample validation failed for {path}:\n- " + "\n- ".join(sample_issues)
+        )
+    if allow_legacy_text:
+        if prompt_answer_rows == 0 and text_rows == 0:
+            raise ValueError(
+                f"SFT JSONL must contain either 'prompt'+'answer' or legacy 'text' rows; "
+                f"observed keys: {sorted(sample_keys)}"
+            )
+    elif prompt_answer_rows == 0:
+        raise ValueError(
+            f"SFT JSONL must contain 'prompt' and 'answer' columns; observed keys: {sorted(sample_keys)}. "
+            "Use generate_staged_sft_data.py to produce a compatible JSONL."
+        )
+
+    return {
+        "rows": total,
+        "prompt_answer_rows": prompt_answer_rows,
+        "text_rows": text_rows,
+        "keys": sorted(sample_keys),
+    }
 
 
 def _build_jsonl_metrics_callback(output_path: Path):
@@ -298,7 +410,7 @@ def _run_sft_unsloth(
     )
     print(f"[sft/unsloth] rows={len(tokenized_ds)} supervised_tokens_total={supervised_total}")
 
-    from trl import SFTTrainer, SFTConfig
+    SFTConfig, SFTTrainer = _import_trl_sft()
     metrics_jsonl_path = _resolve_train_log_path(sft_output_dir, train_log_jsonl)
     print(f"[sft/unsloth] JSONL logging enabled: {metrics_jsonl_path}")
     cfg = SFTConfig(
@@ -363,6 +475,12 @@ def run_sft(
     wandb_project: str | None = None,
     wandb_run_name: str | None = None,
 ) -> None:
+    sft_summary = _validate_sft_jsonl(sft_jsonl)
+    print(
+        f"[sft] validated dataset: rows={sft_summary['rows']} "
+        f"prompt_answer_rows={sft_summary['prompt_answer_rows']} path={Path(sft_jsonl).resolve()}"
+    )
+
     if use_unsloth:
         _run_sft_unsloth(
             base_model=base_model,
@@ -406,8 +524,6 @@ def run_sft(
         "dtype": load_dtype,
         "attn_implementation": "sdpa",
     }
-    if distributed_world_size == 1:
-        model_load_kwargs["device_map"] = "auto"
 
     if is_adapter:
         if distributed_world_size > 1:
@@ -645,6 +761,35 @@ def run_grpo(
     subprocess.run(cmd, env=child_env, check=True)
 
 
+def merge_sft_adapter(
+    *,
+    sft_model_dir: Path,
+    merged_output_dir: Path,
+) -> Path:
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoTokenizer
+
+    sft_model_dir = Path(sft_model_dir).resolve()
+    merged_output_dir = Path(merged_output_dir).resolve()
+
+    if not (sft_model_dir / "adapter_config.json").exists():
+        raise ValueError(f"{sft_model_dir} is not a PEFT adapter directory (missing adapter_config.json)")
+
+    print(f"[merge] loading adapter from {sft_model_dir}")
+    model = AutoPeftModelForCausalLM.from_pretrained(
+        str(sft_model_dir),
+        torch_dtype="auto",
+    )
+    merged = model.merge_and_unload()
+    tokenizer = AutoTokenizer.from_pretrained(str(sft_model_dir), use_fast=True)
+
+    merged_output_dir.mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(str(merged_output_dir))
+    tokenizer.save_pretrained(str(merged_output_dir))
+    print(f"[merge] saved merged model -> {merged_output_dir}")
+    return merged_output_dir
+
+
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 
 
@@ -831,7 +976,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--python-exe", default=sys.executable)
     ap.add_argument(
         "--cuda-visible-devices",
-        default="0,1",
+        default="0",
         help="CUDA_VISIBLE_DEVICES for GPU stages (default: 0,1).",
     )
 
@@ -920,6 +1065,27 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Extra args passed through to GRPO script.",
     )
+    ap.add_argument(
+        "--merge-after-sft",
+        action="store_true",
+        help="After SFT finishes, merge the LoRA adapter into a full model checkpoint.",
+    )
+    ap.add_argument(
+        "--no-merge-after-sft",
+        dest="merge_after_sft",
+        action="store_false",
+        help="Do not merge the LoRA adapter into a full model checkpoint after SFT.",
+    )
+    ap.add_argument(
+        "--merged-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output dir for the merged full model checkpoint. "
+            "Defaults to <sft_output_dir>_merged when --merge-after-sft is set."
+        ),
+    )
+    ap.set_defaults(merge_after_sft=True)
     return ap.parse_args()
 
 
@@ -941,7 +1107,15 @@ def main() -> None:
         already_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
         if not already_distributed:
             prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+            requested_cvd = str(args.cuda_visible_devices)
+            if prev_cvd:
+                if prev_cvd != requested_cvd:
+                    print(
+                        f"[sft] respecting existing CUDA_VISIBLE_DEVICES={prev_cvd!r}; "
+                        f"ignoring script default {requested_cvd!r}"
+                    )
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = requested_cvd
         try:
             run_sft(
                 base_model=args.base_model,
@@ -970,6 +1144,16 @@ def main() -> None:
                 else:
                     os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
         print(f"[sft] saved -> {args.sft_output_dir}")
+        if args.merge_after_sft:
+            merged_output_dir = (
+                Path(args.merged_output_dir).resolve()
+                if args.merged_output_dir is not None
+                else Path(str(args.sft_output_dir) + "_merged").resolve()
+            )
+            merge_sft_adapter(
+                sft_model_dir=Path(args.sft_output_dir).resolve(),
+                merged_output_dir=merged_output_dir,
+            )
         if args.stage == "sft":
             return
 

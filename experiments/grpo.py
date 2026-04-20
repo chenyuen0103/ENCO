@@ -10,14 +10,15 @@ import sys
 import subprocess
 import csv
 import io
-import importlib
 import inspect
 import shlex
+import warnings
+from typing import Any
 from contextlib import redirect_stdout, redirect_stderr
 import torch
 from pathlib import Path
 from tqdm.auto import tqdm
-from urllib import request, error
+from urllib import request
 from urllib.parse import urlparse
 
 try:
@@ -92,23 +93,72 @@ FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 
 
-def _import_trl_grpo():
-    try:
-        from trl import GRPOConfig, GRPOTrainer
-        return GRPOConfig, GRPOTrainer
-    except Exception as e:
-        msg = str(e)
-        # Some TRL installs try to initialize vLLM during import and fail on
-        # systems where NVML/CUDA visibility is unstable. Retry with vLLM disabled.
-        if not any(token in msg for token in ("GuidedDecodingParams", "vllm", "NVMLError", "NVML")):
-            raise
-        try:
-            trl_import_utils = importlib.import_module("trl.import_utils")
-            setattr(trl_import_utils, "_vllm_available", False)
+def _import_trl_grpo(*, use_vllm: bool = True):
+    from transformers.utils import import_utils as tf_import_utils
+
+    orig_is_pkg_available = tf_import_utils._is_package_available
+
+    def _make_is_pkg_available(disable_vllm_probe: bool):
+        def _patched_is_package_available(package_name: str, *args, **kwargs):
+            return_version = kwargs.get("return_version", args[0] if args else False)
+            if disable_vllm_probe and package_name in {"vllm", "vllm_ascend"}:
+                return (False, "0.0.0") if return_version else False
+            return orig_is_pkg_available(package_name, *args, **kwargs)
+
+        return _patched_is_package_available
+
+    def _patched_is_package_available(package_name: str, *args, **kwargs):
+        return_version = kwargs.get("return_version", args[0] if args else False)
+        if not use_vllm and package_name in {"vllm", "vllm_ascend"}:
+            return (False, "0.0.0") if return_version else False
+        return orig_is_pkg_available(package_name, *args, **kwargs)
+
+    def _clear_trl_modules() -> None:
+        stale = [name for name in sys.modules if name == "trl" or name.startswith("trl.")]
+        for name in stale:
+            sys.modules.pop(name, None)
+
+    def _do_import():
+        with warnings.catch_warnings():
+            # TRL checks vLLM support during import and emits the same advisory on
+            # every torchrun worker. Keep it visible on rank 0 only.
+            if str(os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0") not in {"0", ""}:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"TRL currently only supports vLLM version `0\.10\.2`.*",
+                    category=UserWarning,
+                )
             from trl import GRPOConfig, GRPOTrainer
-            return GRPOConfig, GRPOTrainer
-        except Exception:
-            raise e
+
+        return GRPOConfig, GRPOTrainer
+
+    tf_import_utils._is_package_available = _patched_is_package_available
+    try:
+        _clear_trl_modules()
+        try:
+            return _do_import()
+        except Exception as e:
+            msg = str(e)
+            # Some TRL installs try to initialize vLLM during import and fail on
+            # systems where NVML/CUDA visibility is unstable. Retry with vLLM disabled.
+            if not any(token in msg for token in ("GuidedDecodingParams", "vllm", "NVMLError", "NVML")):
+                raise
+            tf_import_utils._is_package_available = _make_is_pkg_available(True)
+            try:
+                _clear_trl_modules()
+                return _do_import()
+            except Exception:
+                raise e
+    finally:
+        tf_import_utils._is_package_available = orig_is_pkg_available
+
+
+def _filter_supported_kwargs(callable_obj, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        params = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _load_graph_num_nodes(graph_path: str) -> int | None:
@@ -137,6 +187,56 @@ def _load_graph_num_nodes(graph_path: str) -> int | None:
 
 def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
+
+
+def _resolve_model_reference_for_attention(args) -> str:
+    if getattr(args, "base_model_override", None):
+        return str(args.base_model_override)
+
+    model_id = str(getattr(args, "model_id", "") or "")
+    adapter_cfg_path = Path(model_id) / "adapter_config.json"
+    if adapter_cfg_path.exists():
+        try:
+            adapter_cfg = json.loads(adapter_cfg_path.read_text(encoding="utf-8"))
+            base_model_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            if base_model_name:
+                return base_model_name
+        except Exception:
+            pass
+    return model_id
+
+
+def _resolve_attn_implementation(args) -> str:
+    requested = str(getattr(args, "attn_implementation", "auto") or "auto").strip().lower()
+    if requested != "auto":
+        return requested
+
+    model_ref = _resolve_model_reference_for_attention(args).lower()
+    # Qwen3 has been unreliable with Flash Attention 2 under GRPO's masked/varlen batches.
+    if "qwen3" in model_ref:
+        return "sdpa"
+    return "flash_attention_2"
+
+
+def _probe_trl_vllm_server(base_url: str, timeout: float) -> tuple[bool, str]:
+    base = base_url.rstrip("/")
+    probes = (
+        ("health", f"{base}/health/", None),
+        ("world_size", f"{base}/get_world_size/", "world_size"),
+    )
+    for probe_name, url, required_key in probes:
+        try:
+            with request.urlopen(url, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                body = resp.read()
+            if required_key is not None:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if required_key not in payload:
+                    raise RuntimeError(f"missing JSON key {required_key!r}")
+        except Exception as e:
+            return False, f"{probe_name} probe failed for {url}: {e}"
+    return True, ""
 
 
 def _to_jsonable_config(value):
@@ -260,6 +360,8 @@ class CompactMetricsCallback(TrainerCallback):
         ("epoch", "epoch"),
         ("loss", "loss"),
         ("reward", "reward"),
+        ("reward_min", "reward_min"),
+        ("reward_max", "reward_max"),
     ]
 
     # Task-specific keys, detected from whichever key is present in logs
@@ -351,6 +453,67 @@ class RawMetricsCallback(TrainerCallback):
                     _wandb.log(wandb_payload, step=int(state.global_step))
             except Exception:
                 pass
+
+
+class RewardExtremaCallback(TrainerCallback):
+    """Inject per-step reward min/max statistics captured during rollout logging."""
+
+    def __init__(self, stats_ref: dict):
+        self.stats_ref = stats_ref
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = self.stats_ref.get("latest")
+        if not payload:
+            return
+
+        for key, value in payload.items():
+            logs[key] = value
+
+        try:
+            import wandb as _wandb
+            if _wandb.run is not None:
+                _wandb.log(payload, step=int(state.global_step))
+        except Exception:
+            pass
+
+
+class JsonMetricsCallback(TrainerCallback):
+    """Persist per-log training metrics as a JSON array (rewritten on each log)."""
+
+    def __init__(self, output_path: str):
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.history: list[dict] = []
+
+    @staticmethod
+    def _to_jsonable(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return JsonMetricsCallback._to_jsonable(value.item())
+            except Exception:
+                pass
+        return str(value)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        payload = {
+            "global_step": int(state.global_step),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "time_unix": time.time(),
+        }
+        payload.update({k: self._to_jsonable(v) for k, v in logs.items()})
+        self.history.append(payload)
+        self.output_path.write_text(
+            json.dumps(self.history, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 class JsonlMetricsCallback(TrainerCallback):
@@ -458,13 +621,23 @@ def build_argparser():
             "in bfloat16 without quantization and the adapter applied on top."
         ),
     )
+    p.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+        help=(
+            "Attention backend for the training model. "
+            "'auto' prefers Flash Attention 2, but falls back to SDPA for Qwen3."
+        ),
+    )
     p.add_argument("--dataset_id", type=str, default="AI-MO/NuminaMath-TIR")
     p.add_argument("--train_split", type=str, default="train[:5%]")
     p.add_argument("--test_split", type=str, default="test[:5%]")
     p.add_argument("--output_dir", type=str, default="Qwen2-0.5B-GRPO-vLLM-server")
 
     # Prompt / generation
-    p.add_argument("--max_prompt_tokens", type=int, default=256000)
+    p.add_argument("--max_prompt_tokens", type=int, default=4096)
     p.add_argument("--max_completion_length", type=int, default=8192)
     p.add_argument(
         "--train_temperature",
@@ -659,8 +832,8 @@ def build_argparser():
         dest="cd_grpo_prefill_answer",
         action="store_true",
         help=(
-            "For cd_descendants training rollouts, prefill the assistant through the short think "
-            "trace and opening <answer>, so GRPO only generates the JSON payload and closing tag."
+            "For causal-discovery training rollouts, prefill the assistant through the short think "
+            "trace and opening <answer>, so GRPO only generates the answer payload and closing tag."
         ),
     )
     p.add_argument(
@@ -668,7 +841,7 @@ def build_argparser():
         dest="cd_grpo_prefill_answer",
         action="store_false",
     )
-    p.set_defaults(cd_grpo_prefill_answer=True)
+    p.set_defaults(cd_grpo_prefill_answer=False)
     p.add_argument("--cd-reward-shd-weight", type=float, default=0.0, help="Weight for normalized SHD penalty.")
     p.add_argument("--cd-reward-dag-penalty", type=float, default=0.1, help="Penalty applied if predicted graph has cycles.")
     p.add_argument(
@@ -767,6 +940,13 @@ def build_argparser():
     p.add_argument("--no-use-vllm", dest="use_vllm", action="store_false")
     p.set_defaults(use_vllm=True)
     p.add_argument(
+        "--vllm-mode",
+        type=str,
+        choices=["server", "colocate"],
+        default="server",
+        help="Use a separate TRL vLLM server or colocate vLLM with trainer processes.",
+    )
+    p.add_argument(
         "--enable_vllm_preflight",
         action="store_true",
         help="Run an early communicator init/close probe before trainer startup.",
@@ -791,6 +971,21 @@ def build_argparser():
         help="Max model length for auto-launched vLLM server (<=0 lets vLLM pick a default).",
     )
     p.add_argument("--vllm_server_log_file", type=str, default="vllm_server.log")
+    p.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.3,
+        help="GPU memory utilization for colocated vLLM (only applies with --vllm-mode colocate).",
+    )
+    p.add_argument(
+        "--vllm_max_model_length",
+        type=int,
+        default=None,
+        help=(
+            "Context window for colocated vLLM. Defaults to "
+            "--max_prompt_tokens + --max_completion_length."
+        ),
+    )
 
     # Logging
     p.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])
@@ -1906,7 +2101,7 @@ def _build_trl_vllm_serve_cmd(args, host: str, port: int):
         str(args.vllm_server_gpu_memory_utilization),
     ]
     # <=0 is treated as "unset" so vLLM can choose a safe default.
-    if args.vllm_server_max_model_len > 0:
+    if args.vllm_server_max_model_len is not None and args.vllm_server_max_model_len > 0:
         cmd.extend(["--max-model-len", str(args.vllm_server_max_model_len)])
     return cmd
 
@@ -1914,6 +2109,8 @@ def _build_trl_vllm_serve_cmd(args, host: str, port: int):
 def _maybe_launch_local_vllm_and_reexec_train(args):
     if args.mode != "train" or not args.use_vllm or not args.auto_launch_vllm_server:
         return
+    if args.vllm_mode != "server":
+        raise RuntimeError("--auto-launch-vllm-server only works with --vllm-mode server.")
     if os.environ.get("GRPO_TRAIN_CHILD") == "1":
         return
     if os.environ.get("LOCAL_RANK") is not None:
@@ -2012,17 +2209,75 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
 
 def run_train(args, argv: list[str] | None = None):
     argv = list(argv or [])
-    GRPOConfig, GRPOTrainer = _import_trl_grpo()
+    args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
+    explicit_use_vllm = _argv_has_flag(argv, "--use-vllm")
+    explicit_no_use_vllm = _argv_has_flag(argv, "--no-use-vllm")
+    startup_t0 = time.perf_counter()
+    startup_last_t = startup_t0
+
+    def _log_startup_timing(stage: str) -> None:
+        nonlocal startup_last_t
+        now = time.perf_counter()
+        delta_s = now - startup_last_t
+        total_s = now - startup_t0
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        print(
+            f"[startup][rank={rank} local_rank={local_rank}] {stage}: "
+            f"+{delta_s:.2f}s (total {total_s:.2f}s)",
+            flush=True,
+        )
+        startup_last_t = now
+
+    # if args.use_vllm and args.vllm_mode == "server":
+    #     timeout_s = min(max(float(args.vllm_server_timeout), 1.0), 10.0)
+    #     server_ok, server_error = _probe_trl_vllm_server(args.vllm_server_base_url, timeout=timeout_s)
+    #     if not server_ok:
+    #         if not explicit_use_vllm and not explicit_no_use_vllm:
+    #             args.use_vllm = False
+    #             if int(os.environ.get("RANK", "0")) == 0:
+    #                 print(
+    #                     "[warn] no reachable TRL vLLM server at "
+    #                     f"{args.vllm_server_base_url}; defaulting to Transformers generation "
+    #                     "because neither --use-vllm nor --no-use-vllm was passed. "
+    #                     f"Probe error: {server_error}"
+    #                 )
+    #         else:
+    #             raise RuntimeError(
+    #                 f"Could not reach a TRL vLLM server at {args.vllm_server_base_url}. "
+    #                 "Start TRL's server (`trl vllm-serve`) or rerun with --no-use-vllm "
+    #                 "to use Transformers generation directly. "
+    #                 f"Probe error: {server_error}"
+    #             )
+
+    GRPOConfig, GRPOTrainer = _import_trl_grpo(use_vllm=bool(args.use_vllm))
     _patch_ddp_config_attr()
     _suppress_transformers_attn_mask_warning_bug()
+    _log_startup_timing("TRL import and startup checks")
 
-    args.vllm_server_base_url = args.vllm_server_base_url.rstrip("/")
     if args.max_prompt_tokens <= 0:
         args.max_prompt_tokens = 2048
         print("[warn] max_prompt_tokens <= 0; using safer default 2048.")
     if args.max_completion_length <= 0:
         args.max_completion_length = 512
         print("[warn] max_completion_length <= 0; using safer default 512.")
+    if args.use_vllm and args.vllm_mode == "colocate":
+        if not (0 < float(args.vllm_gpu_memory_utilization) <= 1.0):
+            raise ValueError("--vllm_gpu_memory_utilization must be in (0, 1].")
+        target_vllm_max_model_length = int(args.max_prompt_tokens) + int(args.max_completion_length)
+        if args.vllm_max_model_length is None or args.vllm_max_model_length <= 0:
+            args.vllm_max_model_length = target_vllm_max_model_length
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "[train] auto-set colocated vLLM max model length to "
+                    f"{args.vllm_max_model_length} "
+                    "(max_prompt_tokens + max_completion_length)."
+                )
+        elif args.vllm_max_model_length < target_vllm_max_model_length and int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "[warn] colocated vLLM max model length is smaller than "
+                "max_prompt_tokens + max_completion_length; long prompts or completions may be truncated."
+            )
     if args.train_temperature < 0:
         raise ValueError("--train_temperature must be >= 0.")
     if not (0 < args.train_top_p <= 1.0):
@@ -2033,24 +2288,31 @@ def run_train(args, argv: list[str] | None = None):
         args.stop_sequence = ["</answer>"]
     args.stop_sequence = [s for s in args.stop_sequence if isinstance(s, str) and s]
 
+    if args.task == "causal_discovery" and args.cd_grpo_prefill_answer:
+        staged_reward_scales = {
+            "cd-cot-structure": float(args.cd_cot_structure_reward_scale),
+            "cd-skeleton-f1": float(args.cd_skeleton_f1_reward_scale),
+            "cd-vstruct-f1": float(args.cd_vstruct_f1_reward_scale),
+            "cd-orientation-f1": float(args.cd_orientation_f1_reward_scale),
+        }
+        enabled_staged_rewards = [
+            name for name, scale in staged_reward_scales.items() if scale > 0.0
+        ]
+        if enabled_staged_rewards:
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "[warn] --cd-grpo-prefill-answer is incompatible with staged "
+                    "causal-discovery rewards because the model does not generate "
+                    "Stage 1/2/3 text in that mode. Falling back to assistant "
+                    f"<think> prefill. Enabled staged rewards: {', '.join(enabled_staged_rewards)}"
+                )
+            args.cd_grpo_prefill_answer = False
+
     # Throughput-oriented defaults for Ampere/Hopper GPUs.
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-
-    if args.use_vllm:
-        # Fail fast if the configured vLLM endpoint is unreachable.
-        health_url = f"{args.vllm_server_base_url}/health"
-        try:
-            with request.urlopen(health_url, timeout=10) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"HTTP {resp.status} from {health_url}")
-        except (error.URLError, RuntimeError) as e:
-            raise RuntimeError(
-                f"Could not reach vLLM server at {health_url}. "
-                "Start the server first or set --vllm_server_base_url / VLLM_SERVER_BASE_URL."
-            ) from e
 
     def _json_get(url, timeout=5.0):
         with request.urlopen(url, timeout=timeout) as resp:
@@ -2127,7 +2389,7 @@ def run_train(args, argv: list[str] | None = None):
             except Exception:
                 pass
 
-    if args.use_vllm and args.enable_vllm_preflight:
+    if args.use_vllm and args.vllm_mode == "server" and args.enable_vllm_preflight:
         _preflight_vllm_communicator()
 
     # Default run_name to the output_dir basename so W&B runs are self-labeling.
@@ -2144,12 +2406,14 @@ def run_train(args, argv: list[str] | None = None):
         import wandb  # noqa: F401
         import trl.extras.profiling as trl_profiling
         trl_profiling.wandb = __import__("wandb")
+    _log_startup_timing("W&B setup")
 
     # ---- Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    _log_startup_timing("Tokenizer load")
 
     # ---- Dataset
     if args.task == "math":
@@ -2180,8 +2444,8 @@ def run_train(args, argv: list[str] | None = None):
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
     else:
-        # Always prefill through <think> only; the model generates its own chain-of-thought.
-        rollout_prefill_answer = False
+        # Honor the rollout answer-prefill flag so GRPO can generate only the answer tail.
+        rollout_prefill_answer = bool(args.cd_grpo_prefill_answer)
         rollout_think_text = ""
         if args.cd_config_file and args.cd_train_csv:
             raise ValueError(
@@ -2267,9 +2531,6 @@ def run_train(args, argv: list[str] | None = None):
 
         train_dataset = raw_train.map(_truncate_cd_prompt)
         test_dataset = raw_test.map(_truncate_cd_prompt)
-        print(raw_train[0]["prompt"])
-        print(train_dataset[0]["prompt"])
-        # breakpoint()
         _print_prompt_diagnostics(train_dataset, split_name="train")
         _print_prompt_diagnostics(test_dataset, split_name="test")
         keep_cols = [
@@ -2282,6 +2543,7 @@ def run_train(args, argv: list[str] | None = None):
         ]
         train_dataset = train_dataset.remove_columns([c for c in train_dataset.column_names if c not in keep_cols])
         test_dataset = test_dataset.remove_columns([c for c in test_dataset.column_names if c not in keep_cols])
+    _log_startup_timing("Dataset load and preprocessing")
 
     # Debug: verify tokenized prompt before model load (fast, no GPU needed)
     if int(os.environ.get("RANK", "0")) == 0:
@@ -2295,9 +2557,16 @@ def run_train(args, argv: list[str] | None = None):
 
     # ---- Model + LoRA
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    resolved_attn_implementation = _resolve_attn_implementation(args)
+    if int(os.environ.get("RANK", "0")) == 0:
+        model_ref = _resolve_model_reference_for_attention(args)
+        print(
+            f"[attn] using attn_implementation={resolved_attn_implementation} "
+            f"for model reference {model_ref}"
+        )
     model_load_kwargs = {
         "dtype": "auto",
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": resolved_attn_implementation,
     }
     # `device_map="auto"` is incompatible with distributed Accelerate launches.
     if distributed_world_size == 1:
@@ -2349,6 +2618,7 @@ def run_train(args, argv: list[str] | None = None):
             args.model_id,
             **model_load_kwargs,
         )
+    _log_startup_timing("Model load")
     _apply_explicit_generation_config(
         model,
         max_prompt_tokens=args.max_prompt_tokens,
@@ -2378,6 +2648,7 @@ def run_train(args, argv: list[str] | None = None):
             print(
                 f"[train] dtype normalization -> {cast_dtype}: converted={casted}, skipped={skipped_cast}"
             )
+    _log_startup_timing("LoRA/adapters and dtype normalization")
 
     _wrap_generate_with_eval_mode(
         model,
@@ -2468,6 +2739,7 @@ def run_train(args, argv: list[str] | None = None):
     pending_reward_rows = {}
     generation_log_decisions = {}
     train_state_snapshot = {"global_step": 0, "epoch": None}
+    reward_extrema_snapshot = {"latest": {}}
 
     if int(os.environ.get("LOCAL_RANK", "0")) == 0 and args.save_eval_responses:
         print(
@@ -2708,11 +2980,16 @@ def run_train(args, argv: list[str] | None = None):
             emit_keys = sorted(k for k in pending_reward_rows.keys() if k[0] == generation_id)
             sample_file = sample_log_path.open("a", encoding="utf-8") if decision.get("persist_sample") else None
             eval_file = eval_response_log_path.open("a", encoding="utf-8") if decision.get("persist_eval") else None
+            step_totals = []
+            step_reward_values = {}
             try:
                 for key in emit_keys:
                     row = pending_reward_rows.pop(key)
                     rewards_map = row.get("rewards", {})
                     row["reward_total"] = float(sum(float(v) for v in rewards_map.values()))
+                    step_totals.append(float(row["reward_total"]))
+                    for reward_key, reward_value in rewards_map.items():
+                        step_reward_values.setdefault(str(reward_key), []).append(float(reward_value))
                     if eval_file is not None:
                         eval_file.write(json.dumps(row, ensure_ascii=False) + "\n")
                     if sample_file is not None and row.get("_sampled_for_log"):
@@ -2740,6 +3017,16 @@ def run_train(args, argv: list[str] | None = None):
                             "reward_total": row["reward_total"],
                         }
                         sample_file.write(json.dumps(sample_row, ensure_ascii=False) + "\n")
+                payload = {}
+                if step_totals:
+                    payload["reward_min"] = min(step_totals)
+                    payload["reward_max"] = max(step_totals)
+                for reward_key, values in step_reward_values.items():
+                    if not values:
+                        continue
+                    payload[f"rewards/{reward_key}/min"] = min(values)
+                    payload[f"rewards/{reward_key}/max"] = max(values)
+                reward_extrema_snapshot["latest"] = payload
             finally:
                 if eval_file is not None:
                     eval_file.close()
@@ -2829,14 +3116,21 @@ def run_train(args, argv: list[str] | None = None):
 
     grpo_kwargs = {}
     if args.use_vllm:
-        grpo_kwargs.update(
-            {
-                "vllm_mode": "server",
-                "vllm_server_base_url": args.vllm_server_base_url,
-                "vllm_server_timeout": args.vllm_server_timeout,
-                "vllm_group_port": args.vllm_group_port,
-            }
-        )
+        grpo_kwargs["vllm_mode"] = args.vllm_mode
+        if args.vllm_mode == "server":
+            grpo_kwargs.update(
+                {
+                    "vllm_server_base_url": args.vllm_server_base_url,
+                    "vllm_server_timeout": args.vllm_server_timeout,
+                }
+            )
+        elif args.vllm_mode == "colocate":
+            grpo_kwargs.update(
+                {
+                    "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+                    "vllm_max_model_length": args.vllm_max_model_length,
+                }
+            )
 
     train_generation_kwargs = {}
     if args.stop_sequence:
@@ -2848,46 +3142,42 @@ def run_train(args, argv: list[str] | None = None):
     if args.train_temperature > 0:
         train_generation_kwargs["temperature"] = args.train_temperature
         train_generation_kwargs["top_p"] = args.train_top_p
-
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        remove_unused_columns=False,
-        num_train_epochs=args.num_train_epochs,
-        beta=float(args.grpo_beta),
-
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_grad_norm=args.max_grad_norm,
-        ddp_find_unused_parameters=False,
-
-        bf16=torch.cuda.is_available(),
-
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        torch_compile=False,  # set True for ~20% speedup if your torch version supports it
-
-        max_prompt_length=args.max_prompt_tokens,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        generation_kwargs=train_generation_kwargs or None,
-
-        report_to=report_to,
-        run_name=args.run_name,
-        disable_tqdm=False,
-        logging_steps=args.logging_steps,
-        dataloader_num_workers=args.dataloader_num_workers,
-        dataloader_pin_memory=True,
-
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        push_to_hub=False,
-
-        # vLLM integration (server mode)
-        use_vllm=args.use_vllm,
+    training_kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "remove_unused_columns": False,
+        "num_train_epochs": args.num_train_epochs,
+        "beta": float(args.grpo_beta),
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "max_grad_norm": args.max_grad_norm,
+        "ddp_find_unused_parameters": False,
+        "bf16": torch.cuda.is_available(),
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "torch_compile": False,  # set True for ~20% speedup if your torch version supports it
+        "max_prompt_length": args.max_prompt_tokens,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "generation_kwargs": train_generation_kwargs or None,
+        "report_to": report_to,
+        "run_name": args.run_name,
+        "disable_tqdm": False,
+        "logging_steps": args.logging_steps,
+        "dataloader_num_workers": args.dataloader_num_workers,
+        "dataloader_pin_memory": True,
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "push_to_hub": False,
+        "use_vllm": args.use_vllm,
         **grpo_kwargs,
-    )
+    }
+    supported_training_kwargs = _filter_supported_kwargs(GRPOConfig.__init__, training_kwargs)
+    dropped_training_kwargs = sorted(set(training_kwargs) - set(supported_training_kwargs))
+    if dropped_training_kwargs and int(os.environ.get("RANK", "0")) == 0:
+        print(f"[warn] dropping unsupported GRPOConfig kwargs: {', '.join(dropped_training_kwargs)}")
+    training_args = GRPOConfig(**supported_training_kwargs)
     print(f"[train] generation stop sequences: {args.stop_sequence if args.stop_sequence else 'none'}")
     print(
         f"[train] generation sampling: temperature={args.train_temperature}, "
@@ -2922,6 +3212,7 @@ def run_train(args, argv: list[str] | None = None):
                 edge_f1_scale=float(args.cd_edge_f1_reward_scale),
                 shd_scale=float(args.cd_low_shd_reward_scale),
             ),
+            RewardExtremaCallback(reward_extrema_snapshot),
             TrainStateSnapshotCallback(train_state_snapshot),
             SaveLaunchCommandCallback(argv),
         ]
@@ -2930,9 +3221,12 @@ def run_train(args, argv: list[str] | None = None):
             if args.train_log_jsonl
             else (logs_dir / "train_metrics.jsonl")
         )
+        metrics_json_path = metrics_jsonl_path.with_suffix(".json")
         metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
+        callbacks.append(JsonMetricsCallback(str(metrics_json_path)))
         print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
+        print(f"[train] JSON logging enabled: {metrics_json_path}")
 
         # Debug: verify the prompt the model actually sees (with special tokens)
         if int(os.environ.get("RANK", "0")) == 0:
@@ -2950,6 +3244,7 @@ def run_train(args, argv: list[str] | None = None):
             train_dataset=train_dataset,
             callbacks=callbacks,
         )
+        _log_startup_timing("GRPOTrainer construction")
         # breakpoint()
         trainer.remove_callback(PrinterCallback)
     except RuntimeError as e:
