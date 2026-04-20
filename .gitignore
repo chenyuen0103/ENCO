@@ -181,3 +181,5 @@ verl/
 outputs/
 experiments/data/
 
+
+*.DS_Store
