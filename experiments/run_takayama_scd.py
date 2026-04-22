@@ -342,6 +342,109 @@ def _extract_yes_no_prob_from_text(text: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _checkpoint_path_for_output(out_csv: Path) -> Path:
+    return out_csv.with_suffix(out_csv.suffix + ".checkpoint.json")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _build_run_signature(
+    *,
+    graph_path: Path,
+    model_name: str,
+    provider: str,
+    labels: list[str],
+    sample_size_obs: int,
+    naming_regime: str,
+    temperature: float,
+    max_new_tokens: int | None,
+    num_samples: int,
+    bootstrap_samples: int,
+    pattern: int,
+) -> dict[str, Any]:
+    return {
+        "graph_file": str(graph_path),
+        "graph_stem": graph_path.stem,
+        "model": model_name,
+        "provider": provider,
+        "labels": list(labels),
+        "sample_size_obs": int(sample_size_obs),
+        "naming_regime": naming_regime,
+        "temperature": float(temperature),
+        "max_new_tokens": max_new_tokens,
+        "num_samples": int(num_samples),
+        "bootstrap_samples": int(bootstrap_samples),
+        "takayama_pattern": int(pattern),
+    }
+
+
+def _load_checkpoint_payload(checkpoint_path: Path, run_signature: dict[str, Any]) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        return {
+            "version": 1,
+            "run_signature": run_signature,
+            "completed_pairs": [],
+            "current_pair": None,
+        }
+    payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    if payload.get("version") != 1:
+        raise SystemExit(f"Unsupported checkpoint version in {checkpoint_path}. Delete it and rerun.")
+    saved_signature = payload.get("run_signature")
+    if saved_signature != run_signature:
+        raise SystemExit(
+            f"Checkpoint {checkpoint_path} does not match this run configuration. "
+            "Delete it and rerun, or use a different output path."
+        )
+    payload.setdefault("completed_pairs", [])
+    payload.setdefault("current_pair", None)
+    return payload
+
+
+def _checkpoint_snapshot(
+    *,
+    run_signature: dict[str, Any],
+    completed_pairs: list[dict[str, Any]],
+    current_pair: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "run_signature": run_signature,
+        "completed_pairs": completed_pairs,
+        "current_pair": current_pair,
+    }
+
+
+def _restore_checkpoint_state(
+    checkpoint_payload: dict[str, Any],
+    n: int,
+) -> tuple[np.ndarray, list[dict[str, Any]], set[tuple[int, int]], dict[str, Any] | None]:
+    mean_matrix = np.zeros((n, n), dtype=float)
+    transcript: list[dict[str, Any]] = []
+    completed_pairs: set[tuple[int, int]] = set()
+    for saved in checkpoint_payload.get("completed_pairs", []):
+        entry = dict(saved)
+        entry["samples"] = [dict(sample) for sample in saved.get("samples", [])]
+        i = int(entry["effect_idx"])
+        j = int(entry["cause_idx"])
+        if not (0 <= i < n and 0 <= j < n) or i == j:
+            raise SystemExit("Checkpoint contains an invalid completed pair entry.")
+        mean_prob = float(entry.get("mean_prob_yes", 0.0))
+        entry["mean_prob_yes"] = mean_prob
+        mean_matrix[i, j] = mean_prob
+        transcript.append(entry)
+        completed_pairs.add((i, j))
+    current_pair = checkpoint_payload.get("current_pair")
+    if current_pair is not None:
+        current_pair = dict(current_pair)
+        current_pair["samples"] = [dict(sample) for sample in current_pair.get("samples", [])]
+    return mean_matrix, transcript, completed_pairs, current_pair
+
+
 def _llm_probability_matrix(
     *,
     provider: str,
@@ -357,13 +460,36 @@ def _llm_probability_matrix(
     max_new_tokens: int | None,
     num_samples: int,
     anonymized: bool,
+    checkpoint_path: Path,
+    run_signature: dict[str, Any],
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     n = len(labels)
-    mean_matrix = np.zeros((n, n), dtype=float)
-    transcript: list[dict[str, Any]] = []
+    checkpoint_payload = _load_checkpoint_payload(checkpoint_path, run_signature)
+    mean_matrix, transcript, completed_pairs, current_pair = _restore_checkpoint_state(checkpoint_payload, n)
+    if completed_pairs or current_pair is not None:
+        current_desc = ""
+        if current_pair is not None:
+            current_desc = (
+                f" current_pair=({current_pair.get('cause_idx')}->{current_pair.get('effect_idx')})"
+                f" samples={len(current_pair.get('samples', []))}"
+            )
+        print(f"[TakayamaSCP] resuming from {checkpoint_path} completed_pairs={len(completed_pairs)}{current_desc}")
+
+    def save_checkpoint(*, current_pair_state: dict[str, Any] | None) -> None:
+        _atomic_write_json(
+            checkpoint_path,
+            _checkpoint_snapshot(
+                run_signature=run_signature,
+                completed_pairs=transcript,
+                current_pair=current_pair_state,
+            ),
+        )
+
     for i in range(n):
         for j in range(n):
             if i == j:
+                continue
+            if (i, j) in completed_pairs:
                 continue
             first_prompt = _build_first_prompt(
                 dataset_name=dataset_name,
@@ -376,29 +502,65 @@ def _llm_probability_matrix(
                 pc_undirected_prob=pc_undirected_prob,
                 anonymized=anonymized,
             )
-            first_result = _chat_text_completion(
-                provider=provider,
-                client=client,
-                model_name=model_name,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant for causal inference."},
-                    {"role": "user", "content": first_prompt},
-                ],
-                temperature=temperature,
-                max_new_tokens=max_new_tokens or 3000,
-            )
-            first_answer = first_result["text"] or ""
-            second_prompt = _build_second_prompt(first_prompt, first_answer, src=labels[j], dst=labels[i])
-            probs: list[float] = []
-            sample_logs: list[dict[str, Any]] = []
-            for trial in range(max(1, num_samples)):
+            if current_pair is not None and int(current_pair.get("effect_idx", -1)) == i and int(current_pair.get("cause_idx", -1)) == j:
+                pair_state = current_pair
+                if not pair_state.get("first_prompt"):
+                    pair_state["first_prompt"] = first_prompt
+            else:
+                pair_state = {
+                    "effect_idx": i,
+                    "cause_idx": j,
+                    "effect": labels[i],
+                    "cause": labels[j],
+                    "first_prompt": first_prompt,
+                    "first_answer": "",
+                    "second_prompt": "",
+                    "samples": [],
+                }
+                current_pair = pair_state
+                save_checkpoint(current_pair_state=current_pair)
+
+            if not pair_state.get("first_answer"):
+                first_result = _chat_text_completion(
+                    provider=provider,
+                    client=client,
+                    model_name=model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant for causal inference."},
+                        {"role": "user", "content": pair_state["first_prompt"]},
+                    ],
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens or 3000,
+                )
+                pair_state["first_answer"] = first_result["text"] or ""
+                pair_state["second_prompt"] = _build_second_prompt(
+                    pair_state["first_prompt"],
+                    pair_state["first_answer"],
+                    src=labels[j],
+                    dst=labels[i],
+                )
+                current_pair = pair_state
+                save_checkpoint(current_pair_state=current_pair)
+            elif not pair_state.get("second_prompt"):
+                pair_state["second_prompt"] = _build_second_prompt(
+                    pair_state["first_prompt"],
+                    pair_state["first_answer"],
+                    src=labels[j],
+                    dst=labels[i],
+                )
+                current_pair = pair_state
+                save_checkpoint(current_pair_state=current_pair)
+
+            sample_logs = [dict(sample) for sample in pair_state.get("samples", [])]
+            probs = [float(sample.get("prob_yes", 0.0)) for sample in sample_logs]
+            for trial in range(len(sample_logs), max(1, num_samples)):
                 second_result = _chat_text_completion(
                     provider=provider,
                     client=client,
                     model_name=model_name,
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant for causal inference."},
-                        {"role": "user", "content": second_prompt},
+                        {"role": "user", "content": pair_state["second_prompt"]},
                     ],
                     temperature=temperature,
                     max_new_tokens=max_new_tokens or 1500,
@@ -419,20 +581,27 @@ def _llm_probability_matrix(
                         "response": raw_text,
                     }
                 )
+                pair_state["samples"] = sample_logs
+                pair_state["mean_prob_yes"] = float(np.mean(probs)) if probs else 0.0
+                current_pair = pair_state
+                save_checkpoint(current_pair_state=current_pair)
+
             mean_matrix[i, j] = float(np.mean(probs)) if probs else 0.0
-            transcript.append(
-                {
-                    "effect_idx": i,
-                    "cause_idx": j,
-                    "effect": labels[i],
-                    "cause": labels[j],
-                    "first_prompt": first_prompt,
-                    "first_answer": first_answer,
-                    "second_prompt": second_prompt,
-                    "samples": sample_logs,
-                    "mean_prob_yes": mean_matrix[i, j],
-                }
-            )
+            completed_entry = {
+                "effect_idx": i,
+                "cause_idx": j,
+                "effect": labels[i],
+                "cause": labels[j],
+                "first_prompt": pair_state["first_prompt"],
+                "first_answer": pair_state["first_answer"],
+                "second_prompt": pair_state["second_prompt"],
+                "samples": sample_logs,
+                "mean_prob_yes": mean_matrix[i, j],
+            }
+            transcript.append(completed_entry)
+            completed_pairs.add((i, j))
+            current_pair = None
+            save_checkpoint(current_pair_state=None)
     return mean_matrix, transcript
 
 
@@ -579,6 +748,24 @@ def main() -> int:
         else:
             labels = list(var_names)
 
+        naming_suffix = "_anon" if args.naming_regime == "anonymized" else ""
+        out_csv = Path(args.out_dir) / graph_path.stem / (
+            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{naming_suffix}.csv"
+        )
+        checkpoint_path = _checkpoint_path_for_output(out_csv)
+        run_signature = _build_run_signature(
+            graph_path=graph_path,
+            model_name=args.model,
+            provider=provider,
+            labels=labels,
+            sample_size_obs=args.sample_size_obs,
+            naming_regime=args.naming_regime,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            num_samples=args.num_samples,
+            bootstrap_samples=args.bootstrap_samples,
+            pattern=args.takayama_pattern,
+        )
         probability_matrix, transcript = _llm_probability_matrix(
             provider=provider,
             client=client,
@@ -593,15 +780,13 @@ def main() -> int:
             max_new_tokens=args.max_new_tokens,
             num_samples=args.num_samples,
             anonymized=args.naming_regime == "anonymized",
+            checkpoint_path=checkpoint_path,
+            run_signature=run_signature,
         )
         pk_matrix = _probability_to_pk(probability_matrix)
         constrained_pc_signed = _run_pc_with_background_knowledge(df, pk_matrix=pk_matrix)
         prediction = _directed_prediction_from_pc_signed(constrained_pc_signed)
 
-        naming_suffix = "_anon" if args.naming_regime == "anonymized" else ""
-        out_csv = Path(args.out_dir) / graph_path.stem / (
-            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{naming_suffix}.csv"
-        )
         _write_prediction_csv(
             out_csv=out_csv,
             model_name=args.model,
@@ -614,6 +799,7 @@ def main() -> int:
             probability_matrix=probability_matrix,
             pk_matrix=pk_matrix,
         )
+        checkpoint_path.unlink(missing_ok=True)
         print(f"[TakayamaSCP] wrote {out_csv.resolve()}")
     return 0
 
