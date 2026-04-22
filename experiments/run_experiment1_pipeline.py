@@ -47,6 +47,8 @@ class ResponseMeta:
     prompt_style: str  # "cases" or "matrix" or "names_only"
     row_order: str
     col_order: str
+    wrapper_mode: str
+    append_format_hint: bool
     causal_rules: bool
     give_steps: bool
 
@@ -94,14 +96,19 @@ def _resolve_file_arg(path_str: str, *, repo_root: Path, invocation_cwd: Path) -
 
 
 def _infer_model_from_stem(stem: str) -> str:
+    stem = _normalize_stem_for_parse(stem)
     # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
-    m_names = re.match(r"^responses_names_only(?:_p\d+)?_(?P<model>.+)$", stem, flags=re.IGNORECASE)
+    m_names = re.match(
+        r"^responses_names_only(?:_p\d+)?(?P<tags>(?:_(?:anon|rules|steps|wrapchat|fmthint|row[A-Za-z0-9]+|col[A-Za-z0-9]+))*)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
     if m_names:
         return m_names.group("model")
     m_resp = re.match(
         r"^responses_obs\d+_int\d+_shuf\d+_p\d+_"
         r"(?:(?:[A-Za-z0-9]+_)*)"
-        r"(?:payload_topk|summary_joint|summary|matrix|cases|payload)"
+        r"(?:payload_topk|summary|matrix|cases|payload)"
         r"_(?P<model>.+)$",
         stem,
         flags=re.IGNORECASE,
@@ -111,6 +118,21 @@ def _infer_model_from_stem(stem: str) -> str:
     return "unknown"
 
 
+def _normalize_stem_for_parse(stem: str) -> str:
+    out = stem
+    out = out.replace("summary_joint", "summary")
+    out = out.replace("summary_join", "summary")
+    out = out.replace("thinktags_cothint", "wrapchat_fmthint")
+    out = out.replace("cothint_thinktags", "wrapchat_fmthint")
+    out = out.replace("thinktags", "wrapchat")
+    out = out.replace("cothint", "fmthint")
+    out = out.replace("respthink_answer", "")
+    out = out.replace("wrapplain", "")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
 def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
     """
     Parse the filename suffix after `_shuf{n}` into:
@@ -118,13 +140,14 @@ def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
       2) the model name
 
     Example suffixes:
-      `_p5_anon_thinktags_summary_joint_gpt-5-mini`
+      `_p5_anon_wrapchat_summary_gpt-5-mini`
       `_p3_matrix_gpt-5.2-pro`
-      `_p100_thinktags_summary_joint_sft`
+      `_p100_wrapchat_fmthint_summary_sft`
     """
+    suffix = _normalize_stem_for_parse(suffix)
     m = re.match(
         r"^(?P<tags>_p\d+_(?:(?:[A-Za-z0-9]+_)*)"
-        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases))"
+        r"(?:summary_probs|payload_topk|payload|summary|matrix|cases))"
         r"_(?P<model>.+)$",
         suffix,
         flags=re.IGNORECASE,
@@ -135,7 +158,8 @@ def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
 
 
 def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
-    stem = csv_path.stem
+    raw_stem = csv_path.stem
+    stem = _normalize_stem_for_parse(raw_stem)
 
     # ENCO baseline: "predictions_obs{N}_int{M}_ENCO.csv"
     m_enco = _ENCO_RE.match(stem)
@@ -152,6 +176,8 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             prompt_style="baseline",
             row_order="random",
             col_order="original",
+            wrapper_mode="plain",
+            append_format_hint=False,
             causal_rules=False,
             give_steps=False,
         )
@@ -175,6 +201,8 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             prompt_style="names_only",
             row_order="random",
             col_order=col_order,
+            wrapper_mode=("chat" if "wrapchat" in stem.lower() else "plain"),
+            append_format_hint=("fmthint" in stem.lower()),
             causal_rules=("rules" in stem.lower()),
             give_steps=("steps" in stem.lower()),
         )
@@ -188,7 +216,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             prompt_style = "payload_topk"
         elif "payload" in stem_l:
             prompt_style = "payload"
-        elif "summary_joint" in stem_l or "summary" in stem_l:
+        elif "summary" in stem_l:
             prompt_style = "summary"
         elif "matrix" in stem_l:
             prompt_style = "matrix"
@@ -205,6 +233,8 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             prompt_style=prompt_style,
             row_order="random",
             col_order=("topo" if "coltopo" in stem.lower() else "original"),
+            wrapper_mode=("chat" if "wrapchat" in stem.lower() else "plain"),
+            append_format_hint=("fmthint" in stem.lower()),
             causal_rules=("rules" in stem.lower()),
             give_steps=("steps" in stem.lower()),
         )
@@ -231,7 +261,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         prompt_style = "payload_topk"
     elif "payload" in tags:
         prompt_style = "payload"
-    elif "summary_joint" in tags or "summary" in tags:
+    elif "summary" in tags:
         prompt_style = "summary"
     elif "matrix" in tags:
         prompt_style = "matrix"
@@ -247,6 +277,8 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         prompt_style=prompt_style,
         row_order=row_order,
         col_order=col_order,
+        wrapper_mode=("chat" if "wrapchat" in tags else "plain"),
+        append_format_hint=("fmthint" in tags),
         causal_rules=("rules" in tags),
         give_steps=("steps" in tags),
     )
@@ -349,6 +381,12 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
     if getattr(args, "styles", None):
         cmd.append("--styles")
         cmd.extend([str(s) for s in args.styles])
+    if getattr(args, "wrapper_mode", None):
+        cmd.extend(["--wrapper-mode", str(args.wrapper_mode)])
+    if getattr(args, "append_format_hint", False):
+        cmd.append("--append-format-hint")
+    if getattr(args, "cot_hint", False):
+        cmd.append("--cot-hint")
     for s in (args.shuffles_per_graph or []):
         cmd.extend(["--shuffles-per-graph", str(int(s))])
     for m in args.model:
@@ -580,6 +618,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                         "shuffles_per_graph": None,
                         "row_order": "random",
                         "col_order": "original",
+                        "wrapper_mode": "plain",
+                        "append_format_hint": 0,
                         "causal_rules": 0,
                         "give_steps": 0,
                         "response_csv": str(csv_path),
@@ -630,6 +670,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "prompt_style": meta.prompt_style,
             "row_order": meta.row_order,
             "col_order": meta.col_order,
+            "wrapper_mode": meta.wrapper_mode,
+            "append_format_hint": int(meta.append_format_hint),
             "causal_rules": int(meta.causal_rules),
             "give_steps": int(meta.give_steps),
             "response_csv": str(csv_path),
@@ -655,6 +697,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                     "prompt_style": meta.prompt_style,
                     "row_order": meta.row_order,
                     "col_order": meta.col_order,
+                    "wrapper_mode": meta.wrapper_mode,
+                    "append_format_hint": int(meta.append_format_hint),
                     "response_csv": str(csv_path),
                     **ob,
                 }
@@ -718,6 +762,25 @@ def main() -> None:
             'Optional subset of prompt styles to generate (any of: "cases", "matrix", "summary", '
             '"payload", "payload_topk").'
         ),
+    )
+    ap.add_argument(
+        "--wrapper-mode",
+        choices=["plain", "chat"],
+        default=None,
+        help="Prompt transport for the in-memory run step.",
+    )
+    ap.add_argument(
+        "--append-format-hint",
+        action="store_true",
+        help=(
+            "Append the canonical Formatting requirement line in the in-memory run step. "
+            "For causal discovery this enables the optional stage-by-stage reasoning instructions."
+        ),
+    )
+    ap.add_argument(
+        "--cot-hint",
+        action="store_true",
+        help="Legacy alias for chat-style prompt wrapping in the in-memory run step.",
     )
     ap.add_argument(
         "--include-enco-in-summary",

@@ -97,10 +97,15 @@ def _import_trl_grpo(*, use_vllm: bool = True):
     from transformers.utils import import_utils as tf_import_utils
 
     orig_is_pkg_available = tf_import_utils._is_package_available
+    disabled_packages = {"mergekit", "llm_blender"}
+    if not use_vllm:
+        disabled_packages.update({"vllm", "vllm_ascend"})
 
     def _make_is_pkg_available(disable_vllm_probe: bool):
         def _patched_is_package_available(package_name: str, *args, **kwargs):
             return_version = kwargs.get("return_version", args[0] if args else False)
+            if package_name in disabled_packages:
+                return (False, "0.0.0") if return_version else False
             if disable_vllm_probe and package_name in {"vllm", "vllm_ascend"}:
                 return (False, "0.0.0") if return_version else False
             return orig_is_pkg_available(package_name, *args, **kwargs)
@@ -109,6 +114,8 @@ def _import_trl_grpo(*, use_vllm: bool = True):
 
     def _patched_is_package_available(package_name: str, *args, **kwargs):
         return_version = kwargs.get("return_version", args[0] if args else False)
+        if package_name in disabled_packages:
+            return (False, "0.0.0") if return_version else False
         if not use_vllm and package_name in {"vllm", "vllm_ascend"}:
             return (False, "0.0.0") if return_version else False
         return orig_is_pkg_available(package_name, *args, **kwargs)

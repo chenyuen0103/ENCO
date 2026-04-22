@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import inspect
 import importlib
@@ -1294,6 +1295,13 @@ def _list_grpo_readiness_candidates(sft_output_dir: Path) -> list[Path]:
     return candidates
 
 
+def _parse_cuda_visible_devices(value: str | None) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _summarize_grpo_readiness_eval(eval_jsonl_path: Path, checkpoint_dir: Path, sft_output_dir: Path) -> dict[str, Any]:
     rows = [
         json.loads(line)
@@ -1385,6 +1393,7 @@ def run_grpo_readiness_checkpoint_sweep(
     graph_filter: list[str] | None = None,
     dtype: str = "auto",
     device_map: str = "auto",
+    parallel_workers: int = 1,
     env: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     eval_script = (Path(__file__).resolve().parent / "eval_sft_on_jsonl.py").resolve()
@@ -1392,8 +1401,7 @@ def run_grpo_readiness_checkpoint_sweep(
     if not candidates:
         raise RuntimeError(f"No checkpoint candidates found under {Path(sft_output_dir).resolve()}")
 
-    results: list[dict[str, Any]] = []
-    for checkpoint_dir in candidates:
+    def _build_eval_cmd(checkpoint_dir: Path) -> tuple[str, Path, list[str]]:
         checkpoint_label = "output_dir" if checkpoint_dir == Path(sft_output_dir).resolve() else checkpoint_dir.name
         output_jsonl = checkpoint_dir / "grpo_readiness_eval.jsonl"
         cmd = [
@@ -1415,16 +1423,20 @@ def run_grpo_readiness_checkpoint_sweep(
         if graph_filter:
             cmd.append("--graph-filter")
             cmd.extend([str(x) for x in graph_filter])
+        return checkpoint_label, output_jsonl, cmd
 
-        print(f"[grpo-readiness] evaluating {checkpoint_label} on {Path(eval_jsonl).resolve()}")
+    def _evaluate_one(checkpoint_dir: Path, *, gpu_id: str | None) -> dict[str, Any]:
+        checkpoint_label, output_jsonl, cmd = _build_eval_cmd(checkpoint_dir)
+        gpu_note = f" on GPU {gpu_id}" if gpu_id is not None else ""
+        print(f"[grpo-readiness] evaluating {checkpoint_label}{gpu_note} on {Path(eval_jsonl).resolve()}")
         print("[run]", " ".join(cmd))
         child_env = os.environ.copy()
         if env:
             child_env.update(env)
+        if gpu_id is not None:
+            child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         subprocess.run(cmd, env=child_env, check=True)
-
         summary = _summarize_grpo_readiness_eval(output_jsonl, checkpoint_dir, sft_output_dir)
-        results.append(summary)
         print(
             f"[grpo-readiness] {checkpoint_label}: "
             f"score={summary['readiness_score']:.2f} "
@@ -1432,6 +1444,50 @@ def run_grpo_readiness_checkpoint_sweep(
             f"edge_f1={summary['rollout_primary_f1_mean']:.4f} "
             f"reward_var={summary['prompt_reward_nonzero_variance_rate']:.2%}"
         )
+        return summary
+
+    requested_workers = max(1, int(parallel_workers))
+    visible_gpus = _parse_cuda_visible_devices((env or {}).get("CUDA_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if requested_workers > 1 and not visible_gpus:
+        print("[grpo-readiness] no CUDA_VISIBLE_DEVICES list found; falling back to sequential readiness sweep")
+        requested_workers = 1
+
+    results: list[dict[str, Any]] = []
+    if requested_workers <= 1:
+        for checkpoint_dir in candidates:
+            results.append(_evaluate_one(checkpoint_dir, gpu_id=None))
+    else:
+        worker_gpus = visible_gpus[:requested_workers]
+        if len(worker_gpus) < requested_workers:
+            print(
+                f"[grpo-readiness] requested {requested_workers} workers but only "
+                f"{len(worker_gpus)} visible GPU(s); using {len(worker_gpus)} worker(s)"
+            )
+        requested_workers = max(1, len(worker_gpus))
+        shard_count = min(requested_workers, len(candidates))
+        candidate_shards: list[list[Path]] = [[] for _ in range(shard_count)]
+        for idx, checkpoint_dir in enumerate(candidates):
+            candidate_shards[idx % shard_count].append(checkpoint_dir)
+        worker_specs = [
+            (worker_gpus[idx], candidate_shards[idx])
+            for idx in range(shard_count)
+            if candidate_shards[idx]
+        ]
+        print(
+            f"[grpo-readiness] parallel sweep across {len(worker_specs)} worker(s): "
+            + ", ".join(f"GPU {gpu_id} -> {len(shard)} checkpoint(s)" for gpu_id, shard in worker_specs)
+        )
+
+        def _run_worker(gpu_id: str, shard: list[Path]) -> list[dict[str, Any]]:
+            return [_evaluate_one(checkpoint_dir, gpu_id=gpu_id) for checkpoint_dir in shard]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_specs)) as executor:
+            futures = [
+                executor.submit(_run_worker, gpu_id, shard)
+                for gpu_id, shard in worker_specs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                results.extend(future.result())
 
     results.sort(key=lambda item: (-float(item["readiness_score"]), str(item["checkpoint_dir"])))
     summary_out = Path(summary_out).resolve()
@@ -1692,6 +1748,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--grpo-readiness-top-p", type=float, default=1.0)
     ap.add_argument("--grpo-readiness-max-new-tokens", type=int, default=1024)
     ap.add_argument(
+        "--grpo-readiness-parallel-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of checkpoint-eval workers to run in parallel during readiness ranking. "
+            "When >1, each worker is pinned to one visible GPU from CUDA_VISIBLE_DEVICES."
+        ),
+    )
+    ap.add_argument(
         "--grpo-readiness-base-model-override",
         type=str,
         default=None,
@@ -1761,6 +1826,7 @@ def main() -> None:
             graph_filter=args.grpo_readiness_graph_filter,
             dtype=args.grpo_readiness_dtype,
             device_map=args.grpo_readiness_device_map,
+            parallel_workers=args.grpo_readiness_parallel_workers,
             env={"CUDA_VISIBLE_DEVICES": str(args.cuda_visible_devices)},
         )
         return
@@ -1853,6 +1919,7 @@ def main() -> None:
                 graph_filter=args.grpo_readiness_graph_filter,
                 dtype=args.grpo_readiness_dtype,
                 device_map=args.grpo_readiness_device_map,
+                parallel_workers=args.grpo_readiness_parallel_workers,
                 env={"CUDA_VISIBLE_DEVICES": str(args.cuda_visible_devices)},
             )
         if args.merge_after_sft:
