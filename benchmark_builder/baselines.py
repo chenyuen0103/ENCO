@@ -153,9 +153,10 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
         if not baseline.enabled:
             return False
-        semantic_only = self.method_name in {"JiralerspongBFS", "CausalLLMPrompt"}
-        if semantic_only:
+        if self.method_name == "CausalLLMPrompt":
             return _is_names_only_cell(cell)
+        if self.method_name == "JiralerspongBFS":
+            return (not _is_names_only_cell(cell)) and cell.style == "summary_joint" and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "TakayamaSCP":
             return (not _is_names_only_cell(cell)) and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "CausalLLMData":
@@ -252,7 +253,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 "--edge_threshold",
                 str(baseline.edge_threshold),
                 "--prompt_mode",
-                "names_only" if _is_names_only_cell(cell) else "summary_joint",
+                ("summary_joint" if self.method_name == "JiralerspongBFS" else ("names_only" if _is_names_only_cell(cell) else "summary_joint")),
                 "--naming_regime",
                 naming_regime,
             ]

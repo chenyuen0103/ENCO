@@ -261,12 +261,19 @@ def _semantic_full_graph_prompt(prompt_text: str) -> str:
     )
 
 
-def _bfs_roots_prompt(*, dataset_name: str, remaining: list[str]) -> str:
+def _bfs_roots_prompt(*, dataset_name: str, remaining: list[str], context: str | None = None) -> str:
     vars_text = ", ".join(remaining)
+    evidence_block = ""
+    if context:
+        evidence_block = (
+            "Use the following observational evidence summary when choosing likely roots:\n"
+            f"{context}\n\n"
+        )
     return (
-        "You are an expert in causal discovery from variable semantics.\n"
+        "You are an expert in causal discovery from variable semantics and evidence summaries.\n"
         f"We are studying a system called '{dataset_name}'.\n"
         f"Variables under consideration: {vars_text}\n\n"
+        f"{evidence_block}"
         "Choose a small set of likely root variables among the listed variables. "
         "A root variable should have no direct parents among the remaining variables.\n\n"
         "Output exactly: <think>...</think><answer>{\"roots\": [\"...\"]}</answer>\n"
@@ -274,13 +281,20 @@ def _bfs_roots_prompt(*, dataset_name: str, remaining: list[str]) -> str:
     )
 
 
-def _bfs_children_prompt(*, dataset_name: str, source: str, candidates: list[str]) -> str:
+def _bfs_children_prompt(*, dataset_name: str, source: str, candidates: list[str], context: str | None = None) -> str:
     vars_text = ", ".join(candidates)
+    evidence_block = ""
+    if context:
+        evidence_block = (
+            "Use the following observational evidence summary when choosing direct children:\n"
+            f"{context}\n\n"
+        )
     return (
-        "You are an expert in causal discovery from variable semantics.\n"
+        "You are an expert in causal discovery from variable semantics and evidence summaries.\n"
         f"We are studying a system called '{dataset_name}'.\n"
         f"Source variable: {source}\n"
         f"Candidate target variables: {vars_text}\n\n"
+        f"{evidence_block}"
         "List the most plausible direct children of the source variable among the candidates. "
         "Only include direct effects, not indirect descendants.\n\n"
         "Output exactly: <think>...</think><answer>{\"children\": [\"...\"]}</answer>\n"
@@ -364,6 +378,9 @@ def _run_takayama_scp(
 def _run_jiralerspong_bfs(
     *,
     graph_path: Path,
+    sample_size_obs: int,
+    sample_size_inters: int,
+    prompt_mode: str,
     model_name: str,
     provider: str,
     temperature: float,
@@ -372,12 +389,22 @@ def _run_jiralerspong_bfs(
     anonymize: bool,
     hf_pipe: Any,
 ) -> tuple[np.ndarray, list[str], list[str]]:
-    variables, _answer_obj, _base_prompt = _build_names_only_prompt(
-        graph_path=graph_path,
-        num_prompts=1,
-        seed=seed,
-        anonymize=anonymize,
-    )
+    context = None
+    if prompt_mode == "summary_joint":
+        variables, _answer_obj, context = _build_data_prompt(
+            graph_path=graph_path,
+            sample_size_obs=sample_size_obs,
+            sample_size_inters=sample_size_inters,
+            seed=seed,
+            anonymize=anonymize,
+        )
+    else:
+        variables, _answer_obj, context = _build_names_only_prompt(
+            graph_path=graph_path,
+            num_prompts=1,
+            seed=seed,
+            anonymize=anonymize,
+        )
     dataset_name = graph_path.stem
     var_to_idx = {v: i for i, v in enumerate(variables)}
     remaining = list(variables)
@@ -387,7 +414,7 @@ def _run_jiralerspong_bfs(
 
     while remaining:
         if not frontier:
-            roots_prompt = _bfs_roots_prompt(dataset_name=dataset_name, remaining=remaining)
+            roots_prompt = _bfs_roots_prompt(dataset_name=dataset_name, remaining=remaining, context=context)
             roots_raw = _call_model(
                 prompt=roots_prompt,
                 model_name=model_name,
@@ -414,6 +441,7 @@ def _run_jiralerspong_bfs(
                 dataset_name=dataset_name,
                 source=source,
                 candidates=candidates,
+                context=context,
             )
             children_raw = _call_model(
                 prompt=children_prompt,
@@ -535,10 +563,14 @@ def main() -> int:
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
 
-    semantic_only = args.method in {"TakayamaSCP", "JiralerspongBFS", "CausalLLMPrompt"}
-    if semantic_only and args.prompt_mode != "names_only":
+    names_only_methods = {"TakayamaSCP", "CausalLLMPrompt"}
+    if args.method in names_only_methods and args.prompt_mode != "names_only":
         raise SystemExit(f"{args.method} expects --prompt_mode names_only.")
-    if semantic_only and args.naming_regime not in {"real", "names_only", "anonymized"}:
+    if args.method == "JiralerspongBFS" and args.prompt_mode != "summary_joint":
+        raise SystemExit("JiralerspongBFS expects --prompt_mode summary_joint.")
+    if args.method == "JiralerspongBFS" and args.sample_size_inters != 0:
+        raise SystemExit("JiralerspongBFS is observational-only in this implementation.")
+    if (args.method in names_only_methods or args.method == "JiralerspongBFS") and args.naming_regime not in {"real", "names_only", "anonymized"}:
         raise SystemExit(f"Unsupported naming regime for {args.method}: {args.naming_regime}")
     if args.method == "CausalLLMData" and args.prompt_mode != "summary_joint":
         raise SystemExit("CausalLLMData expects --prompt_mode summary_joint.")
@@ -571,6 +603,9 @@ def main() -> int:
         elif args.method == "JiralerspongBFS":
             prediction, _variables, raw_responses = _run_jiralerspong_bfs(
                 graph_path=graph_path,
+                sample_size_obs=args.sample_size_obs,
+                sample_size_inters=args.sample_size_inters,
+                prompt_mode=args.prompt_mode,
                 model_name=args.model,
                 provider=provider,
                 temperature=args.temperature,

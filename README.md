@@ -157,6 +157,9 @@ Baseline support:
     constrained PC rerun
   - `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData` via
     `experiments/run_external_llm_baselines.py`
+    - `CausalLLMPrompt`: one-shot semantic full-graph prompting from names only
+    - `JiralerspongBFS`: observational-summary BFS-style querying baseline
+    - `CausalLLMData`: one-shot data-backed full-graph prompting baseline
 
 Authoring tutorial:
 

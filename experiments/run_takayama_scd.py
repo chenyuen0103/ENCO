@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,6 +17,10 @@ import requests
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmark_builder.graph_io import load_causal_graph
+
+
+def _progress(message: str) -> None:
+    print(f"[TakayamaSCP {time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
 def _require_openai():
@@ -104,15 +109,21 @@ def _bootstrap_pc_probabilities(df: Any, n_sampling: int) -> tuple[np.ndarray, n
     directed = np.zeros((num_nodes, num_nodes), dtype=float)
     undirected = np.zeros((num_nodes, num_nodes), dtype=float)
 
-    for _ in range(n_sampling):
+    _progress(f"bootstrap PC start: samples={n_sampling}, vars={num_nodes}")
+    report_every = max(1, n_sampling // 5)
+    for idx in range(n_sampling):
         boot = resample(df)
         cg = pc(boot.to_numpy(), independence_test_method="fisherz", verbose=False, show_progress=False)
         mat = _pc_signed_adjacency(cg)
         directed += (mat == 1).astype(float)
         undirected += (mat == -1).astype(float)
+        done = idx + 1
+        if done == 1 or done == n_sampling or done % report_every == 0:
+            _progress(f"bootstrap PC progress: {done}/{n_sampling}")
 
     directed /= float(n_sampling)
     undirected /= float(n_sampling)
+    _progress("bootstrap PC done")
     return directed, undirected
 
 
@@ -326,10 +337,34 @@ def _chat_text_completion(
             "temperature": temperature,
             "stream": False,
         }
-        response = requests.post(client["url"], json=payload, timeout=180)
-        response.raise_for_status()
-        raw = response.json()
-        return {"raw": raw, "text": _extract_text_from_illinois_payload(raw)}
+        max_attempts = 6
+        retry_statuses = {429, 500, 502, 503, 504}
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(client["url"], json=payload, timeout=180)
+                if response.status_code in retry_statuses:
+                    raise requests.HTTPError(
+                        f"{response.status_code} Server Error: {response.reason}",
+                        response=response,
+                    )
+                response.raise_for_status()
+                raw = response.json()
+                return {"raw": raw, "text": _extract_text_from_illinois_payload(raw)}
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                should_retry = (
+                    isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                    or status_code in retry_statuses
+                )
+                if not should_retry or attempt == max_attempts:
+                    raise
+                sleep_s = min(60.0, 2.0 ** (attempt - 1))
+                _progress(
+                    "Illinois API transient failure "
+                    f"(attempt {attempt}/{max_attempts}, status={status_code or 'network'}); "
+                    f"retrying in {sleep_s:.1f}s"
+                )
+                time.sleep(sleep_s)
     raise SystemExit(f"Unsupported provider for TakayamaSCP: {provider}")
 
 
@@ -464,6 +499,7 @@ def _llm_probability_matrix(
     run_signature: dict[str, Any],
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     n = len(labels)
+    total_pairs = n * (n - 1)
     checkpoint_payload = _load_checkpoint_payload(checkpoint_path, run_signature)
     mean_matrix, transcript, completed_pairs, current_pair = _restore_checkpoint_state(checkpoint_payload, n)
     if completed_pairs or current_pair is not None:
@@ -474,6 +510,10 @@ def _llm_probability_matrix(
                 f" samples={len(current_pair.get('samples', []))}"
             )
         print(f"[TakayamaSCP] resuming from {checkpoint_path} completed_pairs={len(completed_pairs)}{current_desc}")
+    _progress(
+        f"LLM pairwise phase start: dataset={dataset_name}, vars={n}, total_pairs={total_pairs}, "
+        f"completed_pairs={len(completed_pairs)}, samples_per_pair={max(1, num_samples)}"
+    )
 
     def save_checkpoint(*, current_pair_state: dict[str, Any] | None) -> None:
         _atomic_write_json(
@@ -491,6 +531,11 @@ def _llm_probability_matrix(
                 continue
             if (i, j) in completed_pairs:
                 continue
+            pair_done = len(completed_pairs) + 1
+            _progress(
+                f"pair {pair_done}/{total_pairs}: cause={labels[j]} -> effect={labels[i]} "
+                f"(indices {j}->{i})"
+            )
             first_prompt = _build_first_prompt(
                 dataset_name=dataset_name,
                 labels=labels,
@@ -521,6 +566,7 @@ def _llm_probability_matrix(
                 save_checkpoint(current_pair_state=current_pair)
 
             if not pair_state.get("first_answer"):
+                _progress(f"pair {pair_done}/{total_pairs}: requesting first-stage explanation")
                 first_result = _chat_text_completion(
                     provider=provider,
                     client=client,
@@ -554,6 +600,9 @@ def _llm_probability_matrix(
             sample_logs = [dict(sample) for sample in pair_state.get("samples", [])]
             probs = [float(sample.get("prob_yes", 0.0)) for sample in sample_logs]
             for trial in range(len(sample_logs), max(1, num_samples)):
+                _progress(
+                    f"pair {pair_done}/{total_pairs}: second-stage sample {trial + 1}/{max(1, num_samples)}"
+                )
                 second_result = _chat_text_completion(
                     provider=provider,
                     client=client,
@@ -583,6 +632,10 @@ def _llm_probability_matrix(
                 )
                 pair_state["samples"] = sample_logs
                 pair_state["mean_prob_yes"] = float(np.mean(probs)) if probs else 0.0
+                _progress(
+                    f"pair {pair_done}/{total_pairs}: sample {trial + 1} done, "
+                    f"prob_yes={prob_yes:.3f}, running_mean={pair_state['mean_prob_yes']:.3f}"
+                )
                 current_pair = pair_state
                 save_checkpoint(current_pair_state=current_pair)
 
@@ -600,8 +653,13 @@ def _llm_probability_matrix(
             }
             transcript.append(completed_entry)
             completed_pairs.add((i, j))
+            _progress(
+                f"pair {pair_done}/{total_pairs}: completed, mean_prob_yes={mean_matrix[i, j]:.3f}, "
+                f"completed_pairs={len(completed_pairs)}/{total_pairs}"
+            )
             current_pair = None
             save_checkpoint(current_pair_state=None)
+    _progress("LLM pairwise phase done")
     return mean_matrix, transcript
 
 
@@ -739,8 +797,16 @@ def main() -> int:
 
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
+        _progress(
+            f"start graph={graph_path.stem}, provider={provider}, model={args.model}, "
+            f"obs={args.sample_size_obs}, pattern={args.takayama_pattern}, naming={args.naming_regime}"
+        )
+        _progress("loading observational dataframe")
         df, var_names, answer = _load_observational_dataframe(graph_path, args.sample_size_obs, args.seed)
+        _progress(f"loaded dataframe: rows={df.shape[0]}, cols={df.shape[1]}")
+        _progress("running unconstrained PC")
         pc_signed = _run_pc_with_background_knowledge(df, pk_matrix=None)
+        _progress("unconstrained PC done")
         directed_prob, undirected_prob = _bootstrap_pc_probabilities(df, args.bootstrap_samples)
 
         if args.naming_regime == "anonymized":
@@ -783,9 +849,12 @@ def main() -> int:
             checkpoint_path=checkpoint_path,
             run_signature=run_signature,
         )
+        _progress("converting probabilities to prior-knowledge matrix")
         pk_matrix = _probability_to_pk(probability_matrix)
+        _progress("running constrained PC with prior knowledge")
         constrained_pc_signed = _run_pc_with_background_knowledge(df, pk_matrix=pk_matrix)
         prediction = _directed_prediction_from_pc_signed(constrained_pc_signed)
+        _progress("constrained PC done; writing output csv")
 
         _write_prediction_csv(
             out_csv=out_csv,
@@ -800,7 +869,7 @@ def main() -> int:
             pk_matrix=pk_matrix,
         )
         checkpoint_path.unlink(missing_ok=True)
-        print(f"[TakayamaSCP] wrote {out_csv.resolve()}")
+        _progress(f"wrote {out_csv.resolve()}")
     return 0
 
 

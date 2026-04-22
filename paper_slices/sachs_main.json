@@ -32,15 +32,68 @@
       "give_steps": false,
       "def_int": false,
       "intervene_vars": "all"
+    },
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all",
+      "anonymize": false
+    },
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all",
+      "anonymize": true
     }
   ],
-  "enco": {
+  "notes": "Canonical Sachs paper slice: summary_joint vs matrix at obs100/int50, plus names_only and observational summary_joint controls for CausalLLMPrompt and JiralerspongBFS.",
+  "names_only": {
     "enabled": true,
-    "sample_size_obs": 100,
-    "sample_size_inters": 50,
-    "max_inters": -1,
-    "seed": 42,
-    "checkpoint_dir": "experiments/checkpoints/paper_slices/sachs_main/enco"
+    "col_order": "original"
   },
-  "notes": "Canonical main-paper slice: Sachs, real names, obs100/int50, summary_joint vs matrix, matched ENCO."
+  "baselines": [
+    {
+      "name": "ENCO",
+      "enabled": true,
+      "scope": "interventional",
+      "library": "internal",
+      "sample_size_obs": 100,
+      "sample_size_inters": 50,
+      "max_inters": -1,
+      "seed": 42,
+      "checkpoint_dir": "experiments/checkpoints/paper_slices/sachs_main/enco"
+    },
+    {
+      "name": "CausalLLMPrompt",
+      "enabled": true,
+      "scope": "all",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Semantic-only names-only one-shot full-DAG baseline for Sachs."
+    },
+    {
+      "name": "JiralerspongBFS",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Observational-summary BFS-style querying baseline for Sachs."
+    }
+  ]
 }

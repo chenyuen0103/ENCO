@@ -79,7 +79,9 @@ Because this manifest uses in-memory prompting, the full prompt CSVs are not wri
 - Synthetic datasets are materialized as `.pt` causal graphs under `benchmark_runs/<name>/graphs/`.
 - Optional classical baselines require `pgmpy` for `PC` and `GES`.
 - Optional external LLM baselines are available as `TakayamaSCP`, `JiralerspongBFS`,
-  `CausalLLMPrompt`, and `CausalLLMData`.
+  `CausalLLMPrompt`, and `CausalLLMData`. `CausalLLMPrompt` is a semantic names-only
+  baseline, `JiralerspongBFS` is an observational-summary querying baseline, and
+  `CausalLLMData` is a one-shot data-backed prompting baseline.
 - `TakayamaSCP` is observational-only and currently requires `provider: "openai"` because it uses
   token logprobs for faithful yes/no probability extraction.
 - The demo is for authoring evidence, not for headline paper claims.

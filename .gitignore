@@ -183,3 +183,5 @@ experiments/data/
 
 
 *.DS_Store
+
+experiments/responses_before/
