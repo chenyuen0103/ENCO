@@ -13,6 +13,7 @@ import io
 import inspect
 import shlex
 import warnings
+import shutil
 from typing import Any
 from contextlib import redirect_stdout, redirect_stderr
 import torch
@@ -91,6 +92,141 @@ except Exception:
 
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+
+
+def _has_full_model_config(model_dir: Path) -> bool:
+    model_dir = Path(model_dir)
+    return (model_dir / "config.json").exists() or (model_dir / "params.json").exists()
+
+
+def _is_adapter_dir(model_dir: Path) -> bool:
+    return (Path(model_dir) / "adapter_config.json").exists()
+
+
+def _merge_adapter_for_vllm(model_dir: Path, *, base_model_override: str | None = None) -> Path:
+    """
+    Merge a PEFT adapter directory into a full model directory suitable for vLLM.
+
+    The merged checkpoint is cached at `<adapter_dir>_merged_vllm` and reused if it
+    already exists with a recognizable config file.
+    """
+    model_dir = Path(model_dir).resolve()
+    merged_dir = model_dir.parent / f"{model_dir.name}_merged_vllm"
+    if _has_full_model_config(merged_dir):
+        print(f"[vllm] reusing existing merged model for adapter checkpoint: {merged_dir}")
+        return merged_dir
+
+    from peft import PeftModel
+
+    adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    base_model_name = str(base_model_override or adapter_cfg.get("base_model_name_or_path") or "").strip()
+    if not base_model_name:
+        raise ValueError(
+            f"Cannot merge adapter {model_dir}: no base model override was provided and "
+            "adapter_config.json does not declare base_model_name_or_path"
+        )
+    tokenizer_source = Path(base_model_name) if Path(base_model_name).exists() else Path(str(base_model_name))
+
+    print(f"[vllm] merging adapter for vLLM: {model_dir} -> {merged_dir}")
+    base = AutoModelForCausalLM.from_pretrained(
+        str(base_model_name),
+        torch_dtype="auto",
+    )
+    model = PeftModel.from_pretrained(base, str(model_dir))
+    merged = model.merge_and_unload()
+
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(str(merged_dir))
+    # Avoid tokenizer instantiation here: some environment/version combinations
+    # trip over adapter tokenizer_config.json (`extra_special_tokens` stored as a list).
+    # Copy the base tokenizer assets directly, then overlay adapter-specific files
+    # such as the chat template when present.
+    tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "spiece.model",
+    ]
+    for filename in tokenizer_files:
+        src = tokenizer_source / filename
+        if src.exists():
+            shutil.copy2(src, merged_dir / filename)
+    chat_template_src = model_dir / "chat_template.jinja"
+    if chat_template_src.exists():
+        shutil.copy2(chat_template_src, merged_dir / "chat_template.jinja")
+    print(f"[vllm] saved merged model -> {merged_dir}")
+    return merged_dir
+
+
+def _maybe_prepare_vllm_model(args) -> None:
+    """
+    Ensure the model path used by TRL vLLM server mode is a full model directory.
+
+    vLLM cannot load LoRA adapter-only directories because they do not contain a
+    base-model `config.json`. When server mode points at such a directory, merge it
+    once and redirect vLLM to the merged checkpoint.
+    """
+    if not getattr(args, "use_vllm", False):
+        return
+    if getattr(args, "vllm_mode", None) != "server":
+        return
+
+    candidate_ref = getattr(args, "vllm_server_model_id", None) or getattr(args, "model_id", None)
+    if not candidate_ref:
+        return
+
+    candidate_path = Path(str(candidate_ref)).expanduser()
+    if not candidate_path.exists():
+        return
+    if _has_full_model_config(candidate_path):
+        return
+    if not _is_adapter_dir(candidate_path):
+        return
+
+    merged_path = _merge_adapter_for_vllm(
+        candidate_path,
+        base_model_override=getattr(args, "base_model_override", None),
+    )
+    args.vllm_server_model_id = str(merged_path)
+    print(f"[vllm] server model path set to merged checkpoint: {args.vllm_server_model_id}")
+
+
+def _ensure_model_warnings_issued(model) -> None:
+    """
+    TRL >= 0.24 may expect `model.warnings_issued` to exist on the model object.
+    Some PEFT-wrapped models do not expose that attribute, so seed it explicitly
+    on the wrapper and any reachable base model layers.
+    """
+    candidates = [model]
+    for attr in ("base_model", "model"):
+        try:
+            child = getattr(model, attr, None)
+        except Exception:
+            child = None
+        if child is not None:
+            candidates.append(child)
+            for sub_attr in ("model", "base_model"):
+                try:
+                    sub_child = getattr(child, sub_attr, None)
+                except Exception:
+                    sub_child = None
+                if sub_child is not None:
+                    candidates.append(sub_child)
+    seen: set[int] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        ident = id(candidate)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if not hasattr(candidate, "warnings_issued"):
+            try:
+                setattr(candidate, "warnings_issued", {})
+            except Exception:
+                pass
 
 
 def _import_trl_grpo(*, use_vllm: bool = True):
@@ -482,7 +618,14 @@ class RewardExtremaCallback(TrainerCallback):
         try:
             import wandb as _wandb
             if _wandb.run is not None:
-                _wandb.log(payload, step=int(state.global_step))
+                # Trainer-managed metrics typically appear under the `train/` namespace
+                # in W&B. Mirror the extrema there so they show up alongside the
+                # existing mean/std reward series, while also preserving the legacy
+                # unprefixed keys for backward compatibility.
+                wandb_payload = dict(payload)
+                for key, value in payload.items():
+                    wandb_payload[f"train/{key}"] = value
+                _wandb.log(wandb_payload, step=int(state.global_step))
         except Exception:
             pass
 
@@ -1106,6 +1249,19 @@ def _sanitize_for_log(text: str, max_chars: int) -> str:
     if max_chars > 0 and len(compact) > max_chars:
         return compact[:max_chars] + "...[truncated]"
     return compact
+
+
+def _middle_truncate_ids(ids: list, max_len: int) -> list:
+    """Keep the first half and last half of token ids, dropping the middle.
+
+    Preserves task instructions (head) and format spec (tail) while dropping
+    data tokens in the middle when a prompt exceeds max_len.
+    """
+    if len(ids) <= max_len:
+        return ids
+    keep_head = max_len // 2
+    keep_tail = max_len - keep_head
+    return ids[:keep_head] + ids[-keep_tail:]
 
 
 def _print_prompt_diagnostics(dataset: Dataset, *, split_name: str):
@@ -1747,18 +1903,18 @@ def _eval_on_dataset(
     for batch_start in range(0, len(eval_dataset), batch_size):
         batch_examples = [eval_dataset[i] for i in range(batch_start, min(batch_start + batch_size, len(eval_dataset)))]
         prompts = [_build_prompt_for_eval(example) for example in batch_examples]
-        tokenization_kwargs = {
-            "return_tensors": "pt",
-            "padding": True,
-        }
         if max_prompt_tokens and int(max_prompt_tokens) > 0:
-            tokenization_kwargs.update(
-                {
-                    "truncation": True,
-                    "max_length": int(max_prompt_tokens),
-                }
-            )
-        inputs = tokenizer(prompts, **tokenization_kwargs).to(input_device)
+            truncated_ids = [
+                _middle_truncate_ids(tokenizer(p, truncation=False)["input_ids"], int(max_prompt_tokens))
+                for p in prompts
+            ]
+            inputs = tokenizer.pad(
+                [{"input_ids": ids} for ids in truncated_ids],
+                return_tensors="pt",
+                padding=True,
+            ).to(input_device)
+        else:
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(input_device)
         padded_input_len = int(inputs["input_ids"].shape[1])
 
         with torch.no_grad():
@@ -2442,7 +2598,7 @@ def run_train(args, argv: list[str] | None = None):
         def add_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
             text = build_prompt(example["problem"])
             orig_ids = tokenizer(text, truncation=False)["input_ids"]
-            ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
+            ids = _middle_truncate_ids(orig_ids, int(max_prompt_tokens))
             return {
                 "prompt": tokenizer.decode(ids, skip_special_tokens=True),
                 "__prompt_orig_tokens": len(orig_ids),
@@ -2539,7 +2695,7 @@ def run_train(args, argv: list[str] | None = None):
         def _truncate_cd_prompt(example, max_prompt_tokens=args.max_prompt_tokens):
             text = str(example["prompt"])
             orig_ids = tokenizer(text, truncation=False)["input_ids"]
-            ids = tokenizer(text, truncation=True, max_length=max_prompt_tokens)["input_ids"]
+            ids = _middle_truncate_ids(orig_ids, int(max_prompt_tokens))
             return {
                 "prompt": tokenizer.decode(ids, skip_special_tokens=True),
                 "__prompt_orig_tokens": len(orig_ids),
@@ -2657,6 +2813,8 @@ def run_train(args, argv: list[str] | None = None):
         model = get_peft_model(model, lora_config)
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
+
+    _ensure_model_warnings_issued(model)
 
     # Keep all floating modules in one dtype. Some adapter/base combinations can
     # otherwise mix fp32 and bf16 and fail in Linear matmul.
@@ -2844,15 +3002,19 @@ def run_train(args, argv: list[str] | None = None):
     def _prompt_as_model_sees(text: str) -> str:
         """Tokenize the prompt then decode with special tokens preserved.
 
-        This reflects what the model actually receives: if the tokenizer adds
-        BOS tokens or the text round-trips differently, it will show up here.
-        Truncates at the end of the assistant-prefill <think> tag so the logged
-        prompt does not include any prefilled chain-of-thought content.
+        This reflects what the model actually receives: applies the same
+        max_prompt_tokens truncation used at generation time, so if the
+        tokenizer adds BOS tokens or the text round-trips differently it will
+        show up here. Also truncates at the end of the assistant-prefill
+        <think> tag so the logged prompt does not include any prefilled
+        chain-of-thought content.
         """
         if not text:
             return text
         try:
-            ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"][0]
+            max_len = int(args.max_prompt_tokens) if args.max_prompt_tokens and int(args.max_prompt_tokens) > 0 else None
+            raw_ids = tokenizer(text, truncation=False)["input_ids"]
+            ids = _middle_truncate_ids(raw_ids, max_len) if max_len else raw_ids
             decoded = tokenizer.decode(ids)  # skip_special_tokens=False by default
         except Exception:
             decoded = text
@@ -3316,6 +3478,7 @@ def main():
             "because the reward stack expects think/answer completions."
         )
     _maybe_enable_small_graph_logging(args, argv)
+    _maybe_prepare_vllm_model(args)
     _maybe_launch_local_vllm_and_reexec_train(args)
     if args.mode == "eval":
         run_eval(args)

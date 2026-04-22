@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -1400,6 +1401,43 @@ def run_grpo_readiness_checkpoint_sweep(
     candidates = _list_grpo_readiness_candidates(sft_output_dir)
     if not candidates:
         raise RuntimeError(f"No checkpoint candidates found under {Path(sft_output_dir).resolve()}")
+    summary_out = Path(summary_out).resolve()
+    summary_out.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write_partial_summary(rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        ordered = sorted(rows, key=lambda item: (-float(item["readiness_score"]), str(item["checkpoint_dir"])))
+        tmp_path = summary_out.with_suffix(summary_out.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            for row in ordered:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        tmp_path.replace(summary_out)
+
+        best = ordered[0]
+        best_out = summary_out.with_name(summary_out.stem + "_best.json")
+        best_tmp = best_out.with_suffix(best_out.suffix + ".tmp")
+        best_tmp.write_text(json.dumps(best, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        best_tmp.replace(best_out)
+
+    existing_results: dict[str, dict[str, Any]] = {}
+    if summary_out.exists():
+        try:
+            with summary_out.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    checkpoint_dir = str(Path(row["checkpoint_dir"]).resolve())
+                    existing_results[checkpoint_dir] = row
+            if existing_results:
+                print(
+                    f"[grpo-readiness] resuming from existing summary with "
+                    f"{len(existing_results)} completed checkpoint(s): {summary_out}"
+                )
+        except Exception as exc:
+            print(f"[grpo-readiness] could not read existing summary {summary_out}: {exc}")
 
     def _build_eval_cmd(checkpoint_dir: Path) -> tuple[str, Path, list[str]]:
         checkpoint_label = "output_dir" if checkpoint_dir == Path(sft_output_dir).resolve() else checkpoint_dir.name
@@ -1425,6 +1463,25 @@ def run_grpo_readiness_checkpoint_sweep(
             cmd.extend([str(x) for x in graph_filter])
         return checkpoint_label, output_jsonl, cmd
 
+    for checkpoint_dir in candidates:
+        checkpoint_key = str(Path(checkpoint_dir).resolve())
+        if checkpoint_key in existing_results:
+            continue
+        _, output_jsonl, _ = _build_eval_cmd(checkpoint_dir)
+        if output_jsonl.exists():
+            try:
+                summary = _summarize_grpo_readiness_eval(output_jsonl, checkpoint_dir, sft_output_dir)
+                existing_results[checkpoint_key] = summary
+                print(
+                    f"[grpo-readiness] recovered existing eval for "
+                    f"{summary['checkpoint_label']} from {output_jsonl}"
+                )
+            except Exception as exc:
+                print(f"[grpo-readiness] ignoring unreadable existing eval {output_jsonl}: {exc}")
+
+    if existing_results:
+        _write_partial_summary(list(existing_results.values()))
+
     def _evaluate_one(checkpoint_dir: Path, *, gpu_id: str | None) -> dict[str, Any]:
         checkpoint_label, output_jsonl, cmd = _build_eval_cmd(checkpoint_dir)
         gpu_note = f" on GPU {gpu_id}" if gpu_id is not None else ""
@@ -1446,16 +1503,43 @@ def run_grpo_readiness_checkpoint_sweep(
         )
         return summary
 
+    pending_candidates = [
+        checkpoint_dir
+        for checkpoint_dir in candidates
+        if str(Path(checkpoint_dir).resolve()) not in existing_results
+    ]
+    if not pending_candidates:
+        results = list(existing_results.values())
+        results.sort(key=lambda item: (-float(item["readiness_score"]), str(item["checkpoint_dir"])))
+        print(f"[grpo-readiness] all checkpoint results already available in {summary_out}")
+        return results
+
     requested_workers = max(1, int(parallel_workers))
     visible_gpus = _parse_cuda_visible_devices((env or {}).get("CUDA_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES"))
     if requested_workers > 1 and not visible_gpus:
         print("[grpo-readiness] no CUDA_VISIBLE_DEVICES list found; falling back to sequential readiness sweep")
         requested_workers = 1
 
-    results: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = list(existing_results.values())
+    results_lock = threading.Lock()
+    worker_errors: list[Exception] = []
+
+    def _record_result(summary: dict[str, Any]) -> None:
+        with results_lock:
+            checkpoint_key = str(Path(summary["checkpoint_dir"]).resolve())
+            deduped = {
+                str(Path(item["checkpoint_dir"]).resolve()): item
+                for item in results
+            }
+            deduped[checkpoint_key] = summary
+            results.clear()
+            results.extend(deduped.values())
+            _write_partial_summary(results)
+
     if requested_workers <= 1:
-        for checkpoint_dir in candidates:
-            results.append(_evaluate_one(checkpoint_dir, gpu_id=None))
+        for checkpoint_dir in pending_candidates:
+            summary = _evaluate_one(checkpoint_dir, gpu_id=None)
+            _record_result(summary)
     else:
         worker_gpus = visible_gpus[:requested_workers]
         if len(worker_gpus) < requested_workers:
@@ -1464,9 +1548,9 @@ def run_grpo_readiness_checkpoint_sweep(
                 f"{len(worker_gpus)} visible GPU(s); using {len(worker_gpus)} worker(s)"
             )
         requested_workers = max(1, len(worker_gpus))
-        shard_count = min(requested_workers, len(candidates))
+        shard_count = min(requested_workers, len(pending_candidates))
         candidate_shards: list[list[Path]] = [[] for _ in range(shard_count)]
-        for idx, checkpoint_dir in enumerate(candidates):
+        for idx, checkpoint_dir in enumerate(pending_candidates):
             candidate_shards[idx % shard_count].append(checkpoint_dir)
         worker_specs = [
             (worker_gpus[idx], candidate_shards[idx])
@@ -1478,8 +1562,10 @@ def run_grpo_readiness_checkpoint_sweep(
             + ", ".join(f"GPU {gpu_id} -> {len(shard)} checkpoint(s)" for gpu_id, shard in worker_specs)
         )
 
-        def _run_worker(gpu_id: str, shard: list[Path]) -> list[dict[str, Any]]:
-            return [_evaluate_one(checkpoint_dir, gpu_id=gpu_id) for checkpoint_dir in shard]
+        def _run_worker(gpu_id: str, shard: list[Path]) -> None:
+            for checkpoint_dir in shard:
+                summary = _evaluate_one(checkpoint_dir, gpu_id=gpu_id)
+                _record_result(summary)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_specs)) as executor:
             futures = [
@@ -1487,20 +1573,20 @@ def run_grpo_readiness_checkpoint_sweep(
                 for gpu_id, shard in worker_specs
             ]
             for future in concurrent.futures.as_completed(futures):
-                results.extend(future.result())
+                try:
+                    future.result()
+                except Exception as exc:
+                    worker_errors.append(exc)
+
+        if worker_errors:
+            raise worker_errors[0]
 
     results.sort(key=lambda item: (-float(item["readiness_score"]), str(item["checkpoint_dir"])))
-    summary_out = Path(summary_out).resolve()
-    summary_out.parent.mkdir(parents=True, exist_ok=True)
-    with summary_out.open("w", encoding="utf-8") as f:
-        for row in results:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    best = results[0]
-    best_out = summary_out.with_name(summary_out.stem + "_best.json")
-    best_out.write_text(json.dumps(best, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_partial_summary(results)
 
     print(f"[grpo-readiness] wrote ranking -> {summary_out}")
+    best = results[0]
+    best_out = summary_out.with_name(summary_out.stem + "_best.json")
     print(f"[grpo-readiness] wrote best checkpoint summary -> {best_out}")
     print(
         f"[grpo-readiness] best checkpoint: {best['checkpoint_label']} "

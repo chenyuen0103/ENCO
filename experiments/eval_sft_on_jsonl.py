@@ -59,8 +59,10 @@ import argparse
 import csv
 import json
 import random
+import shutil
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -304,6 +306,78 @@ def _resolve_tokenizer_source(model_path: str, base_model_id: str) -> str:
             if _has_tokenizer_assets(candidate):
                 return str(candidate)
     return base_model_id
+
+
+def _prepare_tokenizer_source(tokenizer_source: str, base_model_id: str) -> str:
+    """
+    Return a tokenizer source path safe for AutoTokenizer.from_pretrained().
+
+    Some local Qwen checkpoint tokenizer_config.json files store
+    `extra_special_tokens` as a list, while newer Transformers expects a dict.
+    When that shape is detected, create a temporary sanitized tokenizer directory:
+      - copy tokenizer assets from the base model when available
+      - overlay adapter/chat-template files from the local checkpoint
+      - if needed, rewrite tokenizer_config.json with a dict-valued
+        `extra_special_tokens`
+    """
+    src_path = Path(str(tokenizer_source)).expanduser()
+    if not src_path.exists():
+        return tokenizer_source
+
+    cfg_path = src_path / "tokenizer_config.json"
+    if not cfg_path.exists():
+        return tokenizer_source
+
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return tokenizer_source
+
+    if not isinstance(cfg.get("extra_special_tokens"), list):
+        return tokenizer_source
+
+    base_path = Path(str(base_model_id)).expanduser()
+    base_has_assets = base_path.exists() and _has_tokenizer_assets(base_path)
+    tmp_dir = Path(
+        tempfile.mkdtemp(prefix=f"enco_eval_tok_{src_path.name}_", dir="/tmp")
+    )
+    asset_names = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+        "spiece.model",
+    ]
+
+    if base_has_assets:
+        for name in asset_names:
+            src = base_path / name
+            if src.exists():
+                shutil.copy2(src, tmp_dir / name)
+        if (src_path / "chat_template.jinja").exists():
+            shutil.copy2(src_path / "chat_template.jinja", tmp_dir / "chat_template.jinja")
+        if (src_path / "tokenizer.json").exists():
+            shutil.copy2(src_path / "tokenizer.json", tmp_dir / "tokenizer.json")
+    else:
+        for name in asset_names:
+            src = src_path / name
+            if src.exists():
+                shutil.copy2(src, tmp_dir / name)
+
+    tmp_cfg_path = tmp_dir / "tokenizer_config.json"
+    if tmp_cfg_path.exists():
+        try:
+            tmp_cfg = json.loads(tmp_cfg_path.read_text(encoding="utf-8"))
+            if isinstance(tmp_cfg.get("extra_special_tokens"), list):
+                tmp_cfg["extra_special_tokens"] = {}
+                tmp_cfg_path.write_text(json.dumps(tmp_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    print(f"[tokenizer] sanitized tokenizer assets -> {tmp_dir}", flush=True)
+    return str(tmp_dir)
 
 
 def _build_reward_kwargs(prompt: str, ground_truth: str, task: str) -> dict[str, list[Any]]:
@@ -710,6 +784,7 @@ def _load_model_and_tokenizer(
         )
         print(f"Loading base model: {base_model_id}", flush=True)
         tokenizer_source = _resolve_tokenizer_source(model_path, base_model_id)
+        tokenizer_source = _prepare_tokenizer_source(tokenizer_source, base_model_id)
         print(f"Loading tokenizer from: {tokenizer_source}", flush=True)
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
         model_kwargs: dict[str, Any] = {
@@ -725,7 +800,8 @@ def _load_model_and_tokenizer(
     else:
         model_id, model_is_local = _normalize_model_ref(model_path)
         print(f"Loading model: {model_id}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        tokenizer_source = _prepare_tokenizer_source(model_id, model_id)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
         model_kwargs = {
             "trust_remote_code": True,
             "device_map": device_map,

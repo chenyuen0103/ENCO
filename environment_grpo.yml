@@ -1,0 +1,39 @@
+name: grpo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy=2.2.2
+  - scipy
+  - pandas
+  - tqdm=4.67.1
+  - fsspec=2025.9.0
+  - pip
+  - pip:
+      # Core runtime pinned to versions recorded in prior successful GRPO checkpoints.
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - torchaudio==2.8.0
+      - transformers==4.57.1
+      - trl==0.24.0
+      - peft==0.18.1
+      - accelerate==1.12.0
+      - datasets==4.3.0
+      - tokenizers==0.22.2
+      - sentencepiece>=0.2.0,<0.3
+      - safetensors>=0.6.0,<0.7
+      - huggingface_hub>=0.34,<1
+      - wandb>=0.19,<1
+      - protobuf>=5,<7
+      - packaging>=24,<26
+      - pydantic>=2.11.7,<3
+      - lark==1.2.2
+
+      # Intentionally omitted:
+      # - unsloth
+      # - vllm
+      # - mergekit
+      # - llm_blender
+      #
+      # GRPO training in this repo does not require them for the standard
+      # `--no-use-vllm` path, and excluding them keeps the environment stable.
