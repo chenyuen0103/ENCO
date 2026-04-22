@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 try:
-    from cd_training_format import (
+    from cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         build_payload_completion,
         canonicalize_cd_prompt,
@@ -24,7 +24,7 @@ try:
     )
     from run_sft_then_grpo import run_sft
 except ModuleNotFoundError:
-    from experiments.cd_training_format import (
+    from experiments.cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         build_payload_completion,
         canonicalize_cd_prompt,

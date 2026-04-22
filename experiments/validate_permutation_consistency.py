@@ -133,7 +133,7 @@ def _collect_examples(
         num_prompts=num_prompts,
         shuffles_per_graph=1,
         seed=seed,
-        prompt_style="summary_joint",
+        prompt_style="summary",
         obs_per_prompt=obs_per_prompt,
         int_per_combo=int_per_combo,
         row_order="random",
@@ -143,7 +143,6 @@ def _collect_examples(
         give_steps=False,
         def_int=True,
         intervene_vars="all",
-        thinking_tags=False,
     )
     return answer_obj, list(prompt_iter)
 

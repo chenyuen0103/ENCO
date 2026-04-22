@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import csv
 import json
@@ -11,14 +10,29 @@ from typing import List, Dict, Any, Tuple, Optional, Iterator
 
 import numpy as np
 
-LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
-
-# Allow running from experiments/ with repo root one level up
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 try:
-    from cd_training_format import canonicalize_cd_prompt, default_format_hint_text
-except Exception:
-    from experiments.cd_training_format import canonicalize_cd_prompt, default_format_hint_text
+    from .prompt_utils import (
+        LARGE_GRAPH_EDGE_LIST_THRESHOLD,
+        build_causal_discovery_reminder_lines,
+        build_causal_graph_assumption_lines,
+        _build_output_contract_lines,
+        get_topological_sort,
+        normalize_variable_names,
+        render_prompt_text,
+        resolve_wrapper_mode,
+    )
+except ImportError:
+    sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+    from experiments.cd_generation.prompt_utils import (
+        LARGE_GRAPH_EDGE_LIST_THRESHOLD,
+        build_causal_discovery_reminder_lines,
+        build_causal_graph_assumption_lines,
+        _build_output_contract_lines,
+        get_topological_sort,
+        normalize_variable_names,
+        render_prompt_text,
+        resolve_wrapper_mode,
+    )
 try:
     from benchmark_builder.graph_io import load_causal_graph as _load_graph_file_full  # type: ignore
 except Exception:
@@ -61,75 +75,6 @@ def load_graph_file(filename: str) -> SimpleNamespace:
     return _load_graph_file_light(filename)
 
 
-def _build_output_contract_lines(
-    *,
-    output_edge_list: bool,
-    require_think_answer_blocks: bool = True,
-) -> List[str]:
-    """Shared output contract for consistent format instructions."""
-    if output_edge_list:
-        json_key = "edges"
-        json_field_desc = '- "edges": [["source","target"], ...] using exact variable names.'
-    else:
-        json_key = "adjacency_matrix"
-        json_field_desc = '- "adjacency_matrix": N x N 0/1 matrix in declared variable order.'
-
-    _ = require_think_answer_blocks
-    return [
-        "Output exactly: <think>...</think><answer>...</answer>.",
-        "Keep <think> concise (minimal necessary reasoning only).",
-        f'Inside <answer>, output exactly one JSON object with key "{json_key}".',
-        json_field_desc,
-        "No extra text before, between, or after the two blocks.",
-        'The JSON in <answer> must start with "{" and end with "}".',
-    ]
-
-
-def _maybe_apply_cot_hint(prompt_text: str, *, cot_hint: bool) -> str:
-    if not cot_hint:
-        return prompt_text
-    return canonicalize_cd_prompt(
-        prompt_text,
-        task="causal_discovery",
-        wrap_system_prompt=True,
-        append_format_hint=True,
-        format_hint_text=default_format_hint_text("causal_discovery"),
-        prefill_think=True,
-        prefill_answer=False,
-        think_text="",
-    )
-
-# ------------------------ Helpers ------------------------ #
-
-def get_topological_sort(adj_matrix: List[List[int]]) -> List[int]:
-    """Returns a list of node indices in topological order (Causes -> Effects)."""
-    n = len(adj_matrix)
-    in_degree = [0] * n
-    for i in range(n):
-        for j in range(n):
-            if adj_matrix[i][j] == 1:
-                in_degree[j] += 1
-    
-    queue = [i for i in range(n) if in_degree[i] == 0]
-    queue.sort() # Deterministic tie-breaking
-    topo_order = []
-    
-    in_degree_curr = list(in_degree)
-    while queue:
-        u = queue.pop(0)
-        topo_order.append(u)
-        for v in range(n):
-            if adj_matrix[u][v] == 1:
-                in_degree_curr[v] -= 1
-                if in_degree_curr[v] == 0:
-                    queue.append(v)
-    
-    if len(topo_order) != n: return list(range(n)) # Cycle fallback
-    return topo_order
-
-def normalize_variable_names(graph) -> List[str]:
-    return [v.name for v in graph.variables]
-
 def format_names_only_prompt(
     variables: List[str],
     dataset_name: str,
@@ -139,18 +84,27 @@ def format_names_only_prompt(
     anonymize: bool = False,
 ) -> str:
     lines = []
-    lines.append("You are a question-answering assistant with knowledge of causal inference and causal discovery.")
+    lines.append("ROLE: You are an expert in causal discovery from variable semantics and background knowledge.")
+    lines.append("TASK: Infer the directed causal graph over the variables.")
     if anonymize:
         lines.append("We are studying an anonymized causal system.")
     else:
         lines.append(f"We are studying a system called '{dataset_name}'.")
-    lines.append("No observational or interventional data are provided for this case.")
-    lines.append("Infer the directed causal graph over the variables using background causal knowledge.")
+    lines.append("No observational or interventional data are provided for this case. Use only the variable meanings and relevant background causal knowledge.")
+    lines.append("ASSUMPTIONS:")
+    lines.extend(build_causal_graph_assumption_lines(include_intervention_assumption=False))
     
-    lines.append("\n--- VARIABLES ---")
-    # Explicitly show the order
-    lines.append(f"The variables in the system are: {', '.join(variables)}")
+    lines.append("\n--- VARIABLE ORDER (ORDER MATTERS) ---")
+    for i, var in enumerate(variables):
+        lines.append(f"{i}: {var}")
     
+    if include_causal_rules:
+        lines.append("\n--- CAUSAL DISCOVERY REMINDERS ---")
+        lines.extend(build_causal_discovery_reminder_lines())
+
+    lines.append("\n--- AVAILABLE EVIDENCE ---")
+    lines.append("No sampled data are provided. The graph must be inferred from the variable names and domain knowledge alone.")
+
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.extend(
         _build_output_contract_lines(
@@ -158,10 +112,6 @@ def format_names_only_prompt(
             require_think_answer_blocks=require_think_answer_blocks,
         )
     )
-    
-    if include_causal_rules:
-        lines.append("\n--- REMINDER ---")
-        lines.append("Recall that X->Y implies a causal mechanism where manipulating X changes Y.")
 
     return "\n".join(lines)
 
@@ -174,8 +124,10 @@ def iter_names_only_prompts_in_memory(
     col_order: str,
     anonymize: bool,
     causal_rules: bool,
-    thinking_tags: bool = True,
-    cot_hint: bool = False,
+    wrapper_mode: Optional[str] = None,
+    append_format_hint: Optional[bool] = None,
+    prefill_think: Optional[bool] = None,
+    prefill_answer: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate names-only prompts in-memory.
@@ -185,6 +137,9 @@ def iter_names_only_prompts_in_memory(
     graph = load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
+    resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=wrapper_mode)
+    resolved_append_format_hint = bool(append_format_hint)
+    require_think_answer_blocks = True
 
     adj_np = np.asarray(graph.adj_matrix)
     base_adj_bin = (adj_np > 0).astype(int).tolist()
@@ -233,8 +188,10 @@ def iter_names_only_prompts_in_memory(
         answer_obj["adjacency_matrix"] = adj_bin
 
     base_name = f"prompts_names_only_p{num_prompts}"
-    if cot_hint:
-        base_name += "_cothint"
+    if resolved_wrapper_mode != "plain":
+        base_name += f"_wrap{resolved_wrapper_mode}"
+    if resolved_append_format_hint:
+        base_name += "_fmthint"
     if col_order != "original":
         base_name += f"_col{col_order.capitalize()}"
 
@@ -244,10 +201,17 @@ def iter_names_only_prompts_in_memory(
         dataset_name,
         causal_rules,
         output_edge_list=use_edge_list_output,
-        require_think_answer_blocks=thinking_tags,
+        require_think_answer_blocks=require_think_answer_blocks,
         anonymize=anonymize,
     )
-    prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(cot_hint))
+    prompt_text = render_prompt_text(
+        prompt_text,
+        task="causal_discovery",
+        wrapper_mode=resolved_wrapper_mode,
+        append_format_hint=resolved_append_format_hint,
+        prefill_think=prefill_think,
+        prefill_answer=prefill_answer,
+    )
 
     def _iter() -> Iterator[dict[str, Any]]:
         for i in range(num_prompts):
@@ -279,14 +243,18 @@ def main():
     ap.add_argument("--anonymize", action="store_true")
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument(
-        "--thinking-tags",
-        action="store_true",
-        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+        "--wrapper-mode",
+        choices=["plain", "chat"],
+        default=None,
+        help="Prompt transport: plain text or system/user/assistant chat wrapper.",
     )
     ap.add_argument(
-        "--cot-hint",
+        "--append-format-hint",
         action="store_true",
-        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+        help=(
+            "Append the canonical Formatting requirement line. For causal discovery this "
+            "adds the optional stage-by-stage reasoning instructions."
+        ),
     )
     
     # --- Dummy Arguments (Accepted to ignore) ---
@@ -301,6 +269,8 @@ def main():
     ap.add_argument("--give-steps", action="store_true")
 
     args = ap.parse_args()
+    resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=args.wrapper_mode)
+    require_think_answer_blocks = True
 
     # 1. Load Graph
     graph_file = args.graph_file or args.bif_file
@@ -354,8 +324,10 @@ def main():
     prompt_txt_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = f"prompts_names_only_p{args.num_prompts}"
-    if args.cot_hint:
-        base_name += "_cothint"
+    if resolved_wrapper_mode != "plain":
+        base_name += f"_wrap{resolved_wrapper_mode}"
+    if args.append_format_hint:
+        base_name += "_fmthint"
     if args.col_order != "original": base_name += f"_col{args.col_order.capitalize()}"
     
     csv_path = out_dir / f"{base_name}.csv"
@@ -391,10 +363,15 @@ def main():
         dataset_name,
         args.causal_rules,
         output_edge_list=use_edge_list_output,
-        require_think_answer_blocks=args.thinking_tags,
+        require_think_answer_blocks=require_think_answer_blocks,
         anonymize=args.anonymize,
     )
-    prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(args.cot_hint))
+    prompt_text = render_prompt_text(
+        prompt_text,
+        task="causal_discovery",
+        wrapper_mode=resolved_wrapper_mode,
+        append_format_hint=bool(args.append_format_hint),
+    )
     
     print(f"Generating 'Names Only' prompts into {out_dir}...")
 

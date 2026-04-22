@@ -74,7 +74,7 @@
 
 The paper is centered on a benchmark artifact, not a new causal-discovery algorithm. The repository already supports:
 
-- graph-backed prompt generation through `experiments/generate_prompts.py` and `experiments/generate_prompts_names_only.py`
+- graph-backed prompt generation through `experiments/generate_prompts.py` and `experiments/cd_generation/names_only.py`
 - end-to-end execution via `experiments/run_experiment1_pipeline.py`
 - querying across OpenAI, Gemini, and HF / local model backends
 - evaluation and aggregation through `experiments/evaluate.py` and `experiments/collect_results_table.py`
@@ -139,8 +139,8 @@ The benchmark release should make the following first-class:
 | System | Role | Status | Source |
 |--------|------|--------|--------|
 | ENCO | classical anchor baseline | implemented | `causal_discovery/`, `experiments/run_exported_graphs.py` |
-| `gpt-5-mini` | primary closed-model benchmark runner | implemented | `experiments/run_experiment1_pipeline.py`, `experiments/query_gemini.py` |
-| `gemini-2.5-flash` | second API benchmark runner | implemented | `experiments/run_experiment1_pipeline.py`, `experiments/query_gemini.py` |
+| `gpt-5-mini` | primary closed-model benchmark runner | implemented | `experiments/run_experiment1_pipeline.py`, `experiments/query_api.py` |
+| `gemini-2.5-flash` | second API benchmark runner | implemented | `experiments/run_experiment1_pipeline.py`, `experiments/query_api.py` |
 | Curriculum launcher | appendix-level extensibility evidence | partially implemented | `experiments/run_cd_curriculum.py` |
 
 ## Current Results

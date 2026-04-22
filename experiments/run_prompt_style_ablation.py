@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate a single `summary_hist_rows` prompt and deterministically convert it into
-`summary` and `summary_joint` prompts (same underlying empirical data).
+a `summary` prompt (same underlying empirical data).
 
 This driver always uses `--intervene-vars all` when `--int-per-combo > 0` to avoid
 accidentally generating interventions for only a subset of variables.
@@ -102,15 +102,12 @@ def main() -> None:
     if not hist_rows_prompts:
         raise SystemExit(f"No *_summary_hist_rows_data*_shuf*.txt found under: {prompt_txt_dir}")
 
-    # 2) Convert each hist_rows prompt into summary + summary_joint in the same out_dir.
+    # 2) Convert each hist_rows prompt into summary in the same out_dir.
     for in_prompt_txt in hist_rows_prompts:
         if not args.overwrite:
-            # If both target styles already exist, skip.
             stem = in_prompt_txt.name.replace("_summary_hist_rows_", "_summary_")
             maybe_summary = prompt_txt_dir / stem
-            stem2 = in_prompt_txt.name.replace("_summary_hist_rows_", "_summary_joint_")
-            maybe_joint = prompt_txt_dir / stem2
-            if maybe_summary.exists() and maybe_joint.exists():
+            if maybe_summary.exists():
                 print(f"[skip] Already converted: {in_prompt_txt.name}")
                 continue
 
@@ -120,7 +117,7 @@ def main() -> None:
             "--in-prompt-txt",
             str(in_prompt_txt),
             "--out-styles",
-            "summary,summary_joint",
+            "summary",
             "--out-dir",
             str(out_dir),
         ]
@@ -129,7 +126,7 @@ def main() -> None:
 
     # 3) Print a compact size report.
     size_rows: list[dict[str, object]] = []
-    for style in ("summary_hist_rows", "summary", "summary_joint"):
+    for style in ("summary_hist_rows", "summary"):
         for p in sorted(prompt_txt_dir.glob(f"*_{style}_data*_shuf*.txt")):
             st = _file_stats(p)
             size_rows.append({"style": style, "bytes": st["bytes"], "lines": st["lines"], "path": str(p)})

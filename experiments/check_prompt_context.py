@@ -6,7 +6,7 @@ Typical use: estimate matrix-prompt token counts across (obs_n, int_n) grid and
 report the first configuration that exceeds the model's context.
 
 This script generates prompts in-memory (no API calls) and counts tokens using
-count_openai_tokens() from query_gemini.py.
+count_openai_tokens() from query_api.py.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-from query_gemini import count_openai_tokens
+from query_api import count_openai_tokens
 
 
 _DEFAULT_CONTEXT_WINDOWS: dict[str, int] = {
@@ -51,7 +51,7 @@ def main() -> int:
     ap.add_argument(
         "--prompt-style",
         default="matrix",
-        choices=["cases", "matrix", "summary", "summary_probs", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
     )
     ap.add_argument("--anonymize", action="store_true")
     ap.add_argument("--seed", type=int, default=42)

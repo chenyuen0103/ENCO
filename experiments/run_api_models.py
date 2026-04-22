@@ -62,7 +62,7 @@ def _matches_filter(value: int, allowed: Optional[Iterable[int]]) -> bool:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run query_gemini.py over generated prompt CSVs.")
+    ap = argparse.ArgumentParser(description="Run query_api.py over generated prompt CSVs.")
     ap.add_argument(
         "--base-root",
         default="prompts",
@@ -74,9 +74,21 @@ def main() -> None:
         help="Dataset subfolder under base-root (e.g., asia). If omitted and multiple exist, exits with choices.",
     )
     ap.add_argument(
+        "--names-only",
+        action="store_true",
+        help=(
+            "Discover names-only prompt CSVs (pattern: prompts_names_only*.csv) "
+            "instead of obs/int/shuf CSVs. Skips all obs/int/shuf filtering."
+        ),
+    )
+    ap.add_argument(
         "--pattern",
-        default="prompts_obs*_int*_shuf*.csv",
-        help="Filename glob to discover prompt CSVs under the dataset folder.",
+        default=None,
+        help=(
+            "Filename glob to discover prompt CSVs under the dataset folder. "
+            "Defaults to 'prompts_names_only*.csv' when --names-only is set, "
+            "otherwise 'prompts_obs*_int*_shuf*.csv'."
+        ),
     )
     ap.add_argument(
         "--obs",
@@ -116,14 +128,14 @@ def main() -> None:
         "--temperature",
         type=float,
         default=0.0,
-        help="Sampling temperature (passed to query_gemini.py).",
+        help="Sampling temperature (passed to query_api.py).",
     )
     ap.add_argument(
         "--provider",
         default="auto",
         choices=["auto", "openai", "gemini", "vllm"],
         help=(
-            "Provider passed to query_gemini.py. "
+            "Provider passed to query_api.py. "
             "Use 'openai'/'gemini' for API backends, or 'vllm' for local vLLM."
         ),
     )
@@ -155,12 +167,14 @@ def main() -> None:
         action="store_true",
         help="Pass --vllm-enforce-eager to vLLM backend.",
     )
-    ap.add_argument("--overwrite", action="store_true", help="Pass --overwrite to query_gemini.py.")
+    ap.add_argument("--overwrite", action="store_true", help="Pass --overwrite to query_api.py.")
     ap.add_argument("--dry-run", action="store_true", help="List matching CSVs without running.")
 
     args = ap.parse_args()
     if not args.model:
         args.model = ["gpt-5-mini"]
+    if args.pattern is None:
+        args.pattern = "prompts_names_only*.csv" if args.names_only else "prompts_obs*_int*_shuf*.csv"
 
     base_root_candidates = _resolve_base_roots(Path(args.base_root))
     datasets: list[str] = []
@@ -187,6 +201,9 @@ def main() -> None:
     skipped_by_filter = 0
     skipped_by_rule = 0
     for p in csv_paths:
+        if args.names_only:
+            selected.append(p)
+            continue
         parsed = _parse_obs_int_shuf(p)
         if parsed is None:
             skipped_by_filter += 1
@@ -219,7 +236,7 @@ def main() -> None:
     if args.provider == "vllm":
         query_script = (Path(__file__).parent / "query_vllm.py").resolve()
     else:
-        query_script = (Path(__file__).parent / "query_gemini.py").resolve()
+        query_script = (Path(__file__).parent / "query_api.py").resolve()
     if not query_script.exists():
         raise SystemExit(f"query script not found: {query_script}")
 

@@ -387,19 +387,6 @@ def build_argparser():
         help="Intervention variable mode for --cd-config-file generation (default: all).",
     )
     p.add_argument(
-        "--cd-config-thinking-tags",
-        dest="cd_config_thinking_tags",
-        action="store_true",
-        help="Include thinking-tags instruction in generated prompts (default).",
-    )
-    p.add_argument(
-        "--no-cd-config-thinking-tags",
-        dest="cd_config_thinking_tags",
-        action="store_false",
-        help="Disable thinking-tags instruction in prompts generated from --cd-config-file.",
-    )
-    p.set_defaults(cd_config_thinking_tags=True)
-    p.add_argument(
         "--cd-test-fraction",
         type=float,
         default=0.1,
@@ -744,7 +731,6 @@ def _dataset_from_cd_config_file(
     give_steps: bool = False,
     def_int: bool = False,
     intervene_vars: str = "all",
-    thinking_tags: bool = True,
 ) -> Dataset:
     """
     Build causal-discovery training rows in-memory from a config JSON + BIF file.
@@ -760,8 +746,8 @@ def _dataset_from_cd_config_file(
             "Failed to import in-memory prompt helpers from run_experiment1_in_memory.py."
         ) from e
 
-    style_aliases = {"summary_join": "summary_joint"}
-    all_styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    style_aliases = {"summary_join": "summary", "summary_joint": "summary"}
+    all_styles = ["cases", "matrix", "summary", "payload", "payload_topk"]
     allowed_row_orders = {"random", "sorted", "reverse"}
     allowed_col_orders = {"original", "reverse", "random", "topo", "reverse_topo"}
 
@@ -793,7 +779,7 @@ def _dataset_from_cd_config_file(
         return sorted(seen)
 
     rows: list[dict] = []
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint in configs:
         # Match run_experiment1_in_memory behavior: names-only uses only one shuffle.
         if obs_n == 0 and int_n == 0 and int(shuf_n) != 1:
             continue
@@ -812,7 +798,8 @@ def _dataset_from_cd_config_file(
             give_steps=bool(give_steps),
             def_int=bool(def_int),
             intervene_vars=str(intervene_vars),
-            thinking_tags=bool(thinking_tags),
+            wrapper_mode=wrapper_mode,
+            append_format_hint=bool(append_format_hint),
         )
         _ = base_name  # unused here; kept for clarity
         answer_raw = json.dumps(answer_obj, ensure_ascii=False)
@@ -1171,7 +1158,6 @@ def _build_frozen_eval_dataset(args):
             give_steps=bool(args.cd_config_give_steps),
             def_int=bool(args.cd_config_def_int),
             intervene_vars=str(args.cd_config_intervene_vars),
-            thinking_tags=bool(args.cd_config_thinking_tags),
         )
     else:
         eval_sources = args.cd_test_csv if args.cd_test_csv else args.cd_train_csv
@@ -1577,7 +1563,6 @@ def run_train(args):
                 give_steps=bool(args.cd_config_give_steps),
                 def_int=bool(args.cd_config_def_int),
                 intervene_vars=str(args.cd_config_intervene_vars),
-                thinking_tags=bool(args.cd_config_thinking_tags),
             )
             raw_test = None
         else:

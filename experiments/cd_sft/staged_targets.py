@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-generate_staged_sft_data.py
+staged_targets.py
 
 Programmatically generates per-row staged SFT data from an exported CD CSV.
 
@@ -12,12 +11,12 @@ For each row the script:
   4. Writes a JSONL record with the staged think text as the completion
 
 Usage:
-    python experiments/generate_staged_sft_data.py \
+    python experiments/cd_sft/staged_targets.py \
         --input-csv experiments/data/cancer_obs100_int10_anon_train.csv \
         --output-jsonl experiments/data/cancer_staged_sft.jsonl
 
     # Multiple CSVs → one mixed JSONL
-    python experiments/generate_staged_sft_data.py \
+    python experiments/cd_sft/staged_targets.py \
         --input-csv experiments/data/cancer_obs100_int10_anon_train.csv \
                     experiments/data/earthquake_obs100_int10_anon_train.csv \
                     experiments/data/asia_obs100_int10_anon_train.csv \
@@ -37,9 +36,15 @@ from typing import Any, Dict, List, Optional, Tuple
 # Helpers imported from existing pipeline
 # ---------------------------------------------------------------------------
 try:
-    from cd_training_format import ensure_assistant_think_prefill, validate_sft_example
+    from cd_generation.format import (
+        ensure_assistant_think_prefill,
+        validate_sft_example,
+    )
 except ModuleNotFoundError:
-    from experiments.cd_training_format import ensure_assistant_think_prefill, validate_sft_example
+    from experiments.cd_generation.format import (
+        ensure_assistant_think_prefill,
+        validate_sft_example,
+    )
 
 
 def _set_csv_field_limit() -> None:
@@ -367,9 +372,10 @@ def build_staged_jsonl(
             )
             for i, row in enumerate(rows):
                 try:
-                    prompt = (row.get(prompt_col) or "").strip()
-                    if not prompt:
+                    prompt_raw = (row.get(prompt_col) or "").strip()
+                    if not prompt_raw:
                         raise ValueError(f"empty prompt (col={prompt_col!r})")
+                    prompt = prompt_raw
 
                     answer_raw = (row.get(answer_col) or "").strip()
                     if not answer_raw:

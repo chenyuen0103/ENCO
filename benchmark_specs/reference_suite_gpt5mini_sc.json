@@ -154,7 +154,7 @@
   },
   "provenance": {
     "schema_version": "benchmark_spec/v1",
-    "parser_version": "query_gemini.extract_adjacency",
+    "parser_version": "query_api.extract_adjacency",
     "evaluator_version": "evaluate.py",
     "tags": [
       "reference_suite",

@@ -22,7 +22,7 @@ from urllib import request
 from urllib.parse import urlparse
 
 try:
-    from cd_training_format import (
+    from cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
         canonicalize_cd_prompt,
@@ -30,7 +30,7 @@ try:
         default_short_think_text,
     )
 except ModuleNotFoundError:
-    from experiments.cd_training_format import (
+    from experiments.cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
         canonicalize_cd_prompt,
@@ -787,19 +787,6 @@ def build_argparser():
         help="Intervention variable mode for --cd-config-file generation (default: all).",
     )
     p.add_argument(
-        "--cd-config-thinking-tags",
-        dest="cd_config_thinking_tags",
-        action="store_true",
-        help="Include thinking-tags instruction in prompts generated from --cd-config-file (default).",
-    )
-    p.add_argument(
-        "--no-cd-config-thinking-tags",
-        dest="cd_config_thinking_tags",
-        action="store_false",
-        help="Disable thinking-tags instruction in prompts generated from --cd-config-file.",
-    )
-    p.set_defaults(cd_config_thinking_tags=True)
-    p.add_argument(
         "--cd-test-fraction",
         type=float,
         default=0.1,
@@ -807,6 +794,18 @@ def build_argparser():
     )
     p.add_argument("--cd-max-train-samples", type=int, default=0, help="Cap train samples (0 = no cap).")
     p.add_argument("--cd-max-test-samples", type=int, default=0, help="Cap eval samples (0 = no cap).")
+    p.add_argument(
+        "--cd-wrapper-mode",
+        choices=["plain", "chat"],
+        default=None,
+        help="Preferred prompt transport for causal-discovery tasks.",
+    )
+    p.add_argument(
+        "--cd-response-format",
+        choices=["think_answer", "json"],
+        default="think_answer",
+        help="Requested response format for causal-discovery tasks.",
+    )
     p.add_argument(
         "--cd-wrap-system-prompt",
         action="store_true",
@@ -1159,6 +1158,7 @@ def _load_cd_rows_from_prompt_csv(
     csv_path: Path,
     *,
     task: str = "causal_discovery",
+    response_format: str = "think_answer",
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
@@ -1195,12 +1195,14 @@ def _load_cd_rows_from_prompt_csv(
             prompt_text = canonicalize_cd_prompt(
                 prompt_text,
                 task=task,
+                response_format=response_format,
                 wrap_system_prompt=bool(wrap_system_prompt),
                 append_format_hint=bool(append_format_hint),
                 format_hint_text=str(format_hint_text),
                 prefill_think=not bool(prefill_answer),
                 prefill_answer=bool(prefill_answer),
                 think_text=str(think_text),
+                strip_output_instructions=bool(wrap_system_prompt),
             )
 
             answer_raw = (row.get("answer") or "").strip()
@@ -1238,6 +1240,7 @@ def _dataset_from_cd_csvs(
     csv_paths: list[str],
     *,
     task: str = "causal_discovery",
+    response_format: str = "think_answer",
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
@@ -1252,6 +1255,7 @@ def _dataset_from_cd_csvs(
         rows = _load_cd_rows_from_prompt_csv(
             p,
             task=task,
+            response_format=response_format,
             wrap_system_prompt=wrap_system_prompt,
             append_format_hint=append_format_hint,
             format_hint_text=format_hint_text,
@@ -1274,6 +1278,7 @@ def _dataset_from_cd_config_file(
     num_prompts: int,
     seed: int,
     task: str,
+    response_format: str,
     wrap_system_prompt: bool,
     append_format_hint: bool = False,
     format_hint_text: str = "",
@@ -1283,7 +1288,6 @@ def _dataset_from_cd_config_file(
     give_steps: bool = False,
     def_int: bool = False,
     intervene_vars: str = "all",
-    thinking_tags: bool = True,
 ) -> Dataset:
     try:
         from run_experiment1_in_memory import (  # type: ignore
@@ -1295,8 +1299,8 @@ def _dataset_from_cd_config_file(
             "Failed to import in-memory prompt helpers from run_experiment1_in_memory.py."
         ) from e
 
-    style_aliases = {"summary_join": "summary_joint"}
-    all_styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    style_aliases = {"summary_join": "summary", "summary_joint": "summary"}
+    all_styles = ["cases", "matrix", "summary", "payload", "payload_topk"]
     allowed_row_orders = {"random", "sorted", "reverse"}
     allowed_col_orders = {"original", "reverse", "random", "topo", "reverse_topo"}
 
@@ -1328,7 +1332,7 @@ def _dataset_from_cd_config_file(
         return sorted(seen)
 
     rows: list[dict[str, str]] = []
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, _cot_hint in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, legacy_wrapper_mode, config_append_format_hint in configs:
         if obs_n == 0 and int_n == 0 and int(shuf_n) != 1:
             continue
         _base_name, answer_obj, prompt_iter = _iter_cfg_prompts(
@@ -1346,8 +1350,8 @@ def _dataset_from_cd_config_file(
             give_steps=bool(give_steps),
             def_int=bool(def_int),
             intervene_vars=str(intervene_vars),
-            thinking_tags=bool(thinking_tags),
-            cot_hint=bool(_cot_hint),
+            wrapper_mode=legacy_wrapper_mode,
+            append_format_hint=bool(config_append_format_hint),
         )
         adj = answer_obj.get("adjacency_matrix") if isinstance(answer_obj, dict) else None
         variables_out = answer_obj.get("variables") if isinstance(answer_obj, dict) else None
@@ -1401,12 +1405,14 @@ def _dataset_from_cd_config_file(
                     prompt_text = canonicalize_cd_prompt(
                         prompt_text,
                         task=task,
+                        response_format=response_format,
                         wrap_system_prompt=bool(wrap_system_prompt),
                         append_format_hint=bool(append_format_hint),
                         format_hint_text=str(format_hint_text),
                         prefill_think=not bool(prefill_answer),
                         prefill_answer=bool(prefill_answer),
                         think_text=str(think_text),
+                        strip_output_instructions=bool(wrap_system_prompt),
                     )
                     rows.append(
                         {
@@ -1428,12 +1434,14 @@ def _dataset_from_cd_config_file(
             prompt_text = canonicalize_cd_prompt(
                 prompt_text,
                 task=task,
+                response_format=response_format,
                 wrap_system_prompt=bool(wrap_system_prompt),
                 append_format_hint=bool(append_format_hint),
                 format_hint_text=str(format_hint_text),
                 prefill_think=not bool(prefill_answer),
                 prefill_answer=bool(prefill_answer),
                 think_text=str(think_text),
+                strip_output_instructions=bool(wrap_system_prompt),
             )
             rows.append(
                 (
@@ -1882,6 +1890,7 @@ def _build_frozen_eval_dataset(args):
             num_prompts=int(args.cd_config_num_prompts),
             seed=int(args.cd_config_seed),
             task=str(args.task),
+            response_format=str(args.cd_response_format),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -1889,7 +1898,6 @@ def _build_frozen_eval_dataset(args):
             give_steps=bool(args.cd_config_give_steps),
             def_int=bool(args.cd_config_def_int),
             intervene_vars=str(args.cd_config_intervene_vars),
-            thinking_tags=bool(args.cd_config_thinking_tags),
         )
     else:
         eval_sources = args.cd_test_csv if args.cd_test_csv else args.cd_train_csv
@@ -1901,6 +1909,7 @@ def _build_frozen_eval_dataset(args):
         full_eval = _dataset_from_cd_csvs(
             eval_sources,
             task=str(args.task),
+            response_format=str(args.cd_response_format),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -2012,6 +2021,7 @@ def run_export_cd_csv(args) -> None:
             num_prompts=int(args.cd_config_num_prompts),
             seed=int(args.cd_config_seed),
             task=str(args.task),
+            response_format=str(args.cd_response_format),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -2019,7 +2029,6 @@ def run_export_cd_csv(args) -> None:
             give_steps=bool(args.cd_config_give_steps),
             def_int=bool(args.cd_config_def_int),
             intervene_vars=str(args.cd_config_intervene_vars),
-            thinking_tags=bool(args.cd_config_thinking_tags),
         )
     else:
         if not args.cd_train_csv:
@@ -2030,6 +2039,7 @@ def run_export_cd_csv(args) -> None:
         dataset = _dataset_from_cd_csvs(
             args.cd_train_csv,
             task=str(args.task),
+            response_format=str(args.cd_response_format),
             wrap_system_prompt=bool(args.cd_wrap_system_prompt),
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
@@ -2461,6 +2471,7 @@ def run_train(args, argv: list[str] | None = None):
                 num_prompts=int(args.cd_config_num_prompts),
                 seed=int(args.cd_config_seed),
                 task=str(args.task),
+                response_format=str(args.cd_response_format),
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                 append_format_hint=bool(args.cd_append_format_hint),
                 format_hint_text=str(args.cd_format_hint_text),
@@ -2470,7 +2481,6 @@ def run_train(args, argv: list[str] | None = None):
                 give_steps=bool(args.cd_config_give_steps),
                 def_int=bool(args.cd_config_def_int),
                 intervene_vars=str(args.cd_config_intervene_vars),
-                thinking_tags=bool(args.cd_config_thinking_tags),
             )
             raw_test = None
         else:
@@ -2483,6 +2493,7 @@ def run_train(args, argv: list[str] | None = None):
             raw_train = _dataset_from_cd_csvs(
                 args.cd_train_csv,
                 task=str(args.task),
+                response_format=str(args.cd_response_format),
                 wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                 append_format_hint=bool(args.cd_append_format_hint),
                 format_hint_text=str(args.cd_format_hint_text),
@@ -2493,6 +2504,7 @@ def run_train(args, argv: list[str] | None = None):
                 raw_test = _dataset_from_cd_csvs(
                     args.cd_test_csv,
                     task=str(args.task),
+                    response_format=str(args.cd_response_format),
                     wrap_system_prompt=bool(args.cd_wrap_system_prompt),
                     append_format_hint=bool(args.cd_append_format_hint),
                     format_hint_text=str(args.cd_format_hint_text),
@@ -3289,6 +3301,13 @@ def run_train(args, argv: list[str] | None = None):
 def main():
     argv = sys.argv[1:]
     args = build_argparser().parse_args()
+    if args.cd_wrapper_mode is not None:
+        args.cd_wrap_system_prompt = (args.cd_wrapper_mode == "chat")
+    if args.task in {"causal_discovery", "cd_descendants"} and args.cd_response_format != "think_answer":
+        raise ValueError(
+            "GRPO causal-discovery tasks currently support only --cd-response-format think_answer, "
+            "because the reward stack expects think/answer completions."
+        )
     _maybe_enable_small_graph_logging(args, argv)
     _maybe_launch_local_vllm_and_reexec_train(args)
     if args.mode == "eval":

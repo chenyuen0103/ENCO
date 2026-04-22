@@ -127,6 +127,46 @@ def _resolve_model_arg(model_arg: str) -> str:
     raise FileNotFoundError(message)
 
 
+def _is_peft_adapter_dir(path: Path) -> bool:
+    path = Path(path)
+    return path.is_dir() and (path / "adapter_config.json").exists()
+
+
+def _is_full_model_dir(path: Path) -> bool:
+    path = Path(path)
+    if not path.is_dir() or not (path / "config.json").exists():
+        return False
+    model_markers = [
+        path / "model.safetensors",
+        path / "model.safetensors.index.json",
+        path / "pytorch_model.bin",
+    ]
+    if any(marker.exists() for marker in model_markers):
+        return True
+    return any(path.glob("model-*.safetensors"))
+
+
+def _resolve_runtime_model_arg(model_arg: str) -> str:
+    resolved = _resolve_model_arg(model_arg)
+    candidate = Path(resolved)
+    if not _is_peft_adapter_dir(candidate):
+        return resolved
+
+    merged_dir = candidate.parent / f"{candidate.name}_merged"
+    if _is_full_model_dir(merged_dir):
+        print(f"[info] using existing merged model for adapter checkpoint: {merged_dir}", flush=True)
+        return str(merged_dir)
+
+    print(f"[info] merging PEFT adapter checkpoint for vLLM: {candidate} -> {merged_dir}", flush=True)
+    from run_sft import merge_sft_adapter
+
+    merged_path = merge_sft_adapter(
+        sft_model_dir=candidate,
+        merged_output_dir=merged_dir,
+    )
+    return str(merged_path)
+
+
 def _looks_like_inline_text(raw: str) -> bool:
     text = str(raw or "")
     if not text:
@@ -792,7 +832,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    resolved_model = _resolve_model_arg(args.model)
+    resolved_model = _resolve_runtime_model_arg(args.model)
 
     csv_paths = list(args.csv or DEFAULT_CSVS)
     sampled_records = _sample_records(

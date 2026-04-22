@@ -37,8 +37,8 @@ def _iter_rows_for_config(
     shuffles_per_graph: int,
     seed: int,
     anonymize: bool,
-    thinking_tags: bool,
-    cot_hint: bool,
+    wrapper_mode: str | None,
+    append_format_hint: bool,
     col_order: str = "original",
     col_perms: int = 1,
 ):
@@ -65,8 +65,8 @@ def _iter_rows_for_config(
             give_steps=False,
             def_int=False,
             intervene_vars="all",
-            thinking_tags=bool(thinking_tags),
-            cot_hint=bool(cot_hint),
+            wrapper_mode=wrapper_mode,
+            append_format_hint=bool(append_format_hint),
         )
         yield answer_obj, prompt_iter
 
@@ -97,8 +97,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"],
-        default="summary_joint",
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
+        default="summary",
     )
     ap.add_argument(
         "--obs-values",
@@ -136,21 +136,25 @@ def main() -> None:
     )
     ap.add_argument("--anonymize", action="store_true", help="Use anonymized variable names (X1, X2, ...).")
     ap.add_argument(
-        "--no-thinking-tags",
-        dest="thinking_tags",
-        action="store_false",
-        help="Disable <think>...</think><answer>...</answer> output contract in prompts.",
-    )
-    ap.set_defaults(thinking_tags=True)
-    ap.add_argument(
         "--include-names-only",
         action="store_true",
         help="Include obs=0,int=0 names-only rows (off by default).",
     )
     ap.add_argument(
+        "--append-format-hint",
+        action="store_true",
+        help=(
+            "Append the canonical Formatting requirement line. For causal discovery this "
+            "adds the optional stage-by-stage reasoning instructions."
+        ),
+    )
+    ap.add_argument(
         "--cot-hint",
         action="store_true",
-        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+        help=(
+            "Legacy alias for chat-style prompt wrapping. This maps to wrapper_mode=chat "
+            "and does not change the staged reasoning instructions."
+        ),
     )
     args = ap.parse_args()
 
@@ -199,8 +203,8 @@ def main() -> None:
                         shuffles_per_graph=int(args.shuffles_per_graph),
                         seed=int(args.seed),
                         anonymize=bool(args.anonymize),
-                        thinking_tags=bool(args.thinking_tags),
-                        cot_hint=bool(args.cot_hint),
+                        wrapper_mode=("chat" if args.cot_hint else None),
+                        append_format_hint=bool(args.append_format_hint),
                         col_order=args.col_order,
                         col_perms=int(args.col_perms),
                     ):

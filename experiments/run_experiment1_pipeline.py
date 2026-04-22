@@ -101,7 +101,7 @@ def _infer_model_from_stem(stem: str) -> str:
     m_resp = re.match(
         r"^responses_obs\d+_int\d+_shuf\d+_p\d+_"
         r"(?:(?:[A-Za-z0-9]+_)*)"
-        r"(?:summary_probs|payload_topk|summary_joint|payload|summary|matrix|cases)"
+        r"(?:payload_topk|summary_joint|summary|matrix|cases|payload)"
         r"_(?P<model>.+)$",
         stem,
         flags=re.IGNORECASE,
@@ -184,15 +184,11 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         # best-effort fallback
         prompt_style = "cases"
         stem_l = stem.lower()
-        if "summary_probs" in stem_l:
-            prompt_style = "summary_probs"
-        elif "payload_topk" in stem_l:
+        if "payload_topk" in stem_l:
             prompt_style = "payload_topk"
         elif "payload" in stem_l:
             prompt_style = "payload"
-        elif "summary_joint" in stem_l:
-            prompt_style = "summary_joint"
-        elif "summary" in stem_l:
+        elif "summary_joint" in stem_l or "summary" in stem_l:
             prompt_style = "summary"
         elif "matrix" in stem_l:
             prompt_style = "matrix"
@@ -231,15 +227,11 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             col_order = token.removeprefix("col")
 
     prompt_style = "cases"
-    if "summary_probs" in tags:
-        prompt_style = "summary_probs"
-    elif "payload_topk" in tags:
+    if "payload_topk" in tags:
         prompt_style = "payload_topk"
     elif "payload" in tags:
         prompt_style = "payload"
-    elif "summary_joint" in tags:
-        prompt_style = "summary_joint"
-    elif "summary" in tags:
+    elif "summary_joint" in tags or "summary" in tags:
         prompt_style = "summary"
     elif "matrix" in tags:
         prompt_style = "matrix"
@@ -258,23 +250,6 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         causal_rules=("rules" in tags),
         give_steps=("steps" in tags),
     )
-
-
-def _find_prompt_csvs(experiments_dir: Path, dataset: str) -> tuple[list[Path], list[Path]]:
-    prompt_roots = [
-        experiments_dir / "prompts" / dataset,
-        experiments_dir / "prompts" / "experiment1" / dataset,
-    ]
-    core_set: set[Path] = set()
-    names_only_set: set[Path] = set()
-    for root in prompt_roots:
-        if not root.exists():
-            continue
-        core_set.update(root.rglob("prompts_obs*_int*_shuf*.csv"))
-        names_only_set.update(root.rglob("prompts_names_only*.csv"))
-    core = sorted(p for p in core_set if p.is_file())
-    names_only = sorted(p for p in names_only_set if p.is_file())
-    return core, names_only
 
 
 def _find_response_csvs(experiments_dir: Path, dataset: str) -> list[Path]:
@@ -358,25 +333,6 @@ def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any
     return stats
 
 
-def step_generate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
-    cmd = [
-        sys.executable,
-        "generate_prompt_files.py",
-        "--bif-file",
-        args.bif_file,
-        "--num-prompts",
-        str(args.num_prompts),
-        "--seed",
-        str(args.seed),
-    ]
-    if getattr(args, "styles", None):
-        cmd.append("--styles")
-        cmd.extend([str(s) for s in args.styles])
-    for s in (args.shuffles_per_graph or []):
-        cmd.extend(["--shuffles-per-graph", str(int(s))])
-    _run(cmd, cwd=experiments_dir, dry_run=dry_run)
-
-
 def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
     cmd = [
         sys.executable,
@@ -410,55 +366,6 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
     if args.dry_run:
         cmd.append("--dry-run")
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
-
-
-def step_run_models(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
-    core_csvs, names_only_csvs = _find_prompt_csvs(experiments_dir, args.dataset)
-    if not core_csvs and not names_only_csvs:
-        raise SystemExit(
-            f"No prompt CSVs found under {experiments_dir/'prompts'/args.dataset} "
-            f"or {experiments_dir/'prompts'/'experiment1'/args.dataset}. "
-            "Run the generate step first."
-        )
-
-    # 1) Run core prompts via the wrapper
-    if core_csvs:
-        cmd = [
-            sys.executable,
-            "run_api_models.py",
-            "--base-root",
-            "prompts",
-            "--dataset",
-            args.dataset,
-            "--pattern",
-            "prompts_obs*_int*_shuf*.csv",
-            "--temperature",
-            str(args.temperature),
-        ]
-        for m in args.model:
-            cmd.extend(["--model", m])
-        if args.overwrite:
-            cmd.append("--overwrite")
-        _run(cmd, cwd=experiments_dir, dry_run=dry_run)
-
-    # 2) Run names-only CSVs directly (not discovered by run_api_models.py’s default pattern)
-    for csv_path in names_only_csvs:
-        for model in args.model:
-            cmd = [
-                sys.executable,
-                "query_gemini.py",
-                "--csv",
-                str(csv_path),
-                "--model",
-                model,
-                "--temperature",
-                str(args.temperature),
-                "--provider",
-                "auto",
-            ]
-            if args.overwrite:
-                cmd.append("--overwrite")
-            _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
 
 def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
@@ -809,7 +716,7 @@ def main() -> None:
         default=None,
         help=(
             'Optional subset of prompt styles to generate (any of: "cases", "matrix", "summary", '
-            '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
+            '"payload", "payload_topk").'
         ),
     )
     ap.add_argument(
@@ -835,11 +742,6 @@ def main() -> None:
     ap.add_argument("--overwrite-eval", action="store_true", help="Re-run evaluation even if summary exists.")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
     ap.add_argument(
-        "--in-memory",
-        action="store_true",
-        help="Generate prompts in-memory and query models without writing prompt files.",
-    )
-    ap.add_argument(
         "--only-names-only",
         action="store_true",
         help="In in-memory mode, run only the names-only configuration.",
@@ -862,8 +764,12 @@ def main() -> None:
 
     ap.add_argument(
         "--steps",
-        default="generate,run,evaluate,analyze",
-        help="Comma-separated subset of: generate,run,evaluate,analyze",
+        default="run,evaluate,analyze",
+        help=(
+            "Comma-separated subset of steps to execute: run,evaluate,analyze. "
+            "The 'run' step generates prompts and queries models in-memory via run_experiment1_in_memory.py. "
+            "The deprecated alias 'generate' is treated as 'run' for backward compatibility."
+        ),
     )
 
     args = ap.parse_args()
@@ -874,7 +780,8 @@ def main() -> None:
         args.dataset = Path(args.bif_file).stem
 
     steps = [s.strip().lower() for s in str(args.steps).split(",") if s.strip()]
-    allowed = {"generate", "run", "evaluate", "analyze"}
+    steps = ["run" if s == "generate" else s for s in steps]  # backward-compat alias
+    allowed = {"run", "evaluate", "analyze"}
     if any(s not in allowed for s in steps):
         bad = [s for s in steps if s not in allowed]
         raise SystemExit(f"Unknown step(s): {bad}. Allowed: {sorted(allowed)}")
@@ -891,13 +798,8 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    if args.in_memory and ("generate" in steps or "run" in steps):
+    if "run" in steps:
         step_generate_and_run_in_memory(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
-    else:
-        if "generate" in steps:
-            step_generate(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
-        if "run" in steps:
-            step_run_models(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
     if "evaluate" in steps:
         step_evaluate(args, experiments_dir=experiments_dir, dry_run=args.dry_run)
     if "analyze" in steps:

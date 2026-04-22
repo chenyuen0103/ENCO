@@ -39,10 +39,10 @@ def _has_style_tag(tags: str, style: str) -> bool:
     tag_tokens = {tok for tok in tags.strip("_").split("_") if tok}
     if style == "cases":
         # "cases" is untagged in this repo: treat rows without explicit style tags as cases.
-        explicit = {"matrix", "summary", "summary_probs", "summary_joint", "payload", "payload_topk"}
+        explicit = {"matrix", "summary", "payload", "payload_topk"}
         return len(tag_tokens.intersection(explicit)) == 0
     # Multi-token styles are encoded as substrings in filenames/tags.
-    if style in {"summary_probs", "summary_joint", "payload_topk"}:
+    if style in {"payload_topk"}:
         return style in tags
     return style in tag_tokens
 
@@ -113,8 +113,6 @@ def _render_table(
 
     pretty_style = {
         "payload_topk": "payload (top-K)",
-        "summary_probs": "summary (probs)",
-        "summary_joint": "summary (joint)",
     }.get(prompt_style, prompt_style)
 
     caption = (
@@ -343,7 +341,7 @@ def main() -> int:
     p.add_argument("--model", default=None, help="Model tag in filenames (e.g., gpt-5-mini).")
     p.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
         default="summary",
     )
     p.add_argument(
@@ -364,7 +362,7 @@ def main() -> int:
         "--compare-styles",
         nargs="*",
         default=["summary", "matrix", "enco"],
-        choices=["summary", "summary_joint", "matrix", "enco"],
+        choices=["summary", "matrix", "enco"],
         help='Which methods to include in --compare tables (default: "summary matrix enco").',
     )
     p.add_argument(
@@ -376,7 +374,7 @@ def main() -> int:
         "--append-styles",
         nargs="*",
         default=[],
-        choices=["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
         help=(
             "Additional prompt styles to append in the combined --all-four output. "
             "Example: --append-styles matrix"
@@ -386,7 +384,7 @@ def main() -> int:
         "--only-styles",
         nargs="*",
         default=[],
-        choices=["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
         help=(
             "If set, restrict the combined --all-four output to exactly these prompt styles "
             "(disables auto-appending of payload/payload_topk). Example: --only-styles summary matrix"
@@ -479,8 +477,6 @@ def main() -> int:
         for tag in args.compare_styles:
             if tag == "summary":
                 methods.append(("summary", "Summary"))
-            elif tag == "summary_joint":
-                methods.append(("summary_joint", "Summary-Joint"))
             elif tag == "matrix":
                 methods.append(("matrix", "Tabular"))
             elif tag == "enco":

@@ -1,126 +1,312 @@
-# Efficient Neural Causal Discovery without Acyclicity Constraints
+# LLM Causal Discovery Benchmark and Training Repo
 
-[Short paper](https://phlippe.github.io/media/ENCO_CausalUAI_Camera_Ready.pdf) | [Long paper](https://arxiv.org/pdf/2107.10483.pdf) | [Poster](https://phlippe.github.io/media/ENCO_Poster.pdf) | [Tutorial ![Open filled In Collab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/phlippe/ENCO/blob/main/walkthrough.ipynb) 
+This repository is for generating causal-discovery prompts and datasets, training
+SFT / GRPO models, querying external LLMs, and evaluating both LLM and classical
+causal-discovery baselines.
 
-This is the official repository of the paper **Efficient Neural Causal Discovery without Acyclicity Constraints** by Phillip Lippe, Taco Cohen, and Efstratios Gavves. *Presented at the International Conference on Learning Representations (ICLR), 2022.*
+The codebase includes:
 
-## Note on repository origin
+- prompt and dataset generation under `experiments/`
+- benchmark manifests and run orchestration under `benchmark_specs/` and `scripts/`
+- finetuning / evaluation utilities for causal-discovery reasoning
+- the original ENCO structure-learning code under `causal_discovery/` and `causal_graphs/`
 
-This repository is adapted from the original ENCO codebase by Lippe, Cohen, and Gavves. We keep the original ENCO implementation and add additional code under `experiments/` for LLM-based causal discovery prompts, querying, evaluation, and analysis.
+## Provenance
 
-## Table of contents
+This repo was built on top of the original ENCO codebase by Phillip Lippe, Taco
+Cohen, and Efstratios Gavves.
 
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [Benchmark Builder](#benchmark-builder)
-- [Datasets](#datasets)
-- [Running experiments](#running-experiments)
-- [Simple example](#simple-example)
-- [FAQ](#faq)
-- [Citation](#citation)
+In particular, the observational and interventional data generation logic used by
+our prompt and dataset builders is adapted from the ENCO codebase and then wrapped
+for prompt construction, LLM evaluation, and training.
 
-## Paper summary
+The original ENCO implementation is still present here for baseline comparison and
+for graph / data utilities, but this repository should be read primarily as our
+LLM causal-discovery benchmark and training repo.
 
-<center><img src="ENCO_figure.svg" width="800px"></center>
+## Repo Layout
 
-Learning the structure of a causal graphical model using both observational and interventional data is a fundamental problem in many scientific fields.
-A promising direction is continuous optimization for score-based methods, which efficiently learn the causal graph in a data-driven manner.
-However, to date, those methods require slow constrained optimization to enforce acyclicity or lack convergence guarantees.
-In this work, we present ENCO, an efficient structure learning method leveraging observational and interventional data.
-ENCO formulates the graph search as an optimization of independent edge likelihoods with the edge orientation being modeled as a separate parameter.
-Consequently, we can provide convergence guarantees of ENCO under mild conditions without constraining the score function with respect to acyclicity.
-In experiments, we show that ENCO handles various graph settings well, and even recovers graphs with up to 1,000 nodes in less than nine hours of compute using a single GPU (NVIDIA RTX3090) while having less than one mistake on average out of 1 million possible edges.
-Further, ENCO can handle and detect latent confounders.
+- `experiments/`: prompt generation, dataset building, querying, evaluation, training
+- `benchmark_specs/`: benchmark manifests
+- `benchmark_cards/`: benchmark descriptions and claims
+- `benchmark_runs/`: generated benchmark artifacts and summaries
+- `causal_graphs/`: graph definitions, BIF assets, ENCO-derived data utilities
+- `causal_discovery/`: original ENCO learner
+- `scripts/`: benchmark-builder CLIs
 
-## Requirements
+## Setup
 
-The code is written in PyTorch (1.9) and Python 3.8. Higher versions of PyTorch and Python are expected to work as well.
-
-We recommend to use conda for installing the requirements. If you haven't installed conda yet, you can find instructions [here](https://www.anaconda.com/products/individual). The steps for installing the requirements are:
-
-1. Create a new environment from the provided YAML file:
-   ```setup
-   conda env create -f environment.yml
-   ```
-   The environment installs PyTorch with CUDA 11.1. Adjust the CUDA version if you want to install it with CUDA 10.2, or remove it from the environment file if you want to install it on a CPU-only system.
-   
-2. Activate the environment
-   ```setup
-   conda activate enco
-   ```
-
-## Quick start
-
-### Core ENCO workflow
-
-After creating the `enco` environment, you can run the tutorial notebook:
+For the LLM / benchmark workflow, use a Python environment based on
+`requirements.txt`. The current working environment for this repo is
+`python 3.12.12` in the `enco` conda env.
 
 ```bash
-jupyter notebook walkthrough.ipynb
+conda create -n enco-llm python=3.12 -y
+conda activate enco-llm
+conda install -c conda-forge graphviz -y
+pip install -r requirements.txt
 ```
 
-Or run a baseline ENCO script:
+Or:
 
 ```bash
-bash experiments/run_scripts/experiment_synthetic.sh
+./setup.sh enco-llm 3.12
 ```
 
-### Setup for ENCO + LLM prompt experiments
+If you want to run the original ENCO code directly, `environment.yml` is still
+available for that older workflow.
 
-This repo also contains an LLM experiment pipeline under `experiments/` (prompt generation, OpenAI/Gemini/HF querying, evaluation, analysis).
-For that workflow, use a separate environment based on `requirements.txt` (Python 3.9 recommended).
+Environment variables:
 
-Step-by-step:
+- `OPENAI_API_KEY` for OpenAI-backed querying
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY` for Gemini-backed querying
 
-1. Create and activate a new conda environment:
-   ```bash
-   conda create -n enco-llm python=3.9 -y
-   conda activate enco-llm
-   ```
-2. Install Graphviz (needed for some plotted layouts):
-   ```bash
-   conda install -c conda-forge graphviz -y
-   ```
-3. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Data Assets
 
-Quick sanity check (dry-run) from repo root:
+The repo already includes a small set of bundled real-data BIF graphs under:
+
+- `causal_graphs/real_data/small_graphs/`
+- `causal_graphs/real_data/large_graphs/`
+
+To download the broader benchmark graph assets from the original ENCO setup:
+
 ```bash
-python experiments/run_experiment1_pipeline.py --dry-run \
+bash download_datasets.sh
+```
+
+To download the full discrete `bnlearn` BIF collection:
+
+```bash
+python causal_graphs/real_data/download_bnlearn_bifs.py
+```
+
+## Quick Orientation
+
+Pick the workflow that matches your goal:
+
+| Goal | Entry point |
+|------|-------------|
+| Evaluate an API model (GPT, Gemini) end-to-end | `run_experiment1_pipeline.py` |
+| Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `run_external_llm_baselines.py` + `evaluate.py` |
+| Score an existing prediction CSV | `evaluate.py` |
+| Build training data for SFT / GRPO | `build_grpo_cd_mix_dataset.py` → `collect_format_sft_data.py` |
+| Evaluate a finetuned / local model | `eval_sft_on_jsonl.py` |
+| Generate prompts only (single graph, no querying) | `generate_prompts.py` |
+| Query a prompt CSV without the full pipeline | `query_api.py` |
+
+## Main Workflows
+
+### 1. Generate prompts for a single graph
+
+`generate_prompts.py` writes prompt CSVs for one BIF graph. Use this when you
+want raw prompt files without immediately querying a model.
+
+```bash
+python experiments/generate_prompts.py \
+  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+  --num-prompts 5 \
+  --obs-per-prompt 100 \
+  --int-per-combo 10 \
+  --prompt-style summary \
+  --out-dir experiments/prompts/cancer
+```
+
+Key flags: `--anonymize` to strip node names, `--shuffles-per-graph N` for
+row-order replicates, `--wrapper-mode chat` for system/user/assistant format.
+Output goes to `experiments/prompts/<graph>/` by default.
+
+### 2. Query a prompt CSV directly
+
+`query_api.py` queries a CSV of prompts against OpenAI, Gemini, or HF backends
+and writes a response CSV. Use this when you already have a prompt CSV and want
+to skip the full pipeline.
+
+```bash
+python experiments/query_api.py \
+  --csv experiments/prompts/cancer/prompts_obs100_int10.csv \
+  --model gpt-4o-mini \
+  --provider openai \
+  --prompt-col prompt_text \
+  --out-csv experiments/responses/cancer/predictions_obs100_int10.csv
+```
+
+For Gemini: `--model gemini-2.5-flash --provider gemini`.
+For a local HF model: `--model Qwen/Qwen3-4B --provider hf --hf-trust-remote-code`.
+
+### 3. Run the end-to-end LLM pipeline
+
+`run_experiment1_pipeline.py` combines prompt generation, querying, evaluation,
+and summary table aggregation in one command. This is the recommended starting
+point for evaluating an API-backed model.
+
+```bash
+python experiments/run_experiment1_pipeline.py \
   --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
   --dataset cancer \
-  --model gpt-5-mini \
+  --model gpt-4o-mini \
+  --shuffles-per-graph 1 --shuffles-per-graph 3
+```
+
+Outputs:
+
+- prompts under `experiments/prompts/`
+- model responses under `experiments/responses/`
+- aggregated summaries under `experiments/out/experiment1/`
+
+`--shuffles-per-graph` controls row-order replicates and is used for
+ordering-bias analysis.
+
+### 4. Run benchmark-native LLM baselines
+
+`run_external_llm_baselines.py` implements structured baselines such as
+`TakayamaSCP`, `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData`.
+
+```bash
+python experiments/run_external_llm_baselines.py \
+  --method CausalLLMData \
+  --graph_files causal_graphs/real_data/small_graphs/cancer.bif \
+  --sample_size_obs 100 \
+  --sample_size_inters 10 \
+  --prompt_mode summary \
+  --naming_regime real \
+  --model gpt-4o-mini \
+  --provider openai
+```
+
+Score the output CSV with:
+
+```bash
+python experiments/evaluate.py \
+  --csv experiments/responses/cancer/predictions_obs100_int10_CausalLLMData.csv
+```
+
+`evaluate.py` prints mean precision, recall, F1, and SHD (structural Hamming
+distance) to stdout and writes a per-row metrics CSV alongside the input file.
+Pass `--summary-csv path/to/summary.csv` to accumulate results across runs.
+
+### 5. Build mixed prompt/answer CSV datasets
+
+`build_grpo_cd_mix_dataset.py` generates prompt CSVs with gold adjacency answers
+across multiple graphs and observation/intervention sizes.
+
+```bash
+python experiments/build_grpo_cd_mix_dataset.py \
+  --output-csv experiments/data/grpo_mix_named.csv \
+  --graph-names cancer,earthquake,asia,sachs \
+  --prompt-style summary \
+  --obs-values 100 \
+  --int-values 10 \
+  --num-prompts-per-config 5 \
   --shuffles-per-graph 1
 ```
 
-Or run the helper script:
+For anonymized prompts add `--anonymize`.
+
+### 6. Export train/eval CSV splits from a config file
+
+`export_cd_train_eval_csv.py` produces reproducible train/eval splits from an
+explicit prompt grid.
+
 ```bash
-./setup.sh enco-llm 3.9
-```
-If you don’t use conda, `setup.sh` can fall back to a virtualenv:
-```bash
-SETUP_METHOD=venv ./setup.sh
-source .venv/bin/activate
+python experiments/export_cd_train_eval_csv.py \
+  --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
+  --config-file experiments/configs/sachs_qwen_configs.json \
+  --num-prompts 20 \
+  --train-seed 42 \
+  --eval-seed 1337 \
+  --train-csv experiments/data/grpo_sachs_train.csv \
+  --eval-csv experiments/data/sft_eval_child.csv
 ```
 
-Notes:
-- For GPU ENCO, install the correct CUDA-enabled PyTorch build for your machine (instead of the default pip build).
-- For OpenAI runs, export `OPENAI_API_KEY`. For Gemini runs, export `GOOGLE_API_KEY` (or `GEMINI_API_KEY`).
+### 7. Convert prompt CSVs into SFT JSONL
+
+`collect_format_sft_data.py` converts prompt/answer CSV rows into
+chat-formatted SFT records with `<think>...</think><answer>...</answer>`.
+
+```bash
+python experiments/collect_format_sft_data.py \
+  --output experiments/data/format_sft_stages_v4_mixed.jsonl \
+  --csv experiments/data/grpo_mix_anon.csv:grpo_mix_anon \
+  --csv experiments/data/grpo_mix_named.csv:grpo_mix_named \
+  --prompt-col prompt_text \
+  --answer-col answer \
+  --reasoning-target stages \
+  --wrapper-mode chat \
+  --n-per-source 1725 \
+  --seed 42
+```
+
+### 8. Evaluate a finetuned SFT / LoRA model
+
+`eval_sft_on_jsonl.py` evaluates a local adapter or HF model on a JSONL or CSV
+eval set.
+
+```bash
+python experiments/eval_sft_on_jsonl.py \
+  --model experiments/checkpoints/qwen3_4b_cd_format_v5 \
+  --jsonl experiments/data/format_sft_stages_v4_mixed.jsonl \
+  --n 100 \
+  --output-jsonl experiments/checkpoints/qwen3_4b_cd_format_v5/eval_format_sft.jsonl
+```
+
+## Script Reference
+
+All scripts live under `experiments/`.
+
+### Prompt and dataset generation
+
+| Script | Purpose |
+|--------|---------|
+| `generate_prompts.py` | Prompt CSVs from a single BIF graph (obs + interventional) |
+| `cd_generation/names_only.py` | Names-only prompts with no sampled data |
+| `build_grpo_cd_mix_dataset.py` | Mixed prompt/answer CSVs across multiple graphs and data sizes |
+| `export_cd_train_eval_csv.py` | Leak-free train/eval CSV splits from a config file |
+| `collect_format_sft_data.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
+| `collect_descendant_sft_data.py` | SFT data for the descendant-identification task |
+
+### Querying and evaluation
+
+| Script | Purpose |
+|--------|---------|
+| `run_experiment1_pipeline.py` | End-to-end: generate → query → evaluate → summarize |
+| `run_experiment1_in_memory.py` | Same as above but without writing prompt CSV assets first |
+| `query_api.py` | Query a prompt CSV against OpenAI, Gemini, or HF backends |
+| `run_external_llm_baselines.py` | Structured LLM baselines (TakayamaSCP, JiralerspongBFS, CausalLLMPrompt, CausalLLMData) |
+| `evaluate.py` | Score a prediction CSV; outputs precision, recall, F1, SHD |
+| `eval_sft_on_jsonl.py` | Evaluate a finetuned SFT / LoRA model on JSONL or CSV |
+
+### Baselines and training
+
+| Script | Purpose |
+|--------|---------|
+| `run_classical_baselines.py` | Classical baselines: PC, GES, ENCO |
+| `run_exported_graphs.py` | Original ENCO learner on exported graphs |
+| `run_generated_graphs.py` | ENCO on newly generated synthetic graphs |
+| `run_sft.py` | Supervised finetuning |
+| `grpo.py` | GRPO training / evaluation utilities |
+| `grpo_unsloth.py` | Unsloth-oriented GRPO path |
+
+## Prompt Variants
+
+`experiments/prompt_variants.md` documents the current prompt rendering variants,
+including:
+
+- `plain` vs `chat` wrapper mode
+- `summary`, `matrix`, and `names-only` content styles
+- SFT reasoning targets
 
 ## Benchmark Builder
 
-This repository now includes a manifest-driven benchmark framework for LLM causal discovery.
+This repo also includes a manifest-driven benchmark builder.
 
 Core directories:
 
-- `benchmark_specs/`: reusable benchmark manifests
-- `benchmark_cards/`: benchmark cards with intended and unsupported claims
-- `benchmark_runs/`: prompt bundles, run provenance, and aggregate summaries
-- `paper_slices/`: compatibility layer for older paper-facing manifests
+- `benchmark_specs/`
+- `benchmark_cards/`
+- `benchmark_runs/`
+- `paper_slices/`
 
-User-facing CLIs:
+Main CLIs:
 
 ```bash
 scripts/build-benchmark --manifest benchmark_specs/reference_suite.json
@@ -129,177 +315,77 @@ scripts/summarize-benchmark --manifest benchmark_specs/reference_suite.json
 scripts/clean-benchmark-prompts --manifest benchmark_specs/reference_suite.json --yes
 ```
 
-Curated manifests:
+Useful manifests:
 
 - `benchmark_specs/reference_suite.json`
 - `benchmark_specs/smoke_suite.json`
 - `benchmark_specs/synthetic_ladder.json`
 - `benchmark_specs/authoring_demo.json`
 
-Execution policy:
+See also `docs/tutorials/benchmark_authoring.md`.
 
-- `execution.prompt_storage = "disk"` keeps full prompt CSVs
-- `execution.prompt_storage = "in_memory"` generates prompts lazily and only preserves responses
-- `execution.prompt_retention = "example"` or `"none"` controls whether any prompt text survives in in-memory mode
+## Classical Baselines
 
-Prompt cleanup:
-
-- `scripts/clean-benchmark-prompts --manifest benchmark_specs/reference_suite.json --yes`
-- Add `--example-prompts` to also remove saved example prompts from in-memory runs
-
-Baseline support:
-
-- Native to the original repo: `ENCO`
-- Added in this benchmark-builder extension: `PC` and `GES` via `experiments/run_classical_baselines.py`
-- Added external LLM baselines:
-  - `TakayamaSCP` via `experiments/run_takayama_scd.py`, a faithful PC-based implementation of the
-    Takayama et al. pipeline using pairwise prompts, repeated yes/no sampling with logprobs, and a
-    constrained PC rerun
-  - `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData` via
-    `experiments/run_external_llm_baselines.py`
-
-Authoring tutorial:
-
-- [`docs/tutorials/benchmark_authoring.md`](docs/tutorials/benchmark_authoring.md)
-
-### Datasets
-
-To reproduce the experiments in the paper, we provide datasets of causal graphs for the synthetic, confounder, and real-world experiments. The datasets can be downloaded by running:
+`experiments/run_classical_baselines.py` supports `PC`, `GES`, and `ENCO`.
 
 ```bash
-bash download_datasets.sh
+cd experiments
+
+python run_classical_baselines.py \
+  --method PC \
+  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+  --sample_size_obs 5000 \
+  --seed 42
 ```
 
-This requires approximately 600 MB of disk space.
-
-Alternatively, download the archive through [this link](https://drive.google.com/file/d/1mJXJpvkG8Ol4w6QlbzW4EETjpXmHPlMX/view?usp=sharing) and unzip it into `causal_graphs/`.
-
-### Downloading `bnlearn` BIF graphs
-
-The repo already includes a small hand-picked subset of BIF files under:
-
-- `causal_graphs/real_data/small_graphs/`
-- `causal_graphs/real_data/large_graphs/`
-
-To download the full discrete `bnlearn` Bayesian network collection as `.bif`
-files, run:
+The original ENCO learner is also still available:
 
 ```bash
-python causal_graphs/real_data/download_bnlearn_bifs.py
+cd experiments
+
+python run_exported_graphs.py \
+  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+  --sample_size_obs 5000 \
+  --sample_size_inters 200 \
+  --max_inters -1 \
+  --seed 42
 ```
 
-This mirrors the graphs into:
+## GRPO with verl
 
-```text
-causal_graphs/real_data/bnlearn/{small,medium,large,verylarge,massive}
-```
+This repo also contains verl-based GRPO training support.
 
-The downloader keeps the full collection separate from the existing
-`small_graphs/` and `large_graphs/` directories so current experiment globs do
-not change unexpectedly.
+Typical workflow:
 
-Useful options:
+1. prepare prompt / training parquet or JSONL data
+2. launch the Apptainer container
+3. run `verl.trainer.main_ppo`
+
+Example container launch:
 
 ```bash
-# Download only a few named graphs
-python causal_graphs/real_data/download_bnlearn_bifs.py --only survey water andes
-
-# Redownload files even if they already exist
-python causal_graphs/real_data/download_bnlearn_bifs.py --refresh
+apptainer shell --nv --bind /work:/work /work/hdd/bdeb/chenyuen0103/verl.sif
 ```
 
-The upstream source is the `bnlearn` Bayesian Network Repository:
-https://www.bnlearn.com/bnrepository/
-
-## Running experiments
-
-The repository is structured in three main folders:
-* `causal_graphs` contains all utilities for creating, visualizing and handling causal graphs that we experiment on.
-* `causal_discovery` contains the code of ENCO for structure learning.
-* `experiments` contains all utilities to run experiments with ENCO on various causal graphs.
-
-Details on running experiments as well as the commands for reproducing the experiments in the paper can be found in the [`experiments`](experiments/) folder.
-
-### Simple example
-
-We created a quick walkthrough tutorial that goes through the most important functions/components in the repository in [`walkthrough.ipynb`](walkthrough.ipynb). In short, ENCO can be applied as follows:
-
-```python
-from causal_graphs.graph_generation import generate_categorical_graph, get_graph_func  # Functions for generating new graphs
-from causal_discovery.enco import ENCO
-
-# Create a graph on which ENCO should be applied
-graph = generate_categorical_graph(num_vars=8, 
-                                   min_categs=10,
-                                   max_categs=10,
-                                   graph_func=get_graph_func('random'),
-                                   edge_prob=0.4,
-                                   seed=42)
-
-# Create ENCO object
-enco_module = ENCO(graph=graph)
-if torch.cuda.is_available():
-    enco_module.to(torch.device('cuda:0'))
-
-# Run causal discovery
-predicted_adj_matrix = enco_module.discover_graph(num_epochs=10)
-```
-
-## FAQ
-
-<details>
-<summary>How is the repository structured?</summary>
-<br>
-
-We give a quick walkthrough of the most important functions/components in the repository in [`walkthrough.ipynb`](walkthrough.ipynb).  
-
-</details>
-
-<details>
-<summary>Can I also run the experiments on my CPU?</summary>
-<br>
-
-Yes, a GPU is not a strict constraint to run ENCO. Especially for small graphs (about 10 variables), ENCO is similarly fast on a multi-core CPU than on a GPU. To speed up experiments for small graphs on a CPU, it is recommended to reduce the hidden size from `64` to `32`, and the graph samples in graph fitting from `100` to `20`.  
-
-</details>
-
-<details>
-<summary>How can I apply ENCO to my own dataset?</summary>
-<br>
-
-If your causal graph/dataset is specified in a `.bif` format as the real-world graphs, you can directly start an experiment on it using `experiments/run_exported_graphs.py`. The alternative format is a `.npz` file which contains a observational and interventional dataset. The file needs to contain the following keys:
-
-If you need additional benchmark BIFs beyond the small bundled subset, use:
+Inside the container:
 
 ```bash
-python causal_graphs/real_data/download_bnlearn_bifs.py
+export HF_HOME=/work/hdd/bdeb/chenyuen0103/.cache
 ```
 
-This downloads the discrete `bnlearn` collection into
-`causal_graphs/real_data/bnlearn/`.
-   
-* `data_obs`: A dataset of observational samples. This array must be of shape [M, num_vars] where M is the number of data points. For categorical data, it should be any integer data type (e.g. np.int32 or np.uint8).
-* `data_int`: A dataset of interventional samples. This array must be of shape [num_vars, K, num_vars] where K is the number of data points per intervention. The first axis indicates the variables on which has been intervened to gain this dataset.
-* `adj_matrix`: The ground truth adjacency matrix of the graph (shape [num_vars, num_vars], type bool or integer). The matrix is used to determine metrics like SHD during/after training. If the ground truth matrix is not known, you can submit a zero-matrix (keep in mind that the metrics cannot be used in this case).
+The local verl code lives under `verl/`.
 
-</details>
+## Citation and Attribution
 
-<details>
-<summary>Can I apply ENCO to continuous or categorical data?</summary>
-<br>
+If you use this repository, cite the original ENCO work for the base code and
+data-generation foundation:
 
-Both data types are supported in this repository. Simply make sure that the numpy array has the data type `np.float32` for continuous experiments, and `np.uint8` or `np.int32` for categorical data.  
-
-</details>
-
-## Citation
-If you use this code, please consider citing our work:
 ```bibtex
 @inproceedings{lippe2022enco,
- author = {Lippe, Phillip and Cohen, Taco and Gavves, Efstratios},
- booktitle = {International Conference on Learning Representations},
- title = {Efficient Neural Causal Discovery without Acyclicity Constraints},
- url = {https://openreview.net/forum?id=eYciPrLuUhG},
- year = {2022}
+  author = {Lippe, Phillip and Cohen, Taco and Gavves, Efstratios},
+  booktitle = {International Conference on Learning Representations},
+  title = {Efficient Neural Causal Discovery without Acyclicity Constraints},
+  url = {https://openreview.net/forum?id=eYciPrLuUhG},
+  year = {2022}
 }
 ```

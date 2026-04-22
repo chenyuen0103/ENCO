@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ENV_NAME="${1:-enco-llm}"
-PYTHON_VERSION="${2:-3.9}"
+PYTHON_VERSION="${2:-3.12}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"

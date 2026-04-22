@@ -741,8 +741,6 @@ def _infer_prompt_style_from_stem(stem: str) -> str:
     styles = [
         "payload_topk",
         "summary_hist_rows",
-        "summary_joint",
-        "summary_probs",
         "summary",
         "matrix",
         "payload",
@@ -774,7 +772,7 @@ def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
             # Regular prompts: responses_obs..._thinktags_<style>_<model>
             m_resp = re.match(
                 r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-                r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+                r"(?:matrix|summary|cases|payload|payload_topk)_(?P<model>.+)$",
                 stem,
                 flags=re.IGNORECASE,
             )

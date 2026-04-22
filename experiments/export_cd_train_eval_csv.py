@@ -5,7 +5,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from generate_prompts_names_only import iter_names_only_prompts_in_memory
+try:
+    from cd_generation.names_only import iter_names_only_prompts_in_memory
+except ImportError:
+    from experiments.cd_generation.names_only import iter_names_only_prompts_in_memory
+
+
+def _set_csv_field_limit() -> None:
+    try:
+        csv.field_size_limit(10_000_000)
+    except OverflowError:
+        csv.field_size_limit(1_000_000)
 
 
 def _iter_prompt_rows_for_config(
@@ -24,7 +34,6 @@ def _iter_prompt_rows_for_config(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
-    thinking_tags: bool,
 ):
     is_names_only = obs_per_prompt == 0 and int_per_combo == 0
     if is_names_only:
@@ -35,7 +44,6 @@ def _iter_prompt_rows_for_config(
             col_order=col_order,
             anonymize=anonymize,
             causal_rules=causal_rules,
-            thinking_tags=thinking_tags,
         )
 
     from generate_prompts import iter_prompts_in_memory
@@ -55,7 +63,6 @@ def _iter_prompt_rows_for_config(
         give_steps=give_steps,
         def_int=def_int,
         intervene_vars=intervene_vars,
-        thinking_tags=thinking_tags,
     )
 
 
@@ -131,7 +138,6 @@ def _export_rows(
                 give_steps=bool(cfg.get("give_steps", False)),
                 def_int=bool(cfg.get("def_int", False)),
                 intervene_vars=str(cfg.get("intervene_vars", "all")),
-                thinking_tags=bool(cfg.get("thinking_tags", True)),
             )
 
             answer_json = json.dumps(answer_obj, ensure_ascii=False)
@@ -179,6 +185,8 @@ def main() -> None:
     ap.add_argument("--train-csv", type=Path, required=True)
     ap.add_argument("--eval-csv", type=Path, required=True)
     args = ap.parse_args()
+
+    _set_csv_field_limit()
 
     bif_file = args.bif_file.resolve(strict=True)
     config_file = args.config_file.resolve(strict=True)
