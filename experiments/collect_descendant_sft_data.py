@@ -52,11 +52,18 @@ from typing import Dict, List, Optional, Tuple
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
-from cd_training_format import (
-    DEFAULT_DESCENDANT_FORMAT_HINT_TEXT,
-    canonicalize_cd_prompt,
-    validate_sft_example,
-)
+try:
+    from cd_generation.format import (
+        DEFAULT_DESCENDANT_FORMAT_HINT_TEXT,
+        canonicalize_cd_prompt,
+        validate_sft_example,
+    )
+except ModuleNotFoundError:
+    from experiments.cd_generation.format import (
+        DEFAULT_DESCENDANT_FORMAT_HINT_TEXT,
+        canonicalize_cd_prompt,
+        validate_sft_example,
+    )
 from generate_prompts import (
     format_prompt_descendants_matrix,
     format_prompt_descendants_summary,
@@ -242,7 +249,7 @@ def _build_records(
                 num_prompts=num_prompts,
                 shuffles_per_graph=1,
                 seed=perm_seed,
-                prompt_style="summary_joint",
+                prompt_style="summary",
                 obs_per_prompt=obs_per_prompt,
                 int_per_combo=int_per_combo,
                 row_order="random",
@@ -252,7 +259,6 @@ def _build_records(
                 give_steps=False,
                 def_int=True,
                 intervene_vars="all",
-                thinking_tags=False,
             )
         except Exception as e:
             print(f"  [warn] {source_tag} perm_idx={perm_idx}: {e}", file=sys.stderr)

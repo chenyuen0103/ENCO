@@ -154,8 +154,8 @@ def main() -> None:
     ap.add_argument("--in-prompt-txt", required=True, help="Path to *_summary_hist_rows_data*_shuf*.txt")
     ap.add_argument(
         "--out-styles",
-        default="summary,summary_joint",
-        help="Comma-separated list of output styles (default: summary,summary_joint).",
+        default="summary",
+        help="Comma-separated list of output styles (default: summary).",
     )
     ap.add_argument(
         "--out-dir",
@@ -195,37 +195,23 @@ def main() -> None:
     out_prompt_txt_dir.mkdir(parents=True, exist_ok=True)
 
     # Import formatting functions (requires only numpy/json; graph sampling is not needed).
-    from generate_prompts import (  # type: ignore
-        format_prompt_summary_full_joint,
-        format_prompt_summary_stats,
-    )
+    from generate_prompts import format_prompt_summary_full_joint  # type: ignore
 
     for style in out_styles:
-        if style not in {"summary", "summary_joint"}:
+        if style != "summary":
             raise ValueError(f"Unsupported out style: {style}")
         out_base = _derive_out_base(in_base, style)
 
-        if style == "summary":
-            prompt_text = format_prompt_summary_stats(
-                variables,
-                dataset_name=dataset_name,
-                obs_rows_num=obs_rows_num,
-                int_groups_num=int_groups_num,
-                include_causal_rules=include_causal_rules,
-                include_give_steps=include_give_steps,
-                include_def_int=include_def_int,
-            )
-        else:
-            prompt_text = format_prompt_summary_full_joint(
-                variables,
-                dataset_name=dataset_name,
-                obs_rows_num=obs_rows_num,
-                int_groups_num=int_groups_num,
-                state_names=state_names if any(state_names) else None,
-                include_causal_rules=include_causal_rules,
-                include_give_steps=include_give_steps,
-                include_def_int=include_def_int,
-            )
+        prompt_text = format_prompt_summary_full_joint(
+            variables,
+            dataset_name=dataset_name,
+            obs_rows_num=obs_rows_num,
+            int_groups_num=int_groups_num,
+            state_names=state_names if any(state_names) else None,
+            include_causal_rules=include_causal_rules,
+            include_give_steps=include_give_steps,
+            include_def_int=include_def_int,
+        )
 
         out_prompt_txt = out_prompt_txt_dir / f"{out_base}_data{data_idx}_shuf{shuf_idx}.txt"
         out_prompt_txt.write_text(prompt_text, encoding="utf-8")

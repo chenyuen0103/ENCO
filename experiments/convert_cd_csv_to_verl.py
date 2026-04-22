@@ -8,7 +8,7 @@ from typing import Any, Iterable, Optional
 from datasets import Dataset
 
 try:
-    from cd_training_format import (
+    from cd_generation.format import (
         default_format_hint_text,
         looks_like_chat_prompt,
         resolve_format_hint_text,
@@ -16,7 +16,7 @@ try:
         append_format_hint_to_user_prompt,
     )
 except ModuleNotFoundError:
-    from experiments.cd_training_format import (
+    from experiments.cd_generation.format import (
         default_format_hint_text,
         looks_like_chat_prompt,
         resolve_format_hint_text,

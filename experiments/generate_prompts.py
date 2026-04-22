@@ -15,58 +15,45 @@ import numpy as np
 # Allow running from experiments/ with repo root one level up
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-try:
-    from cd_training_format import canonicalize_cd_prompt, default_format_hint_text
-except Exception:
-    from experiments.cd_training_format import canonicalize_cd_prompt, default_format_hint_text
-
 # NOTE: We intentionally avoid importing torch-dependent graph loaders at module import time.
 # This file also contains prompt formatting utilities that are useful without torch installed.
 # When sampling from BIF graphs, we lazy-import the loader inside the relevant functions.
-
-LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
+try:
+    from cd_generation.prompt_utils import (
+        LARGE_GRAPH_EDGE_LIST_THRESHOLD,
+        build_causal_discovery_method_lines,
+        build_causal_discovery_reminder_lines,
+        build_causal_graph_assumption_lines,
+        build_intervention_semantics_lines,
+        _build_output_contract_lines,
+        get_topological_sort,
+        normalize_variable_names,
+        render_prompt_text,
+        resolve_wrapper_mode,
+    )
+except ImportError:
+    from experiments.cd_generation.prompt_utils import (
+        LARGE_GRAPH_EDGE_LIST_THRESHOLD,
+        build_causal_discovery_method_lines,
+        build_causal_discovery_reminder_lines,
+        build_causal_graph_assumption_lines,
+        build_intervention_semantics_lines,
+        _build_output_contract_lines,
+        get_topological_sort,
+        normalize_variable_names,
+        render_prompt_text,
+        resolve_wrapper_mode,
+    )
 
 
 def _use_edge_list_output(variables: List[str]) -> bool:
     return len(variables) > LARGE_GRAPH_EDGE_LIST_THRESHOLD
 
 
-def _maybe_apply_cot_hint(prompt_text: str, *, cot_hint: bool, task: str = "causal_discovery") -> str:
-    if not cot_hint:
-        return prompt_text
-    return canonicalize_cd_prompt(
-        prompt_text,
-        task=task,
-        wrap_system_prompt=True,
-        append_format_hint=True,
-        format_hint_text=default_format_hint_text(task),
-        prefill_think=True,
-        prefill_answer=False,
-        think_text="",
-    )
-
 def _load_graph_file(path: str):  # type: ignore
     from benchmark_builder.graph_io import load_causal_graph  # type: ignore
 
     return load_causal_graph(path)
-
-
-def _build_output_contract_lines(
-    *,
-    output_edge_list: bool,
-    require_think_answer_blocks: bool = True,
-) -> List[str]:
-    _ = require_think_answer_blocks
-    if output_edge_list:
-        json_key = "edges"
-        key_desc = '"edges": [["source","target"], ...] using exact variable names.'
-    else:
-        json_key = "adjacency_matrix"
-        key_desc = '"adjacency_matrix": N×N 0/1 matrix in variable order. Must be a DAG.'
-    return [
-        f'Output: <think>[staged reasoning]</think><answer>{{"{json_key}": ...}}</answer>',
-        key_desc,
-    ]
 
 
 def _build_descendants_output_contract_lines() -> List[str]:
@@ -82,46 +69,6 @@ def _build_descendants_output_contract_lines() -> List[str]:
     ]
 
 
-
-# ------------------------ Utility: variable names ------------------------ #
-
-def get_topological_sort(adj_matrix: List[List[int]]) -> List[int]:
-    """
-    Returns a list of node indices in topological order (Causes -> Effects).
-    Uses Kahn's Algorithm.
-    """
-    n = len(adj_matrix)
-    in_degree = [0] * n
-    for i in range(n):
-        for j in range(n):
-            if adj_matrix[i][j] == 1:
-                in_degree[j] += 1
-    
-    queue = [i for i in range(n) if in_degree[i] == 0]
-    topo_order = []
-    
-    # Standard Kahn's Algo
-    # (Using a copy of in_degree to avoid mutating if we needed it later, 
-    # though here it's fine)
-    in_degree_curr = list(in_degree)
-    
-    while queue:
-        # Sort queue to ensure deterministic tie-breaking for identical structures
-        queue.sort() 
-        u = queue.pop(0)
-        topo_order.append(u)
-        
-        for v in range(n):
-            if adj_matrix[u][v] == 1:
-                in_degree_curr[v] -= 1
-                if in_degree_curr[v] == 0:
-                    queue.append(v)
-                    
-    if len(topo_order) != n:
-        # Fallback for cycles (shouldn't happen in DAGs)
-        return list(range(n))
-        
-    return topo_order
 
 def sample_interventional_values_vec(
     graph: Any,
@@ -177,14 +124,6 @@ def sample_interventional_values_vec(
         raise RuntimeError("sample_interventional_values_vec: no samples generated.")
     return arr_all
 
-def normalize_variable_names(graph) -> List[str]:
-    """
-    Returns the list of variable names in the order used by the graph.
-    Adjust here if your graph uses a different naming convention.
-    """
-    return [v.name for v in graph.variables]
-
-
 def iter_prompts_in_memory(
     *,
     bif_file: str,
@@ -201,8 +140,10 @@ def iter_prompts_in_memory(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
-    thinking_tags: bool = True,
-    cot_hint: bool = False,
+    wrapper_mode: Optional[str] = None,
+    append_format_hint: Optional[bool] = None,
+    prefill_think: Optional[bool] = None,
+    prefill_answer: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     """
     Generate prompts in-memory (no prompt files, no prompt CSV).
@@ -212,7 +153,12 @@ def iter_prompts_in_memory(
     graph = _load_graph_file(str(graph_abs))
     base_variables = normalize_variable_names(graph)
     nvars = len(base_variables)
+    if prompt_style in {"summary_join", "summary_joint"}:
+        prompt_style = "summary"
     codebook = build_codebook(graph, base_variables, str(graph_abs))
+    resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=wrapper_mode)
+    resolved_append_format_hint = bool(append_format_hint)
+    require_think_answer_blocks = True
 
     adj_np = np.asarray(graph.adj_matrix)
     base_adj_bin = (adj_np > 0).astype(int).tolist()
@@ -283,11 +229,11 @@ def iter_prompts_in_memory(
         tags.append("rules")
     if give_steps:
         tags.append("steps")
-    if thinking_tags:
-        tags.append("thinktags")
-    if cot_hint:
-        tags.append("cothint")
-    if prompt_style in {"matrix", "summary_joint"}:
+    if resolved_wrapper_mode != "plain":
+        tags.append(f"wrap{resolved_wrapper_mode}")
+    if resolved_append_format_hint:
+        tags.append("fmthint")
+    if prompt_style in {"matrix", "summary"}:
         tags.append(prompt_style)
     if row_order != "random":
         tags.append(f"row{row_order}")
@@ -362,8 +308,7 @@ def iter_prompts_in_memory(
                 elif row_order == "reverse":
                     obs_rows.reverse()
                 elif row_order == "sorted":
-                    key_var = variables_out[0]
-                    obs_rows.sort(key=lambda x: str(x.get(key_var, "")))
+                    obs_rows.sort(key=lambda x: tuple(x.get(v, 0) for v in variables_out))
 
                 int_rows_final = []
                 if interventional_rows_base:
@@ -384,7 +329,7 @@ def iter_prompts_in_memory(
                     elif row_order == "sorted":
                         int_rows_final = sorted(
                             interventional_rows_base,
-                            key=lambda x: str(x.get(variables_out[0], "")),
+                            key=lambda x: tuple(x.get(v, 0) for v in variables_out),
                         )
 
                 if int_per_combo > 0:
@@ -399,15 +344,16 @@ def iter_prompts_in_memory(
                 is_names_only_cfg = (obs_per_prompt == 0 and int_per_combo == 0)
                 if is_names_only_cfg:
                     # (obs=0,int=0) should always use the names-only prompt format, regardless of style.
-                    from generate_prompts_names_only import format_names_only_prompt
+                    from cd_generation.names_only import format_names_only_prompt
                     prompt_text = format_names_only_prompt(
                         variables_out,
                         dataset_name,
                         causal_rules,
                         output_edge_list=use_edge_list_output,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         anonymize=anonymize,
                     )
-                elif prompt_style == "summary_joint":
+                elif prompt_style == "summary":
                     prompt_text = format_prompt_summary_full_joint(
                         variables_out,
                         dataset_name=dataset_name,
@@ -420,22 +366,29 @@ def iter_prompts_in_memory(
                         anonymize=anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
-                        require_think_answer_blocks=thinking_tags,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
                 elif prompt_style == "matrix":
                     prompt_text = format_prompt_cb_matrix(
                         variables_out, rows_text_source, dataset_name,
                         causal_rules, give_steps, include_def_int=include_def_int,
-                        require_think_answer_blocks=thinking_tags,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
                 else:
                     raise ValueError(
                         f"Unsupported prompt_style={prompt_style!r}. "
-                        "Only 'matrix' and 'summary_joint' are enabled."
+                        "Only 'matrix' and 'summary' are enabled."
                     )
-                prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(cot_hint))
+                prompt_text = render_prompt_text(
+                    prompt_text,
+                    task="causal_discovery",
+                    wrapper_mode=resolved_wrapper_mode,
+                    append_format_hint=resolved_append_format_hint,
+                    prefill_think=prefill_think,
+                    prefill_answer=prefill_answer,
+                )
 
                 yield {
                     "data_idx": i,
@@ -944,28 +897,17 @@ def format_prompt_cb_matrix(
 
     # --- Assumptions (high impact, short) ---
     lines.append("ASSUMPTIONS:")
-    lines.append("- The true graph is a DAG (no directed cycles).")
-    lines.append("- Causal sufficiency holds (no unobserved confounders among these variables).")
-    lines.append("- Interventions are perfect do-interventions (surgical): do(X=v) cuts all incoming edges into X.")
+    lines.extend(build_causal_graph_assumption_lines())
 
     # --- Optional causal reminders ---
     if include_causal_rules:
-        lines.extend([
-            "\n--- CAUSAL DISCOVERY REMINDERS ---",
-            "- Use observational dependence/independence to suggest which pairs may be connected (skeleton).",
-            "- Use interventions to orient edges: if Y changes under do(X=v), that supports X being an ancestor of Y.",
-            "- Prefer directions that are consistent across all intervention blocks and keep the graph acyclic.",
-        ])
+        lines.append("\n--- CAUSAL DISCOVERY REMINDERS ---")
+        lines.extend(build_causal_discovery_reminder_lines())
 
     # --- Intervention notes (stronger + operational) ---
     if include_def_int:
-        lines.extend([
-            "\n--- INTERVENTION SEMANTICS ---",
-            "- Each block [Intervention: do(X = v)] contains samples where X is externally set to v.",
-            "- In that block, X's usual causes are disabled (incoming edges into X are cut).",
-            "- Only descendants of X can change in distribution because of do(X=v); non-descendants should remain invariant up to sampling noise.",
-            "- Treat values as categorical labels (do NOT assume numeric ordering of codes).",
-        ])
+        lines.append("\n--- INTERVENTION SEMANTICS ---")
+        lines.extend(build_intervention_semantics_lines())
 
     # --- Known edges (optional) ---
     if given_edges:
@@ -1011,198 +953,15 @@ def format_prompt_cb_matrix(
 
     # --- Minimal internal method (optional) ---
     if include_give_steps:
-        method_header = (
-            "\nMETHOD (write this reasoning in the <think>...</think> block):"
-            if require_think_answer_blocks else
-            "\nMETHOD (follow internally; do not output reasoning):"
+        lines.extend(
+            build_causal_discovery_method_lines(
+                has_observational_data=bool(obs_rows),
+                has_interventional_data=bool(int_buckets),
+                require_think_answer_blocks=require_think_answer_blocks,
+            )
         )
-        lines.extend([
-            method_header,
-            "1) For each do(X=v) block, mark variables whose distributions differ from observational as descendants of X.",
-            "2) Use asymmetry across interventions to orient: if Y changes under do(X) but X does not change under do(Y), prefer X -> Y.",
-            "3) Use observational data only to suggest adjacency (avoid overfitting); interventions decide directions when possible.",
-            "4) Choose the sparsest DAG consistent with all blocks and known edges.",
-        ])
 
     # Put strict formatting constraints at the very end for stronger adherence.
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
-
-    return "\n".join(lines)
-
-
-def _corr_matrix_py(rows: List[List[float]]) -> List[List[float]]:
-    """
-    Pure-Python Pearson correlation over columns (sample correlation, ddof=1).
-    Avoids numpy/BLAS/OpenMP issues on some clusters.
-    """
-    n = len(rows)
-    if n < 2:
-        raise ValueError(f"Need at least 2 rows for correlation; got n={n}.")
-    m = len(rows[0])
-    if any(len(r) != m for r in rows):
-        raise ValueError("Ragged rows: all rows must have the same number of columns.")
-
-    means = [0.0] * m
-    for r in rows:
-        for j, x in enumerate(r):
-            means[j] += float(x)
-    means = [s / n for s in means]
-
-    var = [0.0] * m
-    for r in rows:
-        for j, x in enumerate(r):
-            d = float(x) - means[j]
-            var[j] += d * d
-    denom = float(n - 1)
-    std = [(v / denom) ** 0.5 for v in var]
-
-    corr: List[List[float]] = [[0.0] * m for _ in range(m)]
-    for i in range(m):
-        corr[i][i] = 1.0
-        for j in range(i + 1, m):
-            cov = 0.0
-            for r in rows:
-                cov += (float(r[i]) - means[i]) * (float(r[j]) - means[j])
-            cov /= denom
-            if std[i] == 0.0 or std[j] == 0.0:
-                c = 0.0
-            else:
-                c = cov / (std[i] * std[j])
-            corr[i][j] = c
-            corr[j][i] = c
-    return corr
-
-
-def _mean_vec_py(rows: List[List[float]]) -> List[float]:
-    n = len(rows)
-    if n <= 0:
-        raise ValueError("Need at least 1 row for mean.")
-    m = len(rows[0])
-    if any(len(r) != m for r in rows):
-        raise ValueError("Ragged rows: all rows must have the same number of columns.")
-    sums = [0.0] * m
-    for r in rows:
-        for j, x in enumerate(r):
-            sums[j] += float(x)
-    return [s / n for s in sums]
-
-
-def format_prompt_summary_stats(
-    variables: List[str],
-    *,
-    dataset_name: str,
-    obs_rows_num: List[List[float]],
-    int_groups_num: Dict[Tuple[str, str], List[List[float]]],
-    include_causal_rules: bool = False,
-    include_give_steps: bool = False,
-    include_def_int: bool = False,
-    decimals: int = 4,
-    require_think_answer_blocks: bool = False,
-    output_edge_list: bool = False,
-) -> str:
-    # Legacy formatter: not used in current pipeline (matrix/summary_joint only).
-    """
-    Summary-statistics prompt: small token footprint.
-
-    We embed:
-      - variable order
-      - observational correlation matrix (computed on numeric codes)
-      - optional intervention group means / mean-shifts (computed on numeric codes)
-
-    NOTE: For discrete variables this is a lossy summary; it's meant as a lightweight baseline.
-    """
-    import json
-
-    lines: List[str] = []
-    lines.append(
-        "You are a highly intelligent question-answering bot with profound "
-        "knowledge of causal inference and causal discovery."
-    )
-    lines.append(
-        f"The following are summary statistics computed from data sampled from a Bayesian "
-        f"network named {dataset_name}."
-    )
-    lines.append("Infer the directed causal graph over the variables.")
-
-    if include_causal_rules:
-        lines.extend([
-            "\n--- CAUSAL INFERENCE REMINDERS ---",
-            "- Confounder: a variable that causes two others.",
-            "- Mediator: lies on a path X -> M -> Y.",
-            "- Collider: a common effect of two variables; avoid conditioning on colliders.",
-            "- The final output must be a DAG (no directed cycles).",
-        ])
-
-    if include_def_int and int_groups_num:
-        lines.extend([
-            "\n--- INTERVENTION NOTES ---",
-            "- An intervention do(X = v) sets X externally and replaces its usual causal mechanism.",
-            "- In the intervened causal graph, all incoming edges into X are removed.",
-            "- Only descendants of X can be causally affected by this intervention.",
-        ])
-
-    lines.append("\n--- VARIABLES (ORDER MATTERS) ---")
-    for i, v in enumerate(variables):
-        lines.append(f"{i}: {v}")
-
-    # Observational summaries
-    lines.append("\n--- OBSERVATIONAL SUMMARY ---")
-    if obs_rows_num:
-        obs_mean = _mean_vec_py(obs_rows_num)
-        obs_corr = _corr_matrix_py(obs_rows_num) if len(obs_rows_num) >= 2 else None
-        obs_mean_r = [round(float(x), decimals) for x in obs_mean]
-        obs_corr_r = (
-            [[round(float(x), decimals) for x in row] for row in obs_corr] if obs_corr is not None else None
-        )
-        lines.append(f"obs_n={len(obs_rows_num)}")
-        lines.append("obs_mean_numeric_codes=" + json.dumps(obs_mean_r, separators=(",", ":"), ensure_ascii=False))
-        if obs_corr_r is not None:
-            lines.append("obs_corr_numeric_codes=" + json.dumps(obs_corr_r, separators=(",", ":"), ensure_ascii=False))
-    else:
-        obs_mean = None
-        lines.append("obs_n=0")
-
-    # Interventional summaries
-    lines.append("\n--- INTERVENTIONAL SUMMARY ---")
-    if not int_groups_num:
-        lines.append("(none)")
-    else:
-        # Stable order
-        for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
-            rows = int_groups_num[(ivar, ival)]
-            mu = _mean_vec_py(rows)
-            mu_r = [round(float(x), decimals) for x in mu]
-            if obs_mean is not None:
-                delta_r = [round(float(mu[j] - obs_mean[j]), decimals) for j in range(len(mu))]
-            else:
-                delta_r = None
-            payload = {
-                "n": len(rows),
-                "mean_numeric_codes": mu_r,
-                "delta_from_obs_mean": delta_r,
-            }
-            lines.append(f"do({ivar}={ival}): " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
-
-    lines.append("\n--- END OF SUMMARY ---")
-    if include_give_steps:
-        steps_header = (
-            "\n(Use this in your <think>...</think> block.)"
-            if require_think_answer_blocks else
-            "\n(You may follow these steps silently.)"
-        )
-        lines.extend([
-            steps_header,
-            "1) Use obs_corr and intervention deltas to constrain and orient edges.",
-            "2) Choose a directed acyclic graph consistent with the constraints.",
-            "Then output the JSON as specified above.",
-        ])
-
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.extend(
         _build_output_contract_lines(
@@ -1247,63 +1006,6 @@ def _marginals_py(rows: List[List[float]], num_states: List[int]) -> List[List[f
     return probs
 
 
-def _pairwise_joints_py(
-    rows: List[List[float]],
-    num_states: List[int],
-    *,
-    pairs: Optional[List[Tuple[int, int]]] = None,
-) -> Dict[Tuple[int, int], List[List[float]]]:
-    """
-    Compute pairwise joint distributions over integer-coded states.
-
-    Returns a dict mapping (i,j) -> probs, where probs[a][b] = P(X_i=a, X_j=b).
-    Only pairs in `pairs` are computed; if None, computes all i<j.
-    """
-    n = len(rows)
-    if n <= 0:
-        raise ValueError("Need at least 1 row for pairwise joints.")
-    m = len(rows[0])
-    if any(len(r) != m for r in rows):
-        raise ValueError("Ragged rows: all rows must have the same number of columns.")
-    if len(num_states) != m:
-        raise ValueError(f"num_states must have length {m}; got {len(num_states)}.")
-
-    if pairs is None:
-        pairs = [(i, j) for i in range(m) for j in range(i + 1, m)]
-    else:
-        # Ensure consistent (i<j) ordering.
-        pairs = [(i, j) if i < j else (j, i) for (i, j) in pairs]
-        pairs = sorted(set(pairs))
-
-    counts: Dict[Tuple[int, int], List[List[int]]] = {}
-    for i, j in pairs:
-        ki = int(num_states[i])
-        kj = int(num_states[j])
-        if ki <= 0 or kj <= 0:
-            continue
-        counts[(i, j)] = [[0 for _ in range(kj)] for _ in range(ki)]
-
-    for r in rows:
-        for i, j in pairs:
-            table = counts.get((i, j))
-            if table is None:
-                continue
-            ki = len(table)
-            kj = len(table[0]) if table else 0
-            if ki <= 0 or kj <= 0:
-                continue
-            xi = int(round(float(r[i])))
-            xj = int(round(float(r[j])))
-            if 0 <= xi < ki and 0 <= xj < kj:
-                table[xi][xj] += 1
-
-    probs: Dict[Tuple[int, int], List[List[float]]] = {}
-    denom = float(n)
-    for (i, j), table in counts.items():
-        probs[(i, j)] = [[c / denom for c in row] for row in table]
-    return probs
-
-
 def _histogram_rows_full_assignments_py(
     rows: List[List[float]],
     num_states: List[int],
@@ -1341,185 +1043,6 @@ def _histogram_rows_full_assignments_py(
         key = tuple(x)
         hist[key] = hist.get(key, 0) + 1
     return hist
-
-
-def _encode_assignment_mixed_radix_str(x: Tuple[int, ...], bases: List[int]) -> str:
-    """
-    Encode a full assignment x into a single non-negative integer string using mixed radix.
-
-    code = sum_{j=0..m-1} x[j] * prod_{t<j} bases[t]
-    """
-    if len(x) != len(bases):
-        raise ValueError("x and bases must have the same length.")
-    code = 0
-    mult = 1
-    for j, v in enumerate(x):
-        b = int(bases[j])
-        if b <= 0:
-            raise ValueError("All bases must be positive.")
-        vv = int(v)
-        if not (0 <= vv < b):
-            raise ValueError(f"x[{j}]={vv} out of range for base {b}.")
-        code += vv * mult
-        mult *= b
-    return str(code)
-
-
-def format_prompt_summary_probs(
-    variables: List[str],
-    *,
-    dataset_name: str,
-    obs_rows_num: List[List[float]],
-    int_groups_num: Dict[Tuple[str, str], List[List[float]]],
-    state_names: Optional[List[List[str]]] = None,
-    include_causal_rules: bool = False,
-    include_give_steps: bool = False,
-    include_def_int: bool = False,
-    decimals: int = 4,
-    top_k_effects: int = 5,
-    require_think_answer_blocks: bool = False,
-    output_edge_list: bool = False,
-) -> str:
-    # Legacy formatter: not used in current pipeline (matrix/summary_joint only).
-    """
-    Probability-based summary prompt (token-efficient, more informative than means).
-
-    We embed:
-      - variable order (+ optional state-name mapping)
-      - observational marginals over integer-coded discrete states
-      - optional observational correlation matrix over numeric codes (coarse)
-      - intervention effects summarized via top-K TV-distance shifts and marginals
-    """
-    import json
-
-    lines: List[str] = []
-    lines.append(
-        "You are a highly intelligent question-answering bot with profound "
-        "knowledge of causal inference and causal discovery."
-    )
-    lines.append(
-        f"The following are summary statistics computed from data sampled from a Bayesian "
-        f"network named {dataset_name}."
-    )
-    lines.append("Infer the directed causal graph over the variables.")
-
-    if include_causal_rules:
-        lines.extend([
-            "\n--- CAUSAL INFERENCE REMINDERS ---",
-            "- Confounder: a variable that causes two others.",
-            "- Mediator: lies on a path X -> M -> Y.",
-            "- Collider: a common effect of two variables; avoid conditioning on colliders.",
-            "- The final output must be a DAG (no directed cycles).",
-        ])
-
-    if include_def_int and int_groups_num:
-        lines.extend([
-            "\n--- INTERVENTION NOTES ---",
-            "- An intervention do(X = v) sets X externally and replaces its usual causal mechanism.",
-            "- In the intervened causal graph, all incoming edges into X are removed.",
-            "- Only descendants of X can be causally affected by this intervention.",
-        ])
-
-    lines.append("\n--- VARIABLES (ORDER MATTERS) ---")
-    for i, v in enumerate(variables):
-        if state_names and i < len(state_names) and state_names[i] and not _is_trivial_state_names(state_names[i]):
-            mapping = {str(s): str(name) for s, name in enumerate(state_names[i])}
-            lines.append(f"{i}: {v} states=" + json.dumps(mapping, separators=(",", ":"), ensure_ascii=False))
-        else:
-            lines.append(f"{i}: {v}")
-
-    # Determine number of states per variable.
-    # Prefer state_names lengths if provided, else infer from observed + interventional rows.
-    m = len(variables)
-    num_states: List[int] = []
-    for j in range(m):
-        if state_names and j < len(state_names) and state_names[j]:
-            num_states.append(len(state_names[j]))
-        else:
-            max_seen = -1
-            for r in obs_rows_num:
-                if j < len(r):
-                    max_seen = max(max_seen, int(round(float(r[j]))))
-            for rows in int_groups_num.values():
-                for r in rows:
-                    if j < len(r):
-                        max_seen = max(max_seen, int(round(float(r[j]))))
-            num_states.append(max(2, max_seen + 1))
-
-    lines.append("\n--- OBSERVATIONAL SUMMARY ---")
-    if obs_rows_num:
-        obs_probs = _marginals_py(obs_rows_num, num_states)
-        obs_probs_r = [[round(float(x), decimals) for x in row] for row in obs_probs]
-        obs_corr = _corr_matrix_py(obs_rows_num) if len(obs_rows_num) >= 2 else None
-        obs_corr_r = (
-            [[round(float(x), decimals) for x in row] for row in obs_corr] if obs_corr is not None else None
-        )
-        lines.append(f"obs_n={len(obs_rows_num)}")
-        payload = {variables[j]: obs_probs_r[j] for j in range(m)}
-        lines.append("obs_marginals=" + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
-        if obs_corr_r is not None:
-            lines.append("obs_corr_numeric_codes=" + json.dumps(obs_corr_r, separators=(",", ":"), ensure_ascii=False))
-    else:
-        obs_probs_r = None
-        lines.append("obs_n=0")
-
-    lines.append("\n--- INTERVENTIONAL SUMMARY ---")
-    if not int_groups_num:
-        lines.append("(none)")
-    else:
-        # Stable order by (intervened variable, intervened value)
-        for (ivar, ival) in sorted(int_groups_num.keys(), key=lambda kv: (str(kv[0]), str(kv[1]))):
-            rows = int_groups_num[(ivar, ival)]
-            do_probs = _marginals_py(rows, num_states)
-            do_probs_r = [[round(float(x), decimals) for x in row] for row in do_probs]
-
-            tv_scores: List[Tuple[int, float]] = []
-            if obs_probs_r is not None:
-                for j in range(m):
-                    if variables[j] == ivar:
-                        continue
-                    p = obs_probs_r[j]
-                    q = do_probs_r[j]
-                    if not p or not q:
-                        continue
-                    tv = 0.5 * sum(abs(float(p[s]) - float(q[s])) for s in range(min(len(p), len(q))))
-                    tv_scores.append((j, tv))
-                tv_scores.sort(key=lambda t: t[1], reverse=True)
-
-            top = tv_scores[: max(0, int(top_k_effects))]
-            top_effects = [[variables[j], round(float(tv), decimals)] for (j, tv) in top]
-            top_marginals = {variables[j]: do_probs_r[j] for (j, _) in top}
-
-            payload = {
-                "n": len(rows),
-                "tv_top_effects": top_effects,
-                "do_marginals_top": top_marginals,
-            }
-            lines.append(f"do({ivar}={ival}): " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
-
-    lines.append("\n--- END OF SUMMARY ---")
-    if include_give_steps:
-        steps_header = (
-            "\n(Use this in your <think>...</think> block.)"
-            if require_think_answer_blocks else
-            "\n(You may follow these steps silently.)"
-        )
-        lines.extend([
-            steps_header,
-            "1) Use obs_marginals, obs_corr, and intervention TV effects to constrain and orient edges.",
-            "2) Choose a directed acyclic graph consistent with the constraints.",
-            "Then output the JSON as specified above.",
-        ])
-
-    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
-    lines.extend(
-        _build_output_contract_lines(
-            output_edge_list=output_edge_list,
-            require_think_answer_blocks=require_think_answer_blocks,
-        )
-    )
-
-    return "\n".join(lines)
 
 
 def _is_trivial_state_names(names: List[str]) -> bool:
@@ -2030,37 +1553,38 @@ def format_prompt_summary_full_joint(
     state_map = _state_maps()
 
     lines: List[str] = []
-    lines.append("You are a question-answering assistant with knowledge of causal inference and causal discovery.")
+    lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
+    lines.append("TASK: Infer the directed causal graph over the variables.")
     if anonymize:
         lines.append("The following are empirical distributions computed from data sampled from an anonymized Bayesian network.")
     else:
         lines.append(f"The following are empirical distributions computed from data sampled from a Bayesian network named {dataset_name}.")
-    lines.append("Infer the directed causal graph over the variables.")
+    lines.append("ASSUMPTIONS:")
+    lines.extend(build_causal_graph_assumption_lines())
 
     if include_causal_rules:
-        lines.extend([
-            "\n--- REMINDERS ---",
-            "- Confounder causes two variables; collider is a common effect; mediator lies on a path.",
-        ])
+        lines.append("\n--- CAUSAL DISCOVERY REMINDERS ---")
+        lines.extend(build_causal_discovery_reminder_lines())
 
     if include_def_int and int_groups_num:
-        lines.extend([
-            "\n--- INTERVENTIONS ---",
-            "- do(X=v) sets X externally; incoming edges into X are removed in the intervened graph.",
-        ])
+        lines.append("\n--- INTERVENTION SEMANTICS ---")
+        lines.extend(build_intervention_semantics_lines())
 
-    lines.append("\n--- VARIABLES ---")
+    lines.append("\n--- VARIABLE ORDER (ORDER MATTERS) ---")
     for i, v in enumerate(variables):
         lines.append(f"{i}: {v}")
 
     lines.append("\n--- DATA FORMAT ---")
     num_states_str = _compact_json(num_states)
-    prob_note = ", prob" if include_probabilities else ""
-    marginals_note = " marginals[j][s]=P(Xj=s)." if include_marginals else ""
+    hist_shape = "[assignment, count, prob]" if include_probabilities else "[assignment, count]"
+    marginals_note = " marginals[j][s]=P(variable_j=s)." if include_marginals else ""
     omit_note = "Unlisted assignments have P=0." if omitted_are_zero_prob else "Unlisted assignments may be absent due to finite sampling."
+    lines.append("Each payload summarizes empirical samples in the declared variable order.")
     lines.append(
-        f"num_states={num_states_str}. hist entries: [assignment{prob_note}, count]."
-        f" do(X=v): X fixed to v, its incoming edges removed.{marginals_note} {omit_note}"
+        f"num_states={num_states_str}. hist entries use {hist_shape}; assignments follow the declared variable order."
+    )
+    lines.append(
+        f"observational_data summarizes samples with no intervention. interventional_data maps each do(X=v) regime to its empirical summary.{marginals_note} {omit_note}"
     )
 
     if (not anonymize) and include_state_legend and state_map:
@@ -2118,11 +1642,18 @@ def format_prompt_summary_full_joint(
         # IMPORTANT: use the special dumper so nested arrays become compact
         lines.append("interventional_data=" + _dumps_interventional_hybrid(interventional_dict))
 
-    if include_give_steps:
-        lines.append("\n--- (THINKING STEPS) ---" if require_think_answer_blocks else "\n--- (SILENT STEPS) ---")
-        lines.append("1) Use interventional shifts to identify descendants/orient edges; use joint patterns for colliders.")
-        lines.append("2) Output a DAG as JSON.")
+    lines.append("\n--- END OF DATA ---")
 
+    if include_give_steps:
+        lines.extend(
+            build_causal_discovery_method_lines(
+                has_observational_data=bool(obs_rows_num),
+                has_interventional_data=bool(int_groups_num),
+                require_think_answer_blocks=require_think_answer_blocks,
+            )
+        )
+
+    lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.extend(
         _build_output_contract_lines(
             output_edge_list=output_edge_list,
@@ -2359,29 +1890,26 @@ def main():
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument("--give-steps", action="store_true")
     ap.add_argument(
-        "--thinking-tags",
-        action="store_true",
-        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+        "--wrapper-mode",
+        choices=["plain", "chat"],
+        default=None,
+        help="Prompt transport: plain text or system/user/assistant chat wrapper.",
     )
     ap.add_argument(
-        "--no-thinking-tags",
-        dest="thinking_tags",
-        action="store_false",
-        help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
-    )
-    ap.set_defaults(thinking_tags=True)
-    ap.add_argument(
-        "--cot-hint",
+        "--append-format-hint",
         action="store_true",
-        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+        help=(
+            "Append the canonical Formatting requirement line. For causal discovery this "
+            "adds the optional stage-by-stage reasoning instructions."
+        ),
     )
     ap.add_argument("--def-int", action="store_true", help="Include a brief definition of interventions when interventional data are present.")
     ap.add_argument("--shuffles-per-graph", type=int, default=1)
     ap.add_argument("--given-edge-frac", type=float, default=0.0)
     ap.add_argument(
         "--prompt-style",
-        choices=["matrix", "summary_joint"],
-        default="summary_joint",
+        choices=["matrix", "summary", "summary_joint"],
+        default="summary",
     )
     ap.add_argument(
         "--out-dir",
@@ -2394,6 +1922,10 @@ def main():
     ap.add_argument("--col-order", choices=["original", "reverse", "random", "topo", "reverse_topo"], default="original")
 
     args = ap.parse_args()
+    if args.prompt_style in {"summary_join", "summary_joint"}:
+        args.prompt_style = "summary"
+    resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=args.wrapper_mode)
+    require_think_answer_blocks = True
     if args.int_per_combo > 0:
         iv = str(args.intervene_vars).strip().lower()
         if iv not in {"all", "none", ""}:
@@ -2493,9 +2025,11 @@ def main():
     if args.anonymize: tags.append("anon")
     if getattr(args, "causal_rules", False): tags.append("rules")
     if getattr(args, "give_steps", False): tags.append("steps")
-    if getattr(args, "thinking_tags", False): tags.append("thinktags")
-    if getattr(args, "cot_hint", False): tags.append("cothint")
-    if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary_joint"}:
+    if resolved_wrapper_mode != "plain":
+        tags.append(f"wrap{resolved_wrapper_mode}")
+    if args.append_format_hint:
+        tags.append("fmthint")
+    if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary"}:
         tags.append(args.prompt_style)
     
     # ROBUSTNESS TAGS (Explicitly added to filename)
@@ -2643,15 +2177,16 @@ def main():
                 is_names_only_cfg = (args.obs_per_prompt == 0 and args.int_per_combo == 0)
                 if is_names_only_cfg:
                     # (obs=0,int=0) should always use the names-only prompt format, regardless of style.
-                    from generate_prompts_names_only import format_names_only_prompt
+                    from cd_generation.names_only import format_names_only_prompt
                     prompt_text = format_names_only_prompt(
                         variables_out,
                         dataset_name,
                         args.causal_rules,
                         output_edge_list=use_edge_list_output,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         anonymize=args.anonymize,
                     )
-                elif args.prompt_style == "summary_joint":
+                elif args.prompt_style == "summary":
                     state_names = []
                     for orig_name in permuted_real_names:
                         states = codebook.get(orig_name, []) or []
@@ -2671,7 +2206,7 @@ def main():
                         anonymize=args.anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
-                        require_think_answer_blocks=args.thinking_tags,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
                 elif args.prompt_style == "matrix":
@@ -2683,16 +2218,21 @@ def main():
                         include_give_steps=args.give_steps,
                         include_def_int=include_def_int,
                         anonymize=args.anonymize,
-                        require_think_answer_blocks=args.thinking_tags,
+                        require_think_answer_blocks=require_think_answer_blocks,
                         state_names=None,  # or build mapping if you want
                         output_edge_list=use_edge_list_output,
                     )
                 else:
                     raise ValueError(
                         f"Unsupported prompt_style={args.prompt_style!r}. "
-                        "Only 'matrix' and 'summary_joint' are enabled."
+                        "Only 'matrix' and 'summary' are enabled."
                     )
-                prompt_text = _maybe_apply_cot_hint(prompt_text, cot_hint=bool(args.cot_hint))
+                prompt_text = render_prompt_text(
+                    prompt_text,
+                    task="causal_discovery",
+                    wrapper_mode=resolved_wrapper_mode,
+                    append_format_hint=bool(args.append_format_hint),
+                )
                 
                 # Write Prompt File
                 p_filename = f"{base_name}_data{i}_shuf{rep}.txt"

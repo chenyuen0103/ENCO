@@ -34,8 +34,6 @@ def _infer_prompt_style_from_stem(stem: str) -> str:
     styles = [
         "payload_topk",
         "summary_hist_rows",
-        "summary_joint",
-        "summary_probs",
         "summary",
         "matrix",
         "payload",
@@ -62,7 +60,7 @@ def _infer_from_response_csv(response_csv: str) -> dict[str, Any]:
         else:
             m_resp = re.match(
                 r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-                r"(?:matrix|summary_joint|summary|cases|summary_probs|payload|payload_topk)_(?P<model>.+)$",
+                r"(?:matrix|summary|cases|payload|payload_topk)_(?P<model>.+)$",
                 stem,
                 flags=re.IGNORECASE,
             )
@@ -105,7 +103,7 @@ def main() -> int:
         "--prompt-styles",
         nargs="*",
         default=[],
-        help="Optional prompt_style filter (e.g., summary summary_joint).",
+        help="Optional prompt_style filter (e.g., summary matrix).",
     )
     ap.add_argument("--out-wide", type=Path, default=None)
     ap.add_argument("--out-macro", type=Path, default=None)
@@ -159,7 +157,6 @@ def main() -> int:
 
     method_map = {
         "summary": "LLM-summary",
-        "summary_joint": "LLM-summary_joint",
         "matrix": "LLM-matrix",
         "enco": "ENCO",
     }

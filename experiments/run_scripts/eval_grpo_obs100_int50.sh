@@ -47,22 +47,30 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
     payload = json.load(f)
 
 cfgs = payload.get("configs") if isinstance(payload, dict) else payload
-vals = {bool(c.get("cot_hint", False)) for c in cfgs if isinstance(c, dict)}
-if vals == {True}:
-    print("1")
-elif vals in ({False}, set()):
-    print("0")
+def wrapper_mode(cfg):
+    if not isinstance(cfg, dict):
+        return "plain"
+    mode = cfg.get("wrapper_mode")
+    if mode is not None:
+        mode = str(mode).strip().lower()
+        return "chat" if mode == "chat" else "plain"
+    return "chat" if bool(cfg.get("cot_hint", False)) else "plain"
+
+vals = {wrapper_mode(c) for c in cfgs if isinstance(c, dict)}
+if vals == {"chat"}:
+    print("chat")
+elif vals in ({"plain"}, set()):
+    print("plain")
 else:
     print("mixed")
 PY
 )"
 
-COT_HINT_FLAG=()
-COT_HINT_TAGS=("")
-if [[ "${CONFIG_COT_HINT}" == "1" ]]; then
-    COT_HINT_TAGS=("cothint_")
+LEGACY_WRAPPER_TAGS=("")
+if [[ "${CONFIG_COT_HINT}" == "chat" ]]; then
+    LEGACY_WRAPPER_TAGS=("cothint_")
 elif [[ "${CONFIG_COT_HINT}" == "mixed" ]]; then
-    COT_HINT_TAGS=("" "cothint_")
+    LEGACY_WRAPPER_TAGS=("" "cothint_")
 fi
 
 # ── Helper: evaluate one generated CSV ────────────────────────────────────
@@ -89,7 +97,7 @@ eval_only() {
 
     local found_any=0
     local cot_tag
-    for cot_tag in "${COT_HINT_TAGS[@]}"; do
+    for cot_tag in "${LEGACY_WRAPPER_TAGS[@]}"; do
         # Derive the exact filename that run_experiment1_in_memory.py writes.
         local resp_csv="${RESPONSES_ROOT}/sachs/responses_obs${obs}_int${int_n}_shuf1_p${NUM_PROMPTS}_${anon_suffix}thinktags_${cot_tag}summary_joint_${MODEL_TAG}.csv"
         if [[ ! -f "${resp_csv}" ]]; then
@@ -97,9 +105,9 @@ eval_only() {
         fi
 
         found_any=1
-        local cot_label="cot_hint=0"
+        local cot_label="legacy_chat_wrapper=plain"
         if [[ "${cot_tag}" == "cothint_" ]]; then
-            cot_label="cot_hint=1"
+            cot_label="legacy_chat_wrapper=chat"
         fi
         echo "[eval] Computing metrics (${cot_label}): ${resp_csv}"
         python "${EVALUATE_SCRIPT}" \
@@ -109,7 +117,7 @@ eval_only() {
 
     if [[ "${found_any}" -eq 0 ]]; then
         echo "[error] No response CSV found for obs=${obs}, int=${int_n}${anon_label}. Expected one of:" >&2
-        for cot_tag in "${COT_HINT_TAGS[@]}"; do
+        for cot_tag in "${LEGACY_WRAPPER_TAGS[@]}"; do
             echo "  - ${RESPONSES_ROOT}/sachs/responses_obs${obs}_int${int_n}_shuf1_p${NUM_PROMPTS}_${anon_suffix}thinktags_${cot_tag}summary_joint_${MODEL_TAG}.csv" >&2
         done
         return 1
@@ -125,12 +133,12 @@ main() {
     echo " Model tag:  ${MODEL_TAG}"
     echo " BIF:        ${BIF}"
     echo " Prompts:    ${NUM_PROMPTS}"
-    echo " CoT Hint:   ${CONFIG_COT_HINT}"
+    echo " Chat Wrap:  ${CONFIG_COT_HINT}"
     echo " Config:     ${CONFIG_FILE}"
     echo "============================================"
 
     if [[ "${CONFIG_COT_HINT}" == "mixed" ]]; then
-        echo "[info] Mixed cot_hint configs detected; evaluating both cot_hint=0 and cot_hint=1 outputs when present."
+        echo "[info] Mixed legacy chat-wrapper configs detected; evaluating both plain and chat legacy outputs when present."
     fi
 
     if [[ ! -f "${CONFIG_FILE}" ]]; then
@@ -146,7 +154,6 @@ main() {
         --provider hf \
         --num-prompts "${NUM_PROMPTS}" \
         --prompt-style summary_joint \
-        --thinking-tags \
         --config-file "${CONFIG_FILE}" \
         --temperature 0.0 \
         --hf-max-new-tokens 8192 \

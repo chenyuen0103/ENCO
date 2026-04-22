@@ -208,7 +208,7 @@ class BenchmarkRunner:
         if self.spec.execution.prompt_storage == "disk":
             cmd = [
                 "python3",
-                "generate_prompts_names_only.py",
+                "cd_generation/names_only.py",
                 "--graph-file",
                 str(graph_path),
                 "--out-dir",
@@ -251,7 +251,7 @@ class BenchmarkRunner:
                 response_csv = self.experiments_dir / "responses" / entry["dataset"] / _response_name_for_prompt(prompt_csv, model.name)
                 query_cmd = [
                     "python3",
-                    "query_gemini.py",
+                    "query_api.py",
                     "--csv",
                     str(prompt_csv),
                     "--model",

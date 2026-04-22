@@ -18,8 +18,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from benchmark_builder.graph_io import load_causal_graph
 try:
     from experiments.generate_prompts import iter_prompts_in_memory
-    from experiments.generate_prompts_names_only import iter_names_only_prompts_in_memory
-    from experiments.query_gemini import (
+    from experiments.cd_generation.names_only import iter_names_only_prompts_in_memory
+    from experiments.query_api import (
         ANSWER_RE,
         build_hf_pipeline,
         call_gemini,
@@ -31,8 +31,8 @@ try:
     )
 except ModuleNotFoundError:
     from generate_prompts import iter_prompts_in_memory
-    from generate_prompts_names_only import iter_names_only_prompts_in_memory
-    from query_gemini import (
+    from cd_generation.names_only import iter_names_only_prompts_in_memory
+    from query_api import (
         ANSWER_RE,
         build_hf_pipeline,
         call_gemini,
@@ -212,7 +212,6 @@ def _build_names_only_prompt(
         col_order="original",
         anonymize=anonymize,
         causal_rules=False,
-        thinking_tags=True,
     )
     first = next(prompt_iter)
     variables = [str(v) for v in answer_obj["variables"]]
@@ -232,7 +231,7 @@ def _build_data_prompt(
         num_prompts=1,
         shuffles_per_graph=1,
         seed=seed,
-        prompt_style="summary_joint",
+        prompt_style="summary",
         obs_per_prompt=sample_size_obs,
         int_per_combo=sample_size_inters,
         row_order="random",
@@ -242,7 +241,6 @@ def _build_data_prompt(
         give_steps=False,
         def_int=False,
         intervene_vars="all",
-        thinking_tags=True,
     )
     first = next(prompt_iter)
     prompt_text = (
@@ -559,7 +557,7 @@ def main() -> int:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--edge_threshold", type=float, default=0.5)
-    parser.add_argument("--prompt_mode", choices=["names_only", "summary_joint"], default="names_only")
+    parser.add_argument("--prompt_mode", choices=["names_only", "summary"], default="names_only")
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
 
@@ -572,8 +570,8 @@ def main() -> int:
         raise SystemExit("JiralerspongBFS is observational-only in this implementation.")
     if (args.method in names_only_methods or args.method == "JiralerspongBFS") and args.naming_regime not in {"real", "names_only", "anonymized"}:
         raise SystemExit(f"Unsupported naming regime for {args.method}: {args.naming_regime}")
-    if args.method == "CausalLLMData" and args.prompt_mode != "summary_joint":
-        raise SystemExit("CausalLLMData expects --prompt_mode summary_joint.")
+    if args.method == "CausalLLMData" and args.prompt_mode != "summary":
+        raise SystemExit("CausalLLMData expects --prompt_mode summary.")
     if args.method == "CausalLLMData" and args.naming_regime == "names_only":
         raise SystemExit("CausalLLMData does not support --naming_regime names_only.")
 

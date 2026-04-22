@@ -46,13 +46,24 @@ def main():
         default=None,
         help=(
             'Optional subset of prompt styles to generate (any of: "cases", "matrix", "summary", '
-            '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
+            '"payload", "payload_topk").'
         ),
     )
     ap.add_argument(
         "--cot-hint",
         action="store_true",
-        help="Canonicalize generated prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+        help=(
+            "Legacy alias for chat-style prompt wrapping. This maps to --wrapper-mode chat "
+            "and does not change the staged reasoning instructions."
+        ),
+    )
+    ap.add_argument(
+        "--append-format-hint",
+        action="store_true",
+        help=(
+            "Append the canonical Formatting requirement line. For causal discovery this "
+            "adds the optional stage-by-stage reasoning instructions."
+        ),
     )
     args = ap.parse_args()
 
@@ -70,7 +81,7 @@ def main():
         sys.exit(1)
 
     # Resolve names-only script path (always next to this orchestrator)
-    names_only_script = Path(__file__).parent / "generate_prompts_names_only.py"
+    names_only_script = Path(__file__).parent / "cd_generation" / "names_only.py"
 
     # ==========================================
     # EXPERIMENT 1 GRID DEFINITION
@@ -79,15 +90,15 @@ def main():
     # 1. Data Representation
     # - cases: full sample listing (largest prompts)
     # - matrix: matrix blocks of samples
-    # - summary: compact summary statistics (short prompts)
-    # - summary_probs: discrete marginals + intervention effects (short prompts, usually better than means)
+    # - summary: joint summary statistics (marginals + intervention effects)
     # - payload: a single JSON blob with summary stats (machine-parsable)
     # - payload_topk: compact JSON payload (top-K intervention effects)
     style_aliases = {
-        "summary_join": "summary_joint",
+        "summary_join": "summary",
+        "summary_joint": "summary",
     }
 
-    styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    styles = ["cases", "matrix", "summary", "payload", "payload_topk"]
     if args.styles:
         requested_raw = [s.strip().lower() for s in args.styles if s.strip()]
         requested = [style_aliases.get(s, s) for s in requested_raw]
@@ -239,7 +250,11 @@ def main():
             cmd.append("--anonymize")
 
         if args.cot_hint:
-            cmd.append("--cot-hint")
+            # Legacy CLI compatibility only: this selects chat wrapping, not a separate
+            # chain-of-thought or staged-reasoning mode.
+            cmd.extend(["--wrapper-mode", "chat"])
+        if args.append_format_hint:
+            cmd.append("--append-format-hint")
         
         if int_n > 0:
             cmd.extend(["--intervene-vars", "all"]) 

@@ -66,13 +66,24 @@ from typing import Iterator, List, Optional, Tuple
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
-from cd_training_format import ensure_assistant_think_prefill, validate_sft_example, update_prompt_to_current_format  # noqa: E402
-from generate_staged_sft_data import (  # noqa: E402
-    _load_adj,
-    _extract_variables,
-    build_evidence_grounded_sections,
-    build_staged_sections,
-)
+try:
+    from cd_generation.format import validate_sft_example  # noqa: E402
+    from cd_sft.staged_targets import (  # noqa: E402
+        _load_adj,
+        _extract_variables,
+        build_evidence_grounded_sections,
+        build_staged_sections,
+    )
+    from cd_generation.prompt_utils import render_prompt_text  # noqa: E402
+except ImportError:
+    from experiments.cd_generation.format import validate_sft_example  # noqa: E402
+    from experiments.cd_sft.staged_targets import (  # noqa: E402
+        _load_adj,
+        _extract_variables,
+        build_evidence_grounded_sections,
+        build_staged_sections,
+    )
+    from experiments.cd_generation.prompt_utils import render_prompt_text  # noqa: E402
 from generate_prompts import iter_prompts_in_memory  # noqa: E402
 
 
@@ -120,6 +131,42 @@ def _build_think_sections(
     raise ValueError(f"unsupported think_style={think_style!r}")
 
 
+def _build_reasoning_text(
+    *,
+    prompt_text: str,
+    adj: List[List[int]],
+    variables: List[str],
+    reasoning_target: str,
+) -> Tuple[str, str, str, str]:
+    if reasoning_target == "answer_only":
+        return "", "", "", ""
+    if reasoning_target == "stages":
+        stage1_text, stage2_text, stage3_text = _build_think_sections(
+            prompt_text=prompt_text,
+            adj=adj,
+            variables=variables,
+            think_style="strict",
+        )
+    elif reasoning_target == "stages_evidence":
+        stage1_text, stage2_text, stage3_text = _build_think_sections(
+            prompt_text=prompt_text,
+            adj=adj,
+            variables=variables,
+            think_style="evidence",
+        )
+    else:
+        raise ValueError(f"unsupported reasoning_target={reasoning_target!r}")
+    return stage1_text, stage2_text, stage3_text, f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
+
+
+def _reasoning_style_label(reasoning_target: str) -> str:
+    if reasoning_target == "stages":
+        return "strict"
+    if reasoning_target == "stages_evidence":
+        return "evidence"
+    return reasoning_target
+
+
 # ---------------------------------------------------------------------------
 # Mode B: record builder
 # ---------------------------------------------------------------------------
@@ -130,7 +177,8 @@ def _build_record(
     graph_name: str,
     prompt_col: str,
     answer_col: str,
-    think_style: str,
+    reasoning_target: str,
+    wrapper_mode: str,
 ) -> Optional[dict]:
     """Return a validated SFT record or None if anything fails."""
     prompt_raw = (row.get(prompt_col) or "").strip()
@@ -149,17 +197,21 @@ def _build_record(
         variables = [f"X{k+1}" for k in range(n)]
 
     try:
-        stage1_text, stage2_text, stage3_text = _build_think_sections(
+        stage1_text, stage2_text, stage3_text, think_text = _build_reasoning_text(
             prompt_text=prompt_raw,
             adj=adj,
             variables=variables,
-            think_style=think_style,
+            reasoning_target=reasoning_target,
         )
-        think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
     except ValueError:
         return None
 
-    prompt = ensure_assistant_think_prefill(update_prompt_to_current_format(prompt_raw))
+    prompt = render_prompt_text(
+        prompt_raw,
+        task="causal_discovery",
+        wrapper_mode=wrapper_mode,
+        prefill_think=True,
+    )
     completion = (
         f"{think_text}</think>"
         f"<answer>{json.dumps({'adjacency_matrix': adj}, ensure_ascii=False)}</answer>"
@@ -180,7 +232,7 @@ def _build_record(
         "gold_stage3": stage3_text,
         "source": source_name,
         "graph": row_graph_name,
-        "think_style": think_style,
+        "think_style": _reasoning_style_label(reasoning_target),
     }
 
 
@@ -239,7 +291,8 @@ def _build_records_in_memory(
     seed: int,
     anonymize: bool,
     col_perms: int,
-    think_style: str,
+    reasoning_target: str,
+    wrapper_mode: str,
 ) -> List[dict]:
     """
     Generate SFT records directly from a BIF file without writing intermediate CSVs.
@@ -272,7 +325,7 @@ def _build_records_in_memory(
                 give_steps=False,
                 def_int=False,
                 intervene_vars="all",
-                thinking_tags=False,
+                wrapper_mode="plain",
             )
         except Exception as e:
             print(f"  [warn] {source_tag} perm_idx={perm_idx}: iter_prompts_in_memory failed: {e}",
@@ -294,17 +347,21 @@ def _build_records_in_memory(
             )
 
             try:
-                stage1_text, stage2_text, stage3_text = _build_think_sections(
+                stage1_text, stage2_text, stage3_text, think_text = _build_reasoning_text(
                     prompt_text=prompt_raw,
                     adj=adj,
                     variables=variables,
-                    think_style=think_style,
+                    reasoning_target=reasoning_target,
                 )
-                think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
             except ValueError:
                 continue
 
-            prompt = ensure_assistant_think_prefill(update_prompt_to_current_format(prompt_raw))
+            prompt = render_prompt_text(
+                prompt_raw,
+                task="causal_discovery",
+                wrapper_mode=wrapper_mode,
+                prefill_think=True,
+            )
             completion = (
                 f"{think_text}</think>"
                 f"<answer>{json.dumps({'adjacency_matrix': adj}, ensure_ascii=False)}</answer>"
@@ -322,7 +379,7 @@ def _build_records_in_memory(
                 "gold_stage3": stage3_text,
                 "source": source_tag,
                 "graph": graph_name,
-                "think_style": think_style,
+                "think_style": _reasoning_style_label(reasoning_target),
             })
 
     return records
@@ -563,7 +620,8 @@ def _build_records_perm_csv(
     rng: random.Random,
     prompt_col: str = "prompt",
     answer_col: str = "answer",
-    think_style: str = "evidence",
+    reasoning_target: str = "stages_evidence",
+    wrapper_mode: str = "chat",
 ) -> Tuple[List[dict], int, int]:
     """
     Build SFT records from one CSV by enumerating variable-order permutations.
@@ -615,17 +673,19 @@ def _build_records_perm_csv(
                 skipped += 1
                 continue
 
-            prompt_final = ensure_assistant_think_prefill(
-                update_prompt_to_current_format(prompt_perm)
+            prompt_final = render_prompt_text(
+                prompt_perm,
+                task="causal_discovery",
+                wrapper_mode=wrapper_mode,
+                prefill_think=True,
             )
             try:
-                stage1_text, stage2_text, stage3_text = _build_think_sections(
+                stage1_text, stage2_text, stage3_text, think_text = _build_reasoning_text(
                     prompt_text=prompt_perm,
                     adj=adj_perm,
                     variables=new_var_names,
-                    think_style=think_style,
+                    reasoning_target=reasoning_target,
                 )
-                think_text = f"{stage1_text}\n\n{stage2_text}\n\n{stage3_text}"
             except ValueError:
                 skipped += 1
                 continue
@@ -649,7 +709,7 @@ def _build_records_perm_csv(
                 "source": source_name,
                 "graph": row_graph_name,
                 "perm": perm,
-                "think_style": think_style,
+                "think_style": _reasoning_style_label(reasoning_target),
             })
             built += 1
 
@@ -692,8 +752,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--prompt-style",
-        choices=["summary_joint", "matrix"],
-        default="summary_joint",
+        choices=["summary", "summary_joint", "matrix"],
+        default="summary",
         help="Prompt style for in-memory generation (Mode A only).",
     )
     ap.add_argument(
@@ -719,6 +779,12 @@ def main() -> None:
         "--anonymize", action="store_true", default=False,
         help="Anonymize variable names to X1, X2, ... (Mode A only).",
     )
+    ap.add_argument(
+        "--wrapper-mode",
+        choices=["plain", "chat"],
+        default="chat",
+        help="Prompt transport used for stored SFT prompts.",
+    )
 
     # --- Mode B / C: CSV-based ---
     ap.add_argument(
@@ -733,14 +799,10 @@ def main() -> None:
     ap.add_argument("--prompt-col", default="prompt")
     ap.add_argument("--answer-col", default="answer")
     ap.add_argument(
-        "--think-style",
-        choices=["evidence", "strict"],
-        default="evidence",
-        help=(
-            "Gold reasoning target style. "
-            "'evidence' injects Evidence: summaries into each stage; "
-            "'strict' keeps only the Stage 1/2/3 edge lists."
-        ),
+        "--reasoning-target",
+        choices=["answer_only", "stages", "stages_evidence"],
+        default="stages_evidence",
+        help="Supervised completion target style.",
     )
     ap.add_argument(
         "--csv", action="append", default=[], metavar="PATH[:GRAPH]",
@@ -786,7 +848,8 @@ def main() -> None:
     )
 
     args = ap.parse_args()
-
+    if args.prompt_style == "summary_joint":
+        args.prompt_style = "summary"
     _set_csv_limit()
     rng = random.Random(args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -817,7 +880,8 @@ def main() -> None:
                         seed=config_seed,
                         anonymize=args.anonymize,
                         col_perms=args.col_perms,
-                        think_style=args.think_style,
+                        reasoning_target=args.reasoning_target,
+                        wrapper_mode=args.wrapper_mode,
                     )
                     config_seed += 1000
                     all_records.extend(recs)
@@ -891,7 +955,8 @@ def main() -> None:
                     rng=rng,
                     prompt_col=args.prompt_col,
                     answer_col=args.answer_col,
-                    think_style=args.think_style,
+                    reasoning_target=args.reasoning_target,
+                    wrapper_mode=args.wrapper_mode,
                 )
                 all_records.extend(recs)
                 for rec in recs:
@@ -913,7 +978,8 @@ def main() -> None:
                         graph_name=graph_name,
                         prompt_col=args.prompt_col,
                         answer_col=args.answer_col,
-                        think_style=args.think_style,
+                        reasoning_target=args.reasoning_target,
+                        wrapper_mode=args.wrapper_mode,
                     )
                     if rec is None:
                         skipped += 1

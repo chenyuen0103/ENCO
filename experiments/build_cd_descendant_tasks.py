@@ -162,7 +162,7 @@ def _build_stage_rows(
         num_prompts=num_prompts,
         shuffles_per_graph=shuffles_per_graph,
         seed=stage_seed,
-        prompt_style="summary_joint",
+        prompt_style="summary",
         obs_per_prompt=obs_per_prompt,
         int_per_combo=int_per_combo,
         row_order=row_order,
@@ -172,7 +172,6 @@ def _build_stage_rows(
         give_steps=False,
         def_int=def_int,
         intervene_vars=intervene_vars,
-        thinking_tags=True,
     )
 
     variables = [str(v) for v in answer_obj["variables"]]

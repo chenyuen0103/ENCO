@@ -1,4 +1,4 @@
-# Python >= 3.9 is recommended.
+# Python 3.12 is the tested version in the current `enco` environment.
 #
 # Install:
 #   pip install -r requirements.txt
@@ -24,7 +24,7 @@ openai
 tiktoken
 google-genai
 
-# Optional: local/HF models via `experiments/query_gemini.py --provider hf`
+# Optional: local/HF models via `experiments/query_api.py --provider hf`
 transformers
 accelerate
 sentencepiece

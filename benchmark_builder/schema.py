@@ -94,14 +94,14 @@ class EvaluatorSpec:
     tau: float = 0.7
     answer_col: str | None = None
     pred_col: str = "prediction"
-    parser_version: str = "query_gemini.extract_adjacency"
+    parser_version: str = "query_api.extract_adjacency"
     evaluator_version: str = "evaluate.py"
 
 
 @dataclass
 class ProvenanceSpec:
     schema_version: str = SCHEMA_VERSION
-    parser_version: str = "query_gemini.extract_adjacency"
+    parser_version: str = "query_api.extract_adjacency"
     evaluator_version: str = "evaluate.py"
     tags: list[str] = field(default_factory=list)
 
@@ -329,12 +329,12 @@ def load_benchmark_spec(path: str | Path) -> BenchmarkSpec:
             tau=float(evaluator_raw.get("tau", 0.7)),
             answer_col=evaluator_raw.get("answer_col"),
             pred_col=evaluator_raw.get("pred_col", "prediction"),
-            parser_version=evaluator_raw.get("parser_version", "query_gemini.extract_adjacency"),
+            parser_version=evaluator_raw.get("parser_version", "query_api.extract_adjacency"),
             evaluator_version=evaluator_raw.get("evaluator_version", "evaluate.py"),
         ),
         provenance=ProvenanceSpec(
             schema_version=provenance_raw.get("schema_version", SCHEMA_VERSION),
-            parser_version=provenance_raw.get("parser_version", "query_gemini.extract_adjacency"),
+            parser_version=provenance_raw.get("parser_version", "query_api.extract_adjacency"),
             evaluator_version=provenance_raw.get("evaluator_version", "evaluate.py"),
             tags=list(provenance_raw.get("tags", [])),
         ),

@@ -59,10 +59,11 @@ import argparse
 import csv
 import json
 import random
+import statistics
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
@@ -258,6 +259,201 @@ def _score(completion: str, ground_truth_answer: str, task: str = "cd") -> dict:
     if task == "cd_descendants":
         return _score_descendant(completion, ground_truth_answer)
     return _score_cd(completion, ground_truth_answer)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate stats / readiness helpers
+# ---------------------------------------------------------------------------
+
+def _mean(values: list[float]) -> float:
+    return statistics.fmean(values) if values else 0.0
+
+
+def _std(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    return statistics.pstdev(values)
+
+
+def _has_tokenizer_assets(path: Path) -> bool:
+    asset_names = {
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+    }
+    return any((path / name).exists() for name in asset_names)
+
+
+def _normalize_model_ref(model_ref: str) -> tuple[str, bool]:
+    path = Path(str(model_ref)).expanduser()
+    if path.exists():
+        return str(path.resolve()), True
+    return str(model_ref), False
+
+
+def _resolve_tokenizer_source(model_path: str, base_model_id: str) -> str:
+    model_dir = Path(model_path)
+    if model_dir.exists():
+        candidates = [model_dir]
+        if model_dir.name.startswith("checkpoint-") and model_dir.parent.exists():
+            candidates.append(model_dir.parent)
+        for candidate in candidates:
+            if _has_tokenizer_assets(candidate):
+                return str(candidate)
+    return base_model_id
+
+
+def _build_reward_kwargs(prompt: str, ground_truth: str, task: str) -> dict[str, list[Any]]:
+    reward_kwargs: dict[str, list[Any]] = {
+        "prompt": [prompt],
+        "answer": [ground_truth],
+    }
+    if task == "cd":
+        stage_targets = build_cd_stage_targets(prompt, ground_truth) or {}
+        reward_kwargs.update({
+            "target_stage1_skeleton_edges": [stage_targets.get("target_stage1_skeleton_edges", [])],
+            "target_stage2_vstructures": [stage_targets.get("target_stage2_vstructures", [])],
+            "target_stage3_directed_edges": [stage_targets.get("target_stage3_directed_edges", [])],
+        })
+    return reward_kwargs
+
+
+def _summarize_rollouts(
+    rollouts: list[dict[str, Any]],
+    *,
+    reward_names: list[str],
+) -> dict[str, Any]:
+    totals = [float(item.get("reward_total", 0.0)) for item in rollouts]
+    f1s = [float(item["primary_f1"]) for item in rollouts]
+    unique_completions = len({str(item.get("completion", "")) for item in rollouts})
+    scoreable = [
+        int(bool(item["tags_correct"]) and bool(item["payload_present"]) and not bool(item["prompt_copy"]))
+        for item in rollouts
+    ]
+
+    summary: dict[str, Any] = {
+        "num_rollouts": len(rollouts),
+        "tags_correct_rate": _mean([float(item["tags_correct"]) for item in rollouts]),
+        "payload_present_rate": _mean([float(item["payload_present"]) for item in rollouts]),
+        "exact_match_rate": _mean([float(item["exact_match"]) for item in rollouts]),
+        "primary_f1_mean": _mean(f1s),
+        "primary_f1_std": _std(f1s),
+        "prompt_copy_rate": _mean([float(item["prompt_copy"]) for item in rollouts]),
+        "scoreable_rollout_rate": _mean([float(v) for v in scoreable]),
+        "all_rollouts_scoreable": int(bool(rollouts) and all(scoreable)),
+        "any_rollout_scoreable": int(any(scoreable)),
+        "unique_completion_count": unique_completions,
+        "completion_collapse": int(unique_completions <= 1),
+        "gen_seconds_mean": _mean([float(item.get("gen_seconds", 0.0)) for item in rollouts]),
+    }
+
+    if totals:
+        positive_rewards = [t for t in totals if t > 0.0]
+        summary.update({
+            "reward_total_mean": _mean(totals),
+            "reward_total_std": _std(totals),
+            "reward_total_min": min(totals),
+            "reward_total_max": max(totals),
+            "reward_total_span": max(totals) - min(totals),
+            "reward_total_nonzero_variance": int((max(totals) - min(totals)) > 1e-9),
+            "reward_total_unique_count": len({round(t, 8) for t in totals}),
+            "all_zero_reward": int(all(abs(t) <= 1e-9 for t in totals)),
+            "any_positive_reward": int(bool(positive_rewards)),
+            "positive_reward_rate": _mean([float(t > 0.0) for t in totals]),
+        })
+        reward_component_stats: dict[str, dict[str, float]] = {}
+        for reward_name in reward_names:
+            values = [float(item.get("rewards", {}).get(reward_name, 0.0)) for item in rollouts]
+            reward_component_stats[reward_name] = {
+                "mean": _mean(values),
+                "std": _std(values),
+                "min": min(values) if values else 0.0,
+                "max": max(values) if values else 0.0,
+            }
+        summary["reward_component_stats"] = reward_component_stats
+
+    return summary
+
+
+def _print_overall_summary(
+    prompt_results: list[dict[str, Any]],
+    *,
+    task: str,
+    payload_label: str,
+    f1_label: str,
+    reward_names: list[str],
+    num_rollouts: int,
+) -> None:
+    all_rollouts = [rollout for result in prompt_results for rollout in result.get("rollouts", [])]
+    n_prompts = len(prompt_results)
+    n_rollouts = len(all_rollouts)
+
+    print("\n" + "=" * 60)
+    print(f"OVERALL ({n_prompts} prompts, {n_rollouts} rollouts)  [task={task}]", flush=True)
+    print(f"  tags_correct:     {_mean([float(r['tags_correct']) for r in all_rollouts]):.2%}")
+    print(f"  {payload_label+':':<28} {_mean([float(r['payload_present']) for r in all_rollouts]):.2%}")
+    print(f"  exact_match:      {_mean([float(r['exact_match']) for r in all_rollouts]):.2%}")
+    print(f"  {f1_label+':':<28} {_mean([float(r['primary_f1']) for r in all_rollouts]):.4f}")
+    print(f"  prompt_copy:      {_mean([float(r['prompt_copy']) for r in all_rollouts]):.2%}")
+
+    if reward_names:
+        totals = [float(r.get("reward_total", 0.0)) for r in all_rollouts]
+        print(f"\n  reward_total (mean): {_mean(totals):.4f}")
+        print(f"  reward_total (std):  {_std(totals):.4f}")
+        for reward_name in reward_names:
+            values = [float(r.get("rewards", {}).get(reward_name, 0.0)) for r in all_rollouts]
+            print(f"    {reward_name+':':<45} mean={_mean(values):.4f}  std={_std(values):.4f}")
+
+    readiness = [result["rollout_summary"] for result in prompt_results]
+    print("\nGRPO readiness:")
+    print(f"  prompts_all_rollouts_scoreable: {_mean([float(x['all_rollouts_scoreable']) for x in readiness]):.2%}")
+    print(f"  prompts_any_rollout_scoreable:  {_mean([float(x['any_rollout_scoreable']) for x in readiness]):.2%}")
+    print(f"  prompts_completion_collapsed:   {_mean([float(x['completion_collapse']) for x in readiness]):.2%}")
+    print(f"  prompts_reward_nonzero_var:     {_mean([float(x.get('reward_total_nonzero_variance', 0)) for x in readiness]):.2%}")
+    if reward_names:
+        print(f"  prompts_all_zero_reward:        {_mean([float(x.get('all_zero_reward', 0)) for x in readiness]):.2%}")
+        print(f"  prompts_any_positive_reward:    {_mean([float(x.get('any_positive_reward', 0)) for x in readiness]):.2%}")
+        print(f"  reward_total_std_per_prompt:    {_mean([float(x.get('reward_total_std', 0.0)) for x in readiness]):.4f}")
+        print(f"  unique_reward_totals_per_prompt:{_mean([float(x.get('reward_total_unique_count', 0)) for x in readiness]):.2f}")
+    if num_rollouts > 1:
+        print(f"  unique_completions_per_prompt:  {_mean([float(x['unique_completion_count']) for x in readiness]):.2f}")
+
+
+def _print_group_breakdown(
+    prompt_results: list[dict[str, Any]],
+    *,
+    key: str,
+    label: str,
+    f1_label: str,
+    reward_names: list[str],
+) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for result in prompt_results:
+        grouped.setdefault(str(result.get(key, "")), []).append(result)
+
+    if len(grouped) <= 1:
+        return
+
+    print(f"\nPer-{label} breakdown:")
+    for group_name in sorted(grouped):
+        items = grouped[group_name]
+        all_rollouts = [rollout for result in items for rollout in result.get("rollouts", [])]
+        readiness = [result["rollout_summary"] for result in items]
+        reward_part = ""
+        variance_part = ""
+        if reward_names:
+            reward_part = f"  reward={_mean([float(r.get('reward_total', 0.0)) for r in all_rollouts]):.3f}"
+            variance_part = f"  reward_std/prompt={_mean([float(x.get('reward_total_std', 0.0)) for x in readiness]):.3f}"
+        print(
+            f"  {group_name:20s}  prompts={len(items):4d}  "
+            f"tags={_mean([float(r['tags_correct']) for r in all_rollouts]):.2%}  "
+            f"exact={_mean([float(r['exact_match']) for r in all_rollouts]):.2%}  "
+            f"{f1_label}={_mean([float(r['primary_f1']) for r in all_rollouts]):.3f}"
+            f"{reward_part}{variance_part}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +690,12 @@ class _StopOnSuffix(StoppingCriteria):
 # Model loading / generation
 # ---------------------------------------------------------------------------
 
-def _load_model_and_tokenizer(model_path: str, dtype_str: str, device_map: str):
+def _load_model_and_tokenizer(
+    model_path: str,
+    dtype_str: str,
+    device_map: str,
+    base_model_override: Optional[str] = None,
+):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel  # type: ignore
 
@@ -504,20 +705,35 @@ def _load_model_and_tokenizer(model_path: str, dtype_str: str, device_map: str):
     adapter_config = Path(model_path) / "adapter_config.json"
     if adapter_config.exists():
         cfg = json.loads(adapter_config.read_text())
-        base_model_id = cfg["base_model_name_or_path"]
-        print(f"Loading base model: {base_model_id}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        base = AutoModelForCausalLM.from_pretrained(
-            base_model_id, trust_remote_code=True, device_map=device_map, torch_dtype=dtype,
+        base_model_id, base_is_local = _normalize_model_ref(
+            base_model_override or cfg["base_model_name_or_path"]
         )
+        print(f"Loading base model: {base_model_id}", flush=True)
+        tokenizer_source = _resolve_tokenizer_source(model_path, base_model_id)
+        print(f"Loading tokenizer from: {tokenizer_source}", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+        model_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "device_map": device_map,
+            "torch_dtype": dtype,
+        }
+        if base_is_local:
+            model_kwargs["local_files_only"] = True
+        base = AutoModelForCausalLM.from_pretrained(base_model_id, **model_kwargs)
         print(f"Loading LoRA adapter from: {model_path}", flush=True)
         model = PeftModel.from_pretrained(base, model_path)
     else:
-        print(f"Loading model: {model_path}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=True, device_map=device_map, torch_dtype=dtype,
-        )
+        model_id, model_is_local = _normalize_model_ref(model_path)
+        print(f"Loading model: {model_id}", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        model_kwargs = {
+            "trust_remote_code": True,
+            "device_map": device_map,
+            "torch_dtype": dtype,
+        }
+        if model_is_local:
+            model_kwargs["local_files_only"] = True
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -532,6 +748,7 @@ def _generate_completion(
     prompt: str,
     max_new_tokens: int,
     temperature: float,
+    top_p: float,
     stop_ids: Optional[list[int]] = None,
 ) -> tuple[str, str]:
     """Returns (completion, prompt_model_input).
@@ -545,13 +762,14 @@ def _generate_completion(
 
     gen_kwargs: dict = dict(
         max_new_tokens=max_new_tokens,
+        max_length=None,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
     if stop_ids:
         gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_StopOnSuffix(stop_ids)])
     if temperature > 0:
-        gen_kwargs.update(do_sample=True, temperature=temperature)
+        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=top_p)
     else:
         gen_kwargs["do_sample"] = False
 
@@ -582,6 +800,18 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-new-tokens", type=int, default=8192)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Top-p sampling for generation. Only used when temperature > 0.",
+    )
+    ap.add_argument(
+        "--num-rollouts",
+        type=int,
+        default=1,
+        help="Number of completions to sample per prompt. Use >1 to measure GRPO reward spread.",
+    )
     ap.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="auto")
     ap.add_argument("--device-map", default="auto")
     ap.add_argument(
@@ -654,6 +884,9 @@ def main() -> None:
         ok = check_grpo_compat(args.model, base_model_override=args.base_model_override)
         sys.exit(0 if ok else 1)
 
+    if args.num_rollouts < 1:
+        raise ValueError("--num-rollouts must be >= 1")
+
     print(f"Loading eval set: {args.jsonl}", flush=True)
     records = _load_records(args.jsonl, n=None, rng=rng)
 
@@ -674,16 +907,37 @@ def main() -> None:
     payload_label = "descendant_payload_present" if task == "cd_descendants" else "adj_matrix_present"
     f1_label = "descendant_f1" if task == "cd_descendants" else "edge_f1"
     print(f"Task detected: {task}", flush=True)
-    print(f"Evaluating {len(records)} examples  compute_rewards={not args.no_compute_rewards}", flush=True)
+    print(
+        f"Evaluating {len(records)} prompts  num_rollouts={args.num_rollouts}  "
+        f"temperature={args.temperature}  top_p={args.top_p}  "
+        f"compute_rewards={not args.no_compute_rewards}",
+        flush=True,
+    )
+    if args.num_rollouts > 1 and args.temperature <= 0.0:
+        print(
+            "[warn] num_rollouts > 1 with temperature <= 0 will usually collapse to identical completions; "
+            "use temperature > 0 to measure GRPO reward spread.",
+            flush=True,
+        )
 
-    model, tokenizer = _load_model_and_tokenizer(args.model, args.dtype, args.device_map)
+    model, tokenizer = _load_model_and_tokenizer(
+        args.model,
+        args.dtype,
+        args.device_map,
+        base_model_override=args.base_model_override,
+    )
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Stop-on-answer token IDs (only used when --compute-rewards)
     stop_ids: Optional[list[int]] = None
     reward_funcs: list[tuple[str, object]] = []
+    reward_names: list[str] = []
     if not args.no_compute_rewards:
         stop_ids = tokenizer.encode("</answer>", add_special_tokens=False)
         reward_funcs = _build_reward_funcs(args, tokenizer, task)
+        reward_names = [name for name, _ in reward_funcs]
 
     # Truncate output file if computing rewards (we stream-append)
     if not args.no_compute_rewards and args.output_jsonl:
@@ -691,50 +945,71 @@ def main() -> None:
         if args.output_jsonl.exists():
             args.output_jsonl.unlink()
 
-    results = []
+    results: list[dict[str, Any]] = []
     for i, rec in enumerate(records):
         prompt = str(rec["prompt"])
         ground_truth = str(rec["answer"])
+        reward_kwargs = _build_reward_kwargs(prompt, ground_truth, task) if reward_funcs else {}
 
-        t0 = time.time()
-        completion, prompt_model_input = _generate_completion(
-            model, tokenizer, prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            stop_ids=stop_ids,
-        )
-        gen_seconds = round(time.time() - t0, 3)
+        prompt_model_input: Optional[str] = None
+        rollouts: list[dict[str, Any]] = []
+        for rollout_idx in range(args.num_rollouts):
+            t0 = time.time()
+            completion, prompt_model_input_cur = _generate_completion(
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                stop_ids=stop_ids,
+            )
+            gen_seconds = round(time.time() - t0, 3)
+            if prompt_model_input is None:
+                prompt_model_input = prompt_model_input_cur
 
-        scores = _score(completion, ground_truth, task=task)
+            scores = _score(completion, ground_truth, task=task)
+            rollout_result: dict[str, Any] = {
+                "rollout_idx": rollout_idx,
+                **scores,
+                "completion_snippet": completion[:300],
+                "completion": completion,
+                "gen_seconds": gen_seconds,
+            }
+            if reward_funcs:
+                rewards = {
+                    name: float(fn([completion], **reward_kwargs)[0])
+                    for name, fn in reward_funcs
+                }
+                rollout_result["rewards"] = rewards
+                rollout_result["reward_total"] = float(sum(rewards.values()))
+            rollouts.append(rollout_result)
 
-        result: dict = {
+        first_rollout = rollouts[0]
+        rollout_summary = _summarize_rollouts(rollouts, reward_names=reward_names)
+        result = {
             "idx": i,
             "graph": rec.get("graph", ""),
             "source": rec.get("source", ""),
-            **scores,
-            "completion_snippet": completion[:300],
-            "prompt_model_input": prompt_model_input,
-            "gen_seconds": gen_seconds,
+            "num_rollouts": len(rollouts),
+            "prompt_model_input": prompt_model_input or "",
+            "target_answer": ground_truth,
+            "rollout_summary": rollout_summary,
+            "rollouts": rollouts,
+            # Backward-compatible top-level fields mirror the first rollout.
+            "tags_correct": first_rollout["tags_correct"],
+            "payload_present": first_rollout["payload_present"],
+            "exact_match": first_rollout["exact_match"],
+            "primary_f1": first_rollout["primary_f1"],
+            "prompt_copy": first_rollout["prompt_copy"],
+            "answer_text": first_rollout["answer_text"],
+            "completion_snippet": first_rollout["completion_snippet"],
+            "gen_seconds": first_rollout["gen_seconds"],
         }
-
-        # Optionally add full completion + reward components
-        if not args.no_compute_rewards:
-            stage_targets = build_cd_stage_targets(prompt, ground_truth) or {}
-            reward_kwargs = {
-                "prompt": [prompt],
-                "answer": [ground_truth],
-                "target_stage1_skeleton_edges": [stage_targets.get("target_stage1_skeleton_edges", [])],
-                "target_stage2_vstructures": [stage_targets.get("target_stage2_vstructures", [])],
-                "target_stage3_directed_edges": [stage_targets.get("target_stage3_directed_edges", [])],
-            }
-            rewards = {
-                name: float(fn([completion], **reward_kwargs)[0])
-                for name, fn in reward_funcs
-            }
-            result["completion"] = completion
-            result["target_answer"] = ground_truth
-            result["rewards"] = rewards
-            result["reward_total"] = float(sum(rewards.values()))
+        if reward_funcs:
+            result["completion"] = first_rollout["completion"]
+            result["rewards"] = first_rollout["rewards"]
+            result["reward_total"] = first_rollout["reward_total"]
 
         results.append(result)
 
@@ -745,74 +1020,74 @@ def main() -> None:
 
         # Progress logging
         if (i + 1) % 10 == 0 or i == 0:
-            so_far = results
-            n_so_far = len(so_far)
+            so_far_rollouts = [rollout for item in results for rollout in item["rollouts"]]
+            readiness_so_far = [item["rollout_summary"] for item in results]
+            n_so_far = len(so_far_rollouts)
             reward_str = (
-                f"  reward_total={sum(r.get('reward_total', 0) for r in so_far)/n_so_far:.3f}"
-                if not args.no_compute_rewards else ""
+                f"  reward_total={_mean([float(r.get('reward_total', 0.0)) for r in so_far_rollouts]):.3f}"
+                if reward_funcs else ""
+            )
+            variance_str = (
+                f"  reward_std/prompt={_mean([float(x.get('reward_total_std', 0.0)) for x in readiness_so_far]):.3f}"
+                if reward_funcs and args.num_rollouts > 1 else ""
             )
             print(
-                f"[{i+1:4d}/{len(records)}] "
-                f"tags_correct={sum(r['tags_correct'] for r in so_far)/n_so_far:.2%}  "
-                f"{payload_label}={sum(r['payload_present'] for r in so_far)/n_so_far:.2%}  "
-                f"exact_match={sum(r['exact_match'] for r in so_far)/n_so_far:.2%}  "
-                f"{f1_label}={sum(r['primary_f1'] for r in so_far)/n_so_far:.3f}  "
-                f"prompt_copy={sum(r['prompt_copy'] for r in so_far)/n_so_far:.2%}"
+                f"[{i+1:4d}/{len(records)} prompts] "
+                f"tags_correct={_mean([float(r['tags_correct']) for r in so_far_rollouts]):.2%}  "
+                f"{payload_label}={_mean([float(r['payload_present']) for r in so_far_rollouts]):.2%}  "
+                f"exact_match={_mean([float(r['exact_match']) for r in so_far_rollouts]):.2%}  "
+                f"{f1_label}={_mean([float(r['primary_f1']) for r in so_far_rollouts]):.3f}  "
+                f"prompt_copy={_mean([float(r['prompt_copy']) for r in so_far_rollouts]):.2%}"
                 f"{reward_str}",
                 flush=True,
             )
-        if scores["tags_correct"] and not scores["payload_present"]:
-            print(f"  [parse_fail idx={i}] <answer>: {repr(scores['answer_text'])}", flush=True)
+            if variance_str:
+                print(
+                    f"             prompts_all_scoreable={_mean([float(x['all_rollouts_scoreable']) for x in readiness_so_far]):.2%}"
+                    f"{variance_str}",
+                    flush=True,
+                )
+        for rollout in rollouts:
+            if rollout["tags_correct"] and not rollout["payload_present"]:
+                print(
+                    f"  [parse_fail idx={i} rollout={rollout['rollout_idx']}] <answer>: "
+                    f"{repr(rollout['answer_text'])}",
+                    flush=True,
+                )
 
-    # --- Summary ---
-    n = len(results)
-    print("\n" + "="*60)
-    print(f"OVERALL ({n} examples)  [task={task}]")
-    print(f"  tags_correct:     {sum(r['tags_correct'] for r in results)/n:.2%}")
-    print(f"  {payload_label+':':<28} {sum(r['payload_present'] for r in results)/n:.2%}")
-    print(f"  exact_match:      {sum(r['exact_match'] for r in results)/n:.2%}")
-    print(f"  {f1_label+':':<28} {sum(r['primary_f1'] for r in results)/n:.4f}")
-    print(f"  prompt_copy:      {sum(r['prompt_copy'] for r in results)/n:.2%}")
+    _print_overall_summary(
+        results,
+        task=task,
+        payload_label=payload_label,
+        f1_label=f1_label,
+        reward_names=reward_names,
+        num_rollouts=args.num_rollouts,
+    )
 
-    if not args.no_compute_rewards and reward_funcs:
-        reward_names = [name for name, _ in reward_funcs]
-        mean_total = sum(r["reward_total"] for r in results) / n
-        print(f"\n  reward_total (mean): {mean_total:.4f}")
-        for rname in reward_names:
-            mean_r = sum(r["rewards"][rname] for r in results) / n
-            print(f"    {rname+':':<45} {mean_r:.4f}")
-
-    # Per-graph breakdown
-    by_graph: dict[str, list] = {}
-    for r in results:
-        by_graph.setdefault(r["graph"], []).append(r)
-
-    if len(by_graph) > 1:
-        print("\nPer-graph breakdown:")
-        for g in sorted(by_graph):
-            g_results = by_graph[g]
-            ng = len(g_results)
-            reward_part = (
-                f"  reward={sum(r.get('reward_total', 0) for r in g_results)/ng:.3f}"
-                if not args.no_compute_rewards else ""
-            )
-            print(
-                f"  {g:20s}  n={ng:4d}  "
-                f"tags={sum(r['tags_correct'] for r in g_results)/ng:.2%}  "
-                f"exact={sum(r['exact_match'] for r in g_results)/ng:.2%}  "
-                f"{f1_label}={sum(r['primary_f1'] for r in g_results)/ng:.3f}"
-                f"{reward_part}"
-            )
+    _print_group_breakdown(
+        results,
+        key="graph",
+        label="graph",
+        f1_label=f1_label,
+        reward_names=reward_names,
+    )
+    _print_group_breakdown(
+        results,
+        key="source",
+        label="source",
+        f1_label=f1_label,
+        reward_names=reward_names,
+    )
 
     # Write output JSONL (non-reward mode: write all at once; reward mode: already streamed)
-    if args.output_jsonl and not not args.no_compute_rewards:
+    if args.output_jsonl and args.no_compute_rewards:
         args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
         with args.output_jsonl.open("w", encoding="utf-8") as f:
             for r in results:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"\nWrote {len(results)} results to {args.output_jsonl}")
+        print(f"\nWrote {len(results)} prompt records to {args.output_jsonl}")
     elif args.output_jsonl and not args.no_compute_rewards:
-        print(f"\nWrote {len(results)} results to {args.output_jsonl}")
+        print(f"\nWrote {len(results)} prompt records to {args.output_jsonl}")
 
 
 if __name__ == "__main__":

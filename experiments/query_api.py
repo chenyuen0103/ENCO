@@ -499,10 +499,21 @@ def build_hf_pipeline(
 
     model_path = Path(model_name)
     is_adapter = model_path.exists() and (model_path / "adapter_config.json").exists()
+    tokenizer_name = model_name
+    if is_adapter:
+        try:
+            adapter_cfg = json.loads((model_path / "adapter_config.json").read_text(encoding="utf-8"))
+        except Exception:
+            adapter_cfg = {}
+        has_local_tokenizer = (model_path / "tokenizer.json").exists() or (model_path / "vocab.json").exists()
+        if not has_local_tokenizer:
+            base_model_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+            if base_model_name:
+                tokenizer_name = base_model_name
 
     try:
         tok = AutoTokenizer.from_pretrained(
-            model_name,
+            tokenizer_name,
             trust_remote_code=bool(trust_remote_code),
         )
         # For decoder-only models, use left padding to avoid generation issues
@@ -633,6 +644,7 @@ def call_hf_textgen_batch(pipe, prompts, *, temperature: float = 0.0,
         gen_kwargs: Dict[str, Any] = {
             "return_full_text": False,
             "batch_size": int(batch_size),
+            "truncation": False,
         }
         if max_new_tokens is not None and int(max_new_tokens) > 0:
             gen_kwargs["max_new_tokens"] = int(max_new_tokens)

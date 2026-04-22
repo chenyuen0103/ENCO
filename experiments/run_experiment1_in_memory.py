@@ -14,8 +14,11 @@ try:
 except Exception:
     torch = None
 
-from generate_prompts_names_only import iter_names_only_prompts_in_memory
-from query_gemini import (
+try:
+    from cd_generation.names_only import iter_names_only_prompts_in_memory
+except ImportError:
+    from experiments.cd_generation.names_only import iter_names_only_prompts_in_memory
+from query_api import (
     call_gemini,
     call_openai,
     call_hf_textgen_batch,
@@ -262,7 +265,7 @@ def _load_configs_from_file(
     allowed_styles: set[str],
     allowed_row_orders: set[str],
     allowed_col_orders: set[str],
-) -> list[tuple[str, bool, int, int, str, str, int, bool]]:
+) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool]]:
     try:
         payload = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception as e:
@@ -278,7 +281,7 @@ def _load_configs_from_file(
     if not isinstance(raw_configs, list) or not raw_configs:
         raise SystemExit("--config-file contains no configs.")
 
-    out: list[tuple[str, bool, int, int, str, str, int, bool]] = []
+    out: list[tuple[str, bool, int, int, str, str, int, str | None, bool]] = []
     for i, item in enumerate(raw_configs):
         if not isinstance(item, dict):
             raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
@@ -318,17 +321,39 @@ def _load_configs_from_file(
         else:
             anon = False
 
-        cot_hint_raw = item.get("cot_hint", False)
-        if isinstance(cot_hint_raw, bool):
-            cot_hint = cot_hint_raw
-        elif isinstance(cot_hint_raw, str):
-            cot_hint = cot_hint_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-        elif isinstance(cot_hint_raw, (int, float)):
-            cot_hint = bool(int(cot_hint_raw))
+        wrapper_mode_raw = item.get("wrapper_mode", None)
+        if wrapper_mode_raw is None:
+            # Legacy config compatibility only: historical `cot_hint` files used this
+            # field as a proxy for chat wrapping. It does not control staged reasoning.
+            cot_hint_raw = item.get("cot_hint", False)
+            if isinstance(cot_hint_raw, bool):
+                wrapper_mode = "chat" if cot_hint_raw else None
+            elif isinstance(cot_hint_raw, str):
+                wrapper_mode = "chat" if cot_hint_raw.strip().lower() in {"1", "true", "yes", "y", "on"} else None
+            elif isinstance(cot_hint_raw, (int, float)):
+                wrapper_mode = "chat" if bool(int(cot_hint_raw)) else None
+            else:
+                wrapper_mode = None
         else:
-            cot_hint = False
+            wrapper_mode = str(wrapper_mode_raw).strip().lower() or None
+            if wrapper_mode == "none":
+                wrapper_mode = None
+            if wrapper_mode not in {None, "plain", "chat"}:
+                raise SystemExit(
+                    f"Config #{i}: invalid wrapper_mode '{wrapper_mode_raw}'. Allowed: ['plain', 'chat']."
+                )
 
-        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cot_hint))
+        append_format_hint_raw = item.get("append_format_hint", False)
+        if isinstance(append_format_hint_raw, bool):
+            append_format_hint = append_format_hint_raw
+        elif isinstance(append_format_hint_raw, str):
+            append_format_hint = append_format_hint_raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+        elif isinstance(append_format_hint_raw, (int, float)):
+            append_format_hint = bool(int(append_format_hint_raw))
+        else:
+            append_format_hint = False
+
+        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint))
 
     return out
 
@@ -360,6 +385,21 @@ def _load_completed(out_path: Path, overwrite: bool) -> tuple[set[tuple[int, int
     return completed, rows
 
 
+def _import_iter_prompts_in_memory():
+    try:
+        from generate_prompts import iter_prompts_in_memory
+        return iter_prompts_in_memory
+    except Exception:
+        try:
+            from experiments.generate_prompts import iter_prompts_in_memory
+            return iter_prompts_in_memory
+        except Exception as e:
+            raise SystemExit(
+                "Failed to import generate_prompts.iter_prompts_in_memory. "
+                "Install the prompt-generation dependencies or run with --only-names-only."
+            ) from e
+
+
 def _iter_prompts_for_config(
     *,
     bif_file: str,
@@ -376,8 +416,8 @@ def _iter_prompts_for_config(
     give_steps: bool,
     def_int: bool,
     intervene_vars: str,
-    thinking_tags: bool,
-    cot_hint: bool,
+    wrapper_mode: str | None,
+    append_format_hint: bool,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     is_names_only = (obs_per_prompt == 0 and int_per_combo == 0)
     if is_names_only:
@@ -388,16 +428,10 @@ def _iter_prompts_for_config(
             col_order=col_order,
             anonymize=anonymize,
             causal_rules=causal_rules,
-            thinking_tags=thinking_tags,
-            cot_hint=cot_hint,
+            wrapper_mode=wrapper_mode,
+            append_format_hint=append_format_hint,
         )
-    try:
-        from generate_prompts import iter_prompts_in_memory
-    except Exception as e:
-        raise SystemExit(
-            "Failed to import generate_prompts (likely missing torch). "
-            "Install torch or run with --only-names-only."
-        ) from e
+    iter_prompts_in_memory = _import_iter_prompts_in_memory()
     return iter_prompts_in_memory(
         bif_file=bif_file,
         num_prompts=num_prompts,
@@ -413,8 +447,8 @@ def _iter_prompts_for_config(
         give_steps=give_steps,
         def_int=def_int,
         intervene_vars=intervene_vars,
-        thinking_tags=thinking_tags,
-        cot_hint=cot_hint,
+        wrapper_mode=wrapper_mode,
+        append_format_hint=append_format_hint,
     )
 
 
@@ -435,6 +469,7 @@ def _run_model_for_config(
     hf_pipe: Any = None,
     hf_max_new_tokens: int = 0,
     hf_batch_size: int = 1,
+    hf_context_limit: int = 0,
     hf_skip_if_prompt_tokens_over: int = 0,
     hf_skip_if_est_kv_exceeds_vram: bool = False,
     hf_kv_vram_fraction: float = 0.85,
@@ -483,7 +518,10 @@ def _run_model_for_config(
             if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram)
             else None
         )
-        hf_prompt_context_limit = _hf_prompt_context_limit_tokens(hf_pipe) if provider == "hf" else None
+        if provider == "hf":
+            hf_prompt_context_limit = int(hf_context_limit) if int(hf_context_limit) > 0 else _hf_prompt_context_limit_tokens(hf_pipe)
+        else:
+            hf_prompt_context_limit = None
         if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram):
             print(
                 f"[preflight] hf_visible_vram_bytes={visible_vram_bytes} "
@@ -761,6 +799,15 @@ def main() -> None:
         help="Batch size for HF text generation calls (default: 1).",
     )
     ap.add_argument(
+        "--hf-context-limit",
+        type=int,
+        default=0,
+        help=(
+            "Override the auto-detected HF context window (tokens). "
+            "If >0, use this value instead of reading model_max_length / max_position_embeddings from the model config."
+        ),
+    )
+    ap.add_argument(
         "--hf-skip-if-prompt-tokens-over",
         type=int,
         default=0,
@@ -816,7 +863,7 @@ def main() -> None:
         default=None,
         help=(
             'Optional subset of prompt styles to run (any of: "cases", "matrix", "summary", '
-            '"summary_joint" (alias: "summary_join"), "summary_probs", "payload", "payload_topk").'
+            '"payload", "payload_topk").'
         ),
     )
     ap.add_argument(
@@ -848,22 +895,26 @@ def main() -> None:
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument("--give-steps", action="store_true")
     ap.add_argument(
-        "--thinking-tags",
-        dest="thinking_tags",
-        action="store_true",
-        help="Require model outputs to use <think>...</think> and <answer>...</answer> blocks.",
+        "--wrapper-mode",
+        choices=["plain", "chat"],
+        default=None,
+        help="Prompt transport: plain text or system/user/assistant chat wrapper.",
     )
     ap.add_argument(
-        "--no-thinking-tags",
-        dest="thinking_tags",
-        action="store_false",
-        help="Disable <think>...</think><answer>...</answer> output contract and use JSON-only output.",
+        "--append-format-hint",
+        action="store_true",
+        help=(
+            "Append the canonical Formatting requirement line. For causal discovery this "
+            "adds the optional stage-by-stage reasoning instructions."
+        ),
     )
-    ap.set_defaults(thinking_tags=True)
     ap.add_argument(
         "--cot-hint",
         action="store_true",
-        help="Canonicalize prompts to the SFT/GRPO training chat template with assistant <think> prefill.",
+        help=(
+            "Legacy alias for chat-style prompt wrapping. This maps to wrapper_mode=chat "
+            "and does not change the staged reasoning instructions."
+        ),
     )
     ap.add_argument("--single-config", action="store_true")
     ap.add_argument(
@@ -882,7 +933,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary", "summary_joint", "summary_join", "summary_probs", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
         default="cases",
     )
     ap.add_argument("--obs-per-prompt", type=int, default=0)
@@ -900,10 +951,11 @@ def main() -> None:
     shuf_values = [int(x) for x in (args.shuffles_per_graph or [1])]
 
     style_aliases = {
-        "summary_join": "summary_joint",
+        "summary_join": "summary",
+        "summary_joint": "summary",
     }
 
-    all_styles = ["cases", "matrix", "summary", "summary_joint", "summary_probs", "payload", "payload_topk"]
+    all_styles = ["cases", "matrix", "summary", "payload", "payload_topk"]
     styles = list(all_styles)
     allowed_row_orders = {"random", "sorted", "reverse"}
     allowed_col_orders = {"original", "reverse", "random", "topo", "reverse_topo"}
@@ -915,8 +967,9 @@ def main() -> None:
             raise SystemExit(f"Unknown --styles: {unknown}. Allowed: {styles}")
         styles = requested
 
-    if args.prompt_style == "summary_join":
-        args.prompt_style = "summary_joint"
+    if args.prompt_style in {"summary_join", "summary_joint"}:
+        args.prompt_style = "summary"
+    cli_wrapper_mode = args.wrapper_mode or ("chat" if args.cot_hint else None)
     anonymize_opts = [False, True]
     obs_sizes = [0, 100, 1000, 5000, 8000]
     int_sizes = [0, 50, 100, 200, 500]
@@ -940,7 +993,8 @@ def main() -> None:
             args.row_order,
             args.col_order,
             int(shuf_values[0] if shuf_values else 1),
-            bool(args.cot_hint),
+            cli_wrapper_mode,
+            bool(args.append_format_hint),
         )]
     elif args.config_file is not None:
         configs = _load_configs_from_file(
@@ -952,7 +1006,7 @@ def main() -> None:
         )
     else:
         configs = [
-            (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, bool(args.cot_hint))
+            (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cli_wrapper_mode, bool(args.append_format_hint))
             for style in styles
             for anon in anonymize_opts
             for obs_n in obs_sizes
@@ -963,8 +1017,9 @@ def main() -> None:
         ]
 
     hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
+    using_explicit_config_file = args.config_file is not None
 
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cot_hint in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint in configs:
                                 is_names_only = (obs_n == 0 and int_n == 0)
                                 is_payload_without_obs = (style in {"payload", "payload_topk"} and obs_n == 0 and int_n > 0)
                                 if is_payload_without_obs:
@@ -982,32 +1037,34 @@ def main() -> None:
                                 )
 
                                 if is_names_only:
-                                    if row_ord != "random":
-                                        continue
-                                    if anon is True:
-                                        continue
-                                    # Names-only is independent of prompt style. To avoid duplicate work in the
-                                    # full grid, we run it exactly once. If the user requests styles explicitly
-                                    # and excludes "cases" (e.g., --styles payload), we still run names-only once.
-                                    if not args.single_config:
-                                        if args.styles:
-                                            if "cases" in styles:
+                                    if not using_explicit_config_file:
+                                        if row_ord != "random":
+                                            continue
+                                        if anon is True:
+                                            continue
+                                        # Names-only is independent of prompt style. To avoid duplicate work in the
+                                        # full grid, we run it exactly once. If the user requests styles explicitly
+                                        # and excludes "cases" (e.g., --styles payload), we still run names-only once.
+                                        if not args.single_config:
+                                            if args.styles:
+                                                if "cases" in styles:
+                                                    if style != "summary":
+                                                        continue
+                                                else:
+                                                    if style != styles[0]:
+                                                        continue
+                                            else:
                                                 if style != "cases":
                                                     continue
-                                            else:
-                                                if style != styles[0]:
-                                                    continue
-                                        else:
-                                            if style != "cases":
-                                                continue
                                 else:
                                     if obs_n == 0 and int_n == 0:
                                         continue
-                                    is_non_default_ordering = (row_ord != "random" or col_ord != "original")
-                                    if is_non_default_ordering and not is_robustness_baseline:
-                                        continue
-                                    if obs_n >= 5000 and style == "cases" and not is_robustness_baseline:
-                                        continue
+                                    if not using_explicit_config_file:
+                                        is_non_default_ordering = (row_ord != "random" or col_ord != "original")
+                                        if is_non_default_ordering and not is_robustness_baseline:
+                                            continue
+                                        if obs_n >= 5000 and style == "cases" and not is_robustness_baseline:
+                                            continue
 
                                 base_name, answer_obj, prompt_iter = _iter_prompts_for_config(
                                     bif_file=args.bif_file,
@@ -1024,8 +1081,8 @@ def main() -> None:
                                     give_steps=args.give_steps,
                                     def_int=args.def_int,
                                     intervene_vars=args.intervene_vars,
-                                    thinking_tags=bool(args.thinking_tags),
-                                    cot_hint=bool(cot_hint),
+                                    wrapper_mode=wrapper_mode,
+                                    append_format_hint=bool(append_format_hint),
                                 )
 
                                 if args.save_example_prompt:
@@ -1063,7 +1120,8 @@ def main() -> None:
                                                 "col_order": col_ord,
                                                 "shuffles_per_graph": shuf_n,
                                                 "base_name": base_name,
-                                                "cot_hint": bool(cot_hint),
+                                                "wrapper_mode": wrapper_mode or "plain",
+                                                "append_format_hint": bool(append_format_hint),
                                             },
                                             ensure_ascii=False,
                                             indent=2,
@@ -1099,8 +1157,8 @@ def main() -> None:
                                             give_steps=args.give_steps,
                                             def_int=args.def_int,
                                             intervene_vars=args.intervene_vars,
-                                            thinking_tags=bool(args.thinking_tags),
-                                            cot_hint=bool(cot_hint),
+                                            wrapper_mode=wrapper_mode,
+                                            append_format_hint=bool(append_format_hint),
                                         )
                                         n_rows = 0
                                         for tok_row in token_iter:
@@ -1174,8 +1232,8 @@ def main() -> None:
                                         give_steps=args.give_steps,
                                         def_int=args.def_int,
                                         intervene_vars=args.intervene_vars,
-                                        thinking_tags=bool(args.thinking_tags),
-                                        cot_hint=bool(cot_hint),
+                                        wrapper_mode=wrapper_mode,
+                                        append_format_hint=bool(append_format_hint),
                                     )
                                     _run_model_for_config(
                                         dataset=dataset,
@@ -1193,6 +1251,7 @@ def main() -> None:
                                         hf_pipe=hf_pipe,
                                         hf_max_new_tokens=int(args.hf_max_new_tokens),
                                         hf_batch_size=max(1, int(args.hf_batch_size)),
+                                        hf_context_limit=max(0, int(args.hf_context_limit)),
                                         hf_skip_if_prompt_tokens_over=max(0, int(args.hf_skip_if_prompt_tokens_over)),
                                         hf_skip_if_est_kv_exceeds_vram=bool(args.hf_skip_if_est_kv_exceeds_vram),
                                         hf_kv_vram_fraction=float(args.hf_kv_vram_fraction),

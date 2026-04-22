@@ -7,7 +7,7 @@ from pathlib import Path
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="HF-only wrapper around query_gemini.py (provider=hf)."
+        description="HF-only wrapper around query_api.py (provider=hf)."
     )
     ap.add_argument("--csv", required=True, help="Input prompt CSV path.")
     ap.add_argument("--model", required=True, help="HF model id/path.")
@@ -38,7 +38,7 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    query_script = (Path(__file__).parent / "query_gemini.py").resolve()
+    query_script = (Path(__file__).parent / "query_api.py").resolve()
     if not query_script.exists():
         raise SystemExit(f"query script not found: {query_script}")
 
