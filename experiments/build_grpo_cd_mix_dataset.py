@@ -97,8 +97,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--prompt-style",
-        choices=["cases", "matrix", "summary", "payload", "payload_topk"],
+        choices=["cases", "matrix", "summary", "summary_joint", "summary_join", "payload", "payload_topk"],
         default="summary",
+        help="Prompt style. summary_joint/summary_join are legacy aliases for summary.",
     )
     ap.add_argument(
         "--obs-values",

@@ -346,6 +346,24 @@ def _named_directed_edges_from_adj(adj: List[List[int]], variables: List[str]) -
     }
 
 
+def _named_descendants_from_adj(adj: List[List[int]], variables: List[str], target_name: str) -> List[str]:
+    """Return descendants of target_name in graph order, excluding the target itself."""
+    if target_name not in variables:
+        return []
+    idx = variables.index(target_name)
+    n = len(adj)
+    seen = set()
+    stack = [idx]
+    while stack:
+        u = stack.pop()
+        for v in range(n):
+            if adj[u][v] != 1 or v == idx or v in seen:
+                continue
+            seen.add(v)
+            stack.append(v)
+    return [variables[i] for i in range(n) if i in seen]
+
+
 def build_cd_stage_targets(prompt: str, answer: Any) -> Optional[Dict[str, List[List[str]]]]:
     """
     Precompute ground-truth Stage 1/2/3 structures from the prompt VARIABLES block
@@ -412,6 +430,22 @@ def _target_directed_edges_from_kwargs(kwargs: dict, index: int) -> Optional[set
         if not isinstance(item, (list, tuple)) or len(item) != 2:
             return None
         out.add((str(item[0]), str(item[1])))
+    return out
+
+
+_DO_TARGET_RE = re.compile(r"do\(\s*([A-Za-z0-9_]+)\s*=\s*[^)]*\)")
+
+
+def _intervention_targets_from_prompt(prompt: str) -> List[str]:
+    text = str(prompt or "")
+    seen = set()
+    out: List[str] = []
+    for name in _DO_TARGET_RE.findall(text):
+        name = str(name).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
     return out
 
 
@@ -1260,6 +1294,13 @@ def _variables_from_prompt(prompt: str) -> Optional[List[str]]:
     return names if names else None
 
 
+def _prompt_text_from_kwargs(kwargs: dict, index: int) -> str:
+    prompt = _value_at(kwargs.get("prompt_raw"), index)
+    if prompt is None:
+        prompt = _value_at(kwargs.get("prompt"), index)
+    return str(prompt or "")
+
+
 def _skeleton_from_adj(adj: List[List[int]]) -> set:
     """Return index-pair set representing the undirected skeleton."""
     n = len(adj)
@@ -1360,12 +1401,13 @@ def build_cd_skeleton_f1_reward(scale: float = 0.2):
     def _cd_skeleton_f1_reward(completions, **kwargs):
         answers = kwargs.get("answer")
         answer_paths = kwargs.get("answer_path")
-        prompts = kwargs.get("prompt")
         rewards: List[float] = []
         s = float(scale)
 
         for i, completion in enumerate(completions):
             target_edges = _target_skeleton_edges_from_kwargs(kwargs, i)
+            prompt_text = _prompt_text_from_kwargs(kwargs, i)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
             if target_edges is None:
                 target_raw = None
                 if answers is not None and i < len(answers):
@@ -1378,8 +1420,6 @@ def build_cd_skeleton_f1_reward(scale: float = 0.2):
                     rewards.append(0.0)
                     continue
 
-                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-                variables = _variables_from_prompt(prompt_text) if prompt_text else None
                 if variables is None or len(variables) != len(target_adj):
                     rewards.append(0.0)
                     continue
@@ -1388,14 +1428,20 @@ def build_cd_skeleton_f1_reward(scale: float = 0.2):
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
-            if not think:
-                rewards.append(0.0)
-                continue
+            think_score = 0.0
+            if think:
+                stage1_text = _extract_stage(think, _STAGE1_RE, _STAGE2_RE)
+                pred_edges = _skeleton_from_stage1_text(stage1_text)
+                think_score = _named_skeleton_f1(pred_edges, target_edges)
 
-            stage1_text = _extract_stage(think, _STAGE1_RE, _STAGE2_RE)
-            pred_edges = _skeleton_from_stage1_text(stage1_text)
+            answer_score = 0.0
+            if variables is not None:
+                pred_adj = extract_adjacency_matrix(text, expected_n=len(variables))
+                if pred_adj is not None:
+                    answer_edges = _named_skeleton_edges_from_adj(pred_adj, variables)
+                    answer_score = _named_skeleton_f1(answer_edges, target_edges)
 
-            value = _named_skeleton_f1(pred_edges, target_edges)
+            value = max(float(think_score), float(answer_score))
             rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
         return rewards
 
@@ -1449,12 +1495,13 @@ def build_cd_vstruct_f1_reward(scale: float = 0.15):
     def _cd_vstruct_f1_reward(completions, **kwargs):
         answers = kwargs.get("answer")
         answer_paths = kwargs.get("answer_path")
-        prompts = kwargs.get("prompt")
         rewards: List[float] = []
         s = float(scale)
 
         for i, completion in enumerate(completions):
             target_vstructs = _target_vstructs_from_kwargs(kwargs, i)
+            prompt_text = _prompt_text_from_kwargs(kwargs, i)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
             if target_vstructs is None:
                 target_raw = None
                 if answers is not None and i < len(answers):
@@ -1467,8 +1514,6 @@ def build_cd_vstruct_f1_reward(scale: float = 0.15):
                     rewards.append(0.0)
                     continue
 
-                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-                variables = _variables_from_prompt(prompt_text) if prompt_text else None
                 if variables is None or len(variables) != len(target_adj):
                     rewards.append(0.0)
                     continue
@@ -1477,14 +1522,20 @@ def build_cd_vstruct_f1_reward(scale: float = 0.15):
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
-            if not think:
-                rewards.append(0.0)
-                continue
+            think_score = 0.0
+            if think:
+                stage2_text = _extract_stage(think, _STAGE2_RE, _STAGE3_RE)
+                pred_vstructs = _vstruct_set_from_stage2_text(stage2_text)
+                think_score = _f1(pred_vstructs, target_vstructs)
 
-            stage2_text = _extract_stage(think, _STAGE2_RE, _STAGE3_RE)
-            pred_vstructs = _vstruct_set_from_stage2_text(stage2_text)
+            answer_score = 0.0
+            if variables is not None:
+                pred_adj = extract_adjacency_matrix(text, expected_n=len(variables))
+                if pred_adj is not None:
+                    answer_vstructs = _named_vstructs_from_adj(pred_adj, variables)
+                    answer_score = _f1(answer_vstructs, target_vstructs)
 
-            value = _f1(pred_vstructs, target_vstructs)
+            value = max(float(think_score), float(answer_score))
             rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
         return rewards
 
@@ -1534,12 +1585,13 @@ def build_cd_orientation_f1_reward(scale: float = 0.15):
     def _cd_orientation_f1_reward(completions, **kwargs):
         answers = kwargs.get("answer")
         answer_paths = kwargs.get("answer_path")
-        prompts = kwargs.get("prompt")
         rewards: List[float] = []
         s = float(scale)
 
         for i, completion in enumerate(completions):
             target_directed = _target_directed_edges_from_kwargs(kwargs, i)
+            prompt_text = _prompt_text_from_kwargs(kwargs, i)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
             if target_directed is None:
                 target_raw = None
                 if answers is not None and i < len(answers):
@@ -1552,8 +1604,6 @@ def build_cd_orientation_f1_reward(scale: float = 0.15):
                     rewards.append(0.0)
                     continue
 
-                prompt_text = (prompts[i] if prompts is not None and i < len(prompts) else None)
-                variables = _variables_from_prompt(prompt_text) if prompt_text else None
                 if variables is None or len(variables) != len(target_adj):
                     rewards.append(0.0)
                     continue
@@ -1562,21 +1612,94 @@ def build_cd_orientation_f1_reward(scale: float = 0.15):
 
             text = completion_to_text(completion)
             think = _extract_think_block(text)
-            if not think:
-                rewards.append(0.0)
-                continue
+            think_score = 0.0
+            if think:
+                # Stage 3 runs to end of think block (no following stage header)
+                m3 = _STAGE3_RE.search(think)
+                stage3_text = think[m3.end():].strip() if m3 else ""
+                pred_directed = _directed_set_from_stage3_text(stage3_text)
+                think_score = _f1(pred_directed, target_directed)
 
-            # Stage 3 runs to end of think block (no following stage header)
-            m3 = _STAGE3_RE.search(think)
-            stage3_text = think[m3.end():].strip() if m3 else ""
-            pred_directed = _directed_set_from_stage3_text(stage3_text)
+            answer_score = 0.0
+            if variables is not None:
+                pred_adj = extract_adjacency_matrix(text, expected_n=len(variables))
+                if pred_adj is not None:
+                    answer_directed = _named_directed_edges_from_adj(pred_adj, variables)
+                    answer_score = _f1(answer_directed, target_directed)
 
-            value = _f1(pred_directed, target_directed)
+            value = max(float(think_score), float(answer_score))
             rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
         return rewards
 
     _cd_orientation_f1_reward.__name__ = "cd_orientation_f1_reward"
     return _cd_orientation_f1_reward
+
+
+def build_cd_descendant_consistency_reward(scale: float = 0.1):
+    """
+    Reward consistency of the final predicted graph with intervention-local descendant sets.
+
+    For each intervention target mentioned in the prompt, compare the descendants implied by
+    the predicted adjacency matrix against the true descendants from the target graph and
+    average descendant-set F1 across targets.
+    """
+    if scale < 0:
+        raise ValueError("scale must be >= 0")
+
+    target_cache: Dict[str, Optional[List[List[int]]]] = {}
+
+    def _cached_target(raw: Any) -> Optional[List[List[int]]]:
+        key = str(raw)
+        if key in target_cache:
+            return target_cache[key]
+        mat = target_matrix_from_answer(raw)
+        target_cache[key] = mat
+        return mat
+
+    def _reward_fn(completions, **kwargs):
+        answers = kwargs.get("answer")
+        answer_paths = kwargs.get("answer_path")
+        rewards: List[float] = []
+        s = float(scale)
+
+        for i, completion in enumerate(completions):
+            target_raw = None
+            if answers is not None and i < len(answers):
+                target_raw = answers[i]
+            elif answer_paths is not None and i < len(answer_paths):
+                target_raw = answer_paths[i]
+
+            target_adj = _cached_target(target_raw)
+            prompt_text = _prompt_text_from_kwargs(kwargs, i)
+            variables = _variables_from_prompt(prompt_text) if prompt_text else None
+            if target_adj is None or variables is None or len(variables) != len(target_adj):
+                rewards.append(0.0)
+                continue
+
+            intervention_targets = _intervention_targets_from_prompt(prompt_text)
+            intervention_targets = [name for name in intervention_targets if name in variables]
+            if not intervention_targets:
+                rewards.append(0.0)
+                continue
+
+            text = completion_to_text(completion)
+            pred_adj = extract_adjacency_matrix(text, expected_n=len(target_adj))
+            if pred_adj is None:
+                rewards.append(0.0)
+                continue
+
+            per_target_scores: List[float] = []
+            for target_name in intervention_targets:
+                gold_desc = _named_descendants_from_adj(target_adj, variables, target_name)
+                pred_desc = _named_descendants_from_adj(pred_adj, variables, target_name)
+                per_target_scores.append(_set_f1(pred_desc, gold_desc))
+
+            value = sum(per_target_scores) / len(per_target_scores) if per_target_scores else 0.0
+            rewards.append(float(s) * float(max(min(value, 1.0), 0.0)))
+        return rewards
+
+    _reward_fn.__name__ = "cd_descendant_consistency_reward"
+    return _reward_fn
 
 
 def build_length_penalty_reward(
