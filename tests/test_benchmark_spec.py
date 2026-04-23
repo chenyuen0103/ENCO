@@ -49,7 +49,7 @@ class TestBenchmarkSpec(unittest.TestCase):
         cell = next(
             cell
             for cell in spec.prompt_cells
-            if cell.style == "summary_joint"
+            if cell.style == "summary"
             and cell.obs_per_prompt == 100
             and cell.int_per_combo == 0
             and not cell.anonymize
@@ -62,17 +62,26 @@ class TestBenchmarkSpec(unittest.TestCase):
     def test_external_llm_adapters_bind_to_expected_configs(self) -> None:
         adapters = build_baseline_adapters(Path(".").resolve())
         names_only = PromptCellSpec(style="names_only", obs_per_prompt=0, int_per_combo=0)
-        observational = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=0)
-        summary = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=50)
+        observational = PromptCellSpec(style="summary", obs_per_prompt=100, int_per_combo=0)
+        anonymized_observational = PromptCellSpec(
+            style="summary",
+            obs_per_prompt=100,
+            int_per_combo=0,
+            anonymize=True,
+        )
+        summary = PromptCellSpec(style="summary", obs_per_prompt=100, int_per_combo=50)
         matrix = PromptCellSpec(style="matrix", obs_per_prompt=100, int_per_combo=50)
         self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), names_only))
         self.assertTrue(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), observational))
+        self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), anonymized_observational))
         self.assertFalse(adapters["JiralerspongBFS"].applies_to(BaselineSpec(name="JiralerspongBFS"), names_only))
         self.assertTrue(adapters["JiralerspongBFS"].applies_to(BaselineSpec(name="JiralerspongBFS"), observational))
+        self.assertFalse(adapters["JiralerspongBFS"].applies_to(BaselineSpec(name="JiralerspongBFS"), anonymized_observational))
         self.assertTrue(adapters["CausalLLMPrompt"].applies_to(BaselineSpec(name="CausalLLMPrompt"), names_only))
         self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), summary))
         self.assertFalse(adapters["JiralerspongBFS"].applies_to(BaselineSpec(name="JiralerspongBFS"), summary))
         self.assertTrue(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), summary))
+        self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), anonymized_observational))
         self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), matrix))
 
 

@@ -16,6 +16,9 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmark_builder.graph_io import load_causal_graph
+
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
+
 try:
     from experiments.generate_prompts import iter_prompts_in_memory
     from experiments.cd_generation.names_only import iter_names_only_prompts_in_memory
@@ -388,7 +391,7 @@ def _run_jiralerspong_bfs(
     hf_pipe: Any,
 ) -> tuple[np.ndarray, list[str], list[str]]:
     context = None
-    if prompt_mode == "summary_joint":
+    if prompt_mode == "summary":
         variables, _answer_obj, context = _build_data_prompt(
             graph_path=graph_path,
             sample_size_obs=sample_size_obs,
@@ -561,14 +564,14 @@ def main() -> int:
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
 
-    if args.prompt_mode == "summary":
-        args.prompt_mode = "summary_joint"
+    if args.prompt_mode == "summary_joint":
+        args.prompt_mode = "summary"
 
     names_only_methods = {"TakayamaSCP", "CausalLLMPrompt"}
     if args.method in names_only_methods and args.prompt_mode != "names_only":
         raise SystemExit(f"{args.method} expects --prompt_mode names_only.")
-    if args.method == "JiralerspongBFS" and args.prompt_mode != "summary_joint":
-        raise SystemExit("JiralerspongBFS expects --prompt_mode summary_joint.")
+    if args.method == "JiralerspongBFS" and args.prompt_mode != "summary":
+        raise SystemExit("JiralerspongBFS expects --prompt_mode summary.")
     if args.method == "JiralerspongBFS" and args.sample_size_inters != 0:
         raise SystemExit("JiralerspongBFS is observational-only in this implementation.")
     if (args.method in names_only_methods or args.method == "JiralerspongBFS") and args.naming_regime not in {"real", "names_only", "anonymized"}:
@@ -669,4 +672,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"

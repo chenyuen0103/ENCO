@@ -67,7 +67,7 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
-    if cell.style == "summary_joint":
+    if cell.style == "summary":
         tags.append("summary")
     elif cell.style == "matrix":
         tags.append("matrix")
@@ -106,6 +106,10 @@ def _merge_response_entries(existing: list[dict[str, Any]], new_entries: list[di
         key = str(entry.get("response_csv"))
         merged[key] = entry
     return list(merged.values())
+
+
+def _baseline_prefers_anonymized(baseline_name: str) -> bool:
+    return baseline_name in {"PC", "GES", "ENCO"}
 
 
 @dataclass
@@ -342,7 +346,7 @@ class BenchmarkRunner:
                 if entry["kind"] == "names_only":
                     config_rows.append(
                         {
-                            "style": "summary_joint",
+                            "style": "summary",
                             "anonymize": False,
                             "obs_per_prompt": 0,
                             "int_per_combo": 0,
@@ -458,34 +462,44 @@ class BenchmarkRunner:
         evaluator = EvalScriptEvaluator(repo_root=self.repo_root)
         response_entries: list[dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
-        for entry in prompt_bundle["entries"]:
-            if entry["kind"] == "names_only":
-                cell = PromptCellSpec(
-                    style="names_only",
-                    obs_per_prompt=0,
-                    int_per_combo=0,
-                    anonymize=False,
-                    enabled=True,
+        for baseline in self.spec.baselines:
+            adapter = adapters.get(baseline.name)
+            if adapter is None:
+                raise RuntimeError(
+                    f"Baseline `{baseline.name}` is enabled in manifest `{self.spec.name}` but no adapter is registered."
                 )
-            else:
-                cell = next(
-                    cell
-                    for cell in self.spec.prompt_cells
-                    if cell.style == entry["prompt_style"]
-                    and cell.obs_per_prompt == entry["obs_n"]
-                    and cell.int_per_combo == entry["int_n"]
-                    and cell.naming_regime == entry["naming_regime"]
-                )
-            dataset = datasets[entry["dataset"]]
-            graph_path = Path(entry["graph_file"])
-            for baseline in self.spec.baselines:
-                adapter = adapters.get(baseline.name)
-                if adapter is None:
-                    raise RuntimeError(
-                        f"Baseline `{baseline.name}` is enabled in manifest `{self.spec.name}` but no adapter is registered."
-                )
+
+            ordered_entries = sorted(
+                prompt_bundle["entries"],
+                key=lambda entry: (
+                    0 if (_baseline_prefers_anonymized(baseline.name) and entry.get("naming_regime") == "anonymized") else 1,
+                    str(entry.get("dataset")),
+                    str(entry.get("config_name")),
+                ),
+            )
+
+            for entry in ordered_entries:
+                if entry["kind"] == "names_only":
+                    cell = PromptCellSpec(
+                        style="names_only",
+                        obs_per_prompt=0,
+                        int_per_combo=0,
+                        anonymize=False,
+                        enabled=True,
+                    )
+                else:
+                    cell = next(
+                        cell
+                        for cell in self.spec.prompt_cells
+                        if cell.style == entry["prompt_style"]
+                        and cell.obs_per_prompt == entry["obs_n"]
+                        and cell.int_per_combo == entry["int_n"]
+                        and cell.naming_regime == entry["naming_regime"]
+                    )
                 if not adapter.applies_to(baseline, cell):
                     continue
+                dataset = datasets[entry["dataset"]]
+                graph_path = Path(entry["graph_file"])
                 dedupe_fn = getattr(adapter, "dedupe_key", None)
                 if callable(dedupe_fn):
                     dedupe_key = dedupe_fn(baseline=baseline, dataset=dataset, cell=cell, entry=entry)
