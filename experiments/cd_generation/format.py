@@ -19,6 +19,19 @@ DEFAULT_FORMAT_HINT_TEXT = (
     "and [i][j]=1 means variable i directly causes variable j."
 )
 
+DEFAULT_FORMAT_HINT_TEXT_CONCISE = (
+    "Reason however you want inside <think>, but keep it concise. "
+    "Then output: <answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "
+    "where the matrix is N×N with integer entries 0 or 1 in VARIABLES order, "
+    "and [i][j]=1 means variable i directly causes variable j."
+)
+
+DEFAULT_FORMAT_HINT_TEXT_NONE = (
+    "Output exactly: <think>...</think><answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "
+    "where the matrix is N×N with integer entries 0 or 1 in VARIABLES order, "
+    "and [i][j]=1 means variable i directly causes variable j."
+)
+
 DESCENDANT_SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
     "The assistant is an expert in causal inference and reasons from empirical evidence "
@@ -42,9 +55,13 @@ _OUTPUT_INSTRUCTIONS_RE = re.compile(
 )
 
 
-def default_short_think_text(task: str) -> str:
+def default_short_think_text(task: str, reasoning_guidance: str = "staged") -> str:
     if task == "cd_descendants":
         return "I compare the intervention shifts and keep only downstream variables."
+    if reasoning_guidance == "concise":
+        return "I infer the causal graph from the observational and interventional evidence."
+    if reasoning_guidance == "none":
+        return ""
     return (
         "Stage 1 (Skeleton):\n"
         "Stage 2 (V-structures):\n"
@@ -58,16 +75,33 @@ def system_prompt_for_task(task: str, response_format: str = "think_answer") -> 
     return SYSTEM_PROMPT
 
 
-def default_format_hint_text(task: str, response_format: str = "think_answer") -> str:
+def default_format_hint_text(
+    task: str,
+    response_format: str = "think_answer",
+    reasoning_guidance: str = "staged",
+) -> str:
     if task == "cd_descendants":
         return DEFAULT_DESCENDANT_FORMAT_HINT_TEXT
+    if reasoning_guidance == "concise":
+        return DEFAULT_FORMAT_HINT_TEXT_CONCISE
+    if reasoning_guidance == "none":
+        return DEFAULT_FORMAT_HINT_TEXT_NONE
     return DEFAULT_FORMAT_HINT_TEXT
 
 
-def resolve_format_hint_text(task: str, format_hint_text: str, response_format: str = "think_answer") -> str:
+def resolve_format_hint_text(
+    task: str,
+    format_hint_text: str,
+    response_format: str = "think_answer",
+    reasoning_guidance: str = "staged",
+) -> str:
     hint = str(format_hint_text or "").strip()
     if not hint:
-        return default_format_hint_text(task, response_format=response_format)
+        return default_format_hint_text(
+            task,
+            response_format=response_format,
+            reasoning_guidance=reasoning_guidance,
+        )
     if task == "cd_descendants" and hint == DEFAULT_FORMAT_HINT_TEXT:
         return DEFAULT_DESCENDANT_FORMAT_HINT_TEXT
     return hint
@@ -94,6 +128,16 @@ def _strip_formatting_requirement(text: str) -> str:
     if marker in s:
         return s.split(marker, 1)[0].rstrip()
     return s
+
+
+def _extract_formatting_requirement(text: str) -> str:
+    s = str(text or "").strip()
+    for marker in ("\n\nFormatting requirement:", "\nFormatting requirement:"):
+        if marker in s:
+            return s.split(marker, 1)[1].strip()
+    if s.startswith("Formatting requirement:"):
+        return s.split(":", 1)[1].strip()
+    return ""
 
 
 def _strip_output_instructions_block(text: str) -> str:
@@ -169,6 +213,7 @@ def canonicalize_cd_prompt(
     wrap_system_prompt: bool,
     append_format_hint: bool,
     format_hint_text: str,
+    reasoning_guidance: str = "staged",
     prefill_think: bool,
     prefill_answer: bool = False,
     think_text: str = "",
@@ -188,6 +233,9 @@ def canonicalize_cd_prompt(
             prompt,
             task=task,
             response_format=response_format,
+            append_format_hint=append_format_hint,
+            format_hint_text=format_hint_text,
+            reasoning_guidance=reasoning_guidance,
         )
         if prefill_answer:
             return ensure_assistant_answer_prefill(prompt, think_text)
@@ -199,7 +247,12 @@ def canonicalize_cd_prompt(
     if append_format_hint:
         user_prompt = append_format_hint_to_user_prompt(
             user_prompt,
-            resolve_format_hint_text(task, format_hint_text, response_format=response_format),
+            resolve_format_hint_text(
+                task,
+                format_hint_text,
+                response_format=response_format,
+                reasoning_guidance=reasoning_guidance,
+            ),
         )
     if wrap_system_prompt:
         return build_chat_prompt(
@@ -229,17 +282,28 @@ def update_prompt_to_current_format(
     *,
     task: str = "causal_discovery",
     response_format: str = "think_answer",
+    append_format_hint: bool = True,
+    format_hint_text: str = "",
+    reasoning_guidance: str = "staged",
 ) -> str:
     prompt = str(prompt_text or "").strip()
     if not prompt or not looks_like_chat_prompt(prompt):
         return prompt
 
     user_prompt = _unwrap_chat_user_prompt(prompt)
+    existing_hint = _extract_formatting_requirement(user_prompt)
     user_prompt = _strip_output_instructions_block(_strip_formatting_requirement(user_prompt))
-    user_prompt = append_format_hint_to_user_prompt(
-        user_prompt,
-        resolve_format_hint_text(task, "", response_format=response_format),
-    )
+    if append_format_hint or existing_hint:
+        user_prompt = append_format_hint_to_user_prompt(
+            user_prompt,
+            existing_hint
+            or resolve_format_hint_text(
+                task,
+                format_hint_text,
+                response_format=response_format,
+                reasoning_guidance=reasoning_guidance,
+            ),
+        )
     return build_chat_prompt(
         user_prompt,
         task=task,

@@ -246,6 +246,23 @@ def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[
         return dict(kwargs)
 
 
+def _destroy_process_group_if_initialized() -> None:
+    try:
+        import torch
+    except Exception:
+        return
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    try:
+        torch.distributed.destroy_process_group()
+    except Exception as e:
+        rank = int(os.environ.get("RANK", "0"))
+        if rank == 0:
+            print(f"[warn] destroy_process_group failed: {e}")
+
+
 def _load_json_dataset(
     jsonl_path: Path,
     *,
@@ -676,9 +693,12 @@ def _run_sft_unsloth(
     resume_ckpt = _resolve_resume_checkpoint(sft_output_dir, resume_from_checkpoint)
     if resume_ckpt:
         print(f"[sft/unsloth] resuming from checkpoint: {resume_ckpt}")
-    trainer.train(resume_from_checkpoint=resume_ckpt)
-    model.save_pretrained(str(sft_output_dir))
-    tokenizer.save_pretrained(str(sft_output_dir))
+    try:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+        model.save_pretrained(str(sft_output_dir))
+        tokenizer.save_pretrained(str(sft_output_dir))
+    finally:
+        _destroy_process_group_if_initialized()
 
     # Patch adapter_config.json so GRPO can load it without a quantized base.
     if grpo_base_model:
@@ -1058,9 +1078,12 @@ def run_sft(
     resume_ckpt = _resolve_resume_checkpoint(sft_output_dir, resume_from_checkpoint)
     if resume_ckpt:
         print(f"[sft] resuming from checkpoint: {resume_ckpt}")
-    trainer.train(resume_from_checkpoint=resume_ckpt)
-    trainer.save_model(str(sft_output_dir))
-    tokenizer.save_pretrained(str(sft_output_dir))
+    try:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+        trainer.save_model(str(sft_output_dir))
+        tokenizer.save_pretrained(str(sft_output_dir))
+    finally:
+        _destroy_process_group_if_initialized()
 
 
 def run_grpo(

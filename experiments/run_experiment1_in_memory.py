@@ -265,7 +265,7 @@ def _load_configs_from_file(
     allowed_styles: set[str],
     allowed_row_orders: set[str],
     allowed_col_orders: set[str],
-) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool]]:
+) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool, str]]:
     try:
         payload = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception as e:
@@ -281,7 +281,7 @@ def _load_configs_from_file(
     if not isinstance(raw_configs, list) or not raw_configs:
         raise SystemExit("--config-file contains no configs.")
 
-    out: list[tuple[str, bool, int, int, str, str, int, str | None, bool]] = []
+    out: list[tuple[str, bool, int, int, str, str, int, str | None, bool, str]] = []
     for i, item in enumerate(raw_configs):
         if not isinstance(item, dict):
             raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
@@ -353,7 +353,27 @@ def _load_configs_from_file(
         else:
             append_format_hint = False
 
-        out.append((style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint))
+        reasoning_guidance = str(item.get("reasoning_guidance", "staged") or "staged").strip().lower()
+        if reasoning_guidance not in {"staged", "concise", "none"}:
+            raise SystemExit(
+                f"Config #{i}: invalid reasoning_guidance '{item.get('reasoning_guidance')}'. "
+                "Allowed: ['staged', 'concise', 'none']."
+            )
+
+        out.append(
+            (
+                style,
+                anon,
+                obs_n,
+                int_n,
+                row_ord,
+                col_ord,
+                shuf_n,
+                wrapper_mode,
+                append_format_hint,
+                reasoning_guidance,
+            )
+        )
 
     return out
 
@@ -418,6 +438,7 @@ def _iter_prompts_for_config(
     intervene_vars: str,
     wrapper_mode: str | None,
     append_format_hint: bool,
+    reasoning_guidance: str,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     is_names_only = (obs_per_prompt == 0 and int_per_combo == 0)
     if is_names_only:
@@ -430,6 +451,7 @@ def _iter_prompts_for_config(
             causal_rules=causal_rules,
             wrapper_mode=wrapper_mode,
             append_format_hint=append_format_hint,
+            reasoning_guidance=reasoning_guidance,
         )
     iter_prompts_in_memory = _import_iter_prompts_in_memory()
     return iter_prompts_in_memory(
@@ -449,6 +471,7 @@ def _iter_prompts_for_config(
         intervene_vars=intervene_vars,
         wrapper_mode=wrapper_mode,
         append_format_hint=append_format_hint,
+        reasoning_guidance=reasoning_guidance,
     )
 
 
@@ -995,6 +1018,7 @@ def main() -> None:
             int(shuf_values[0] if shuf_values else 1),
             cli_wrapper_mode,
             bool(args.append_format_hint),
+            "staged",
         )]
     elif args.config_file is not None:
         configs = _load_configs_from_file(
@@ -1006,7 +1030,18 @@ def main() -> None:
         )
     else:
         configs = [
-            (style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, cli_wrapper_mode, bool(args.append_format_hint))
+            (
+                style,
+                anon,
+                obs_n,
+                int_n,
+                row_ord,
+                col_ord,
+                shuf_n,
+                cli_wrapper_mode,
+                bool(args.append_format_hint),
+                "staged",
+            )
             for style in styles
             for anon in anonymize_opts
             for obs_n in obs_sizes
@@ -1019,7 +1054,7 @@ def main() -> None:
     hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
     using_explicit_config_file = args.config_file is not None
 
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint in configs:
+    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint, reasoning_guidance in configs:
                                 is_names_only = (obs_n == 0 and int_n == 0)
                                 is_payload_without_obs = (style in {"payload", "payload_topk"} and obs_n == 0 and int_n > 0)
                                 if is_payload_without_obs:
@@ -1083,6 +1118,7 @@ def main() -> None:
                                     intervene_vars=args.intervene_vars,
                                     wrapper_mode=wrapper_mode,
                                     append_format_hint=bool(append_format_hint),
+                                    reasoning_guidance=reasoning_guidance,
                                 )
 
                                 if args.save_example_prompt:
@@ -1122,6 +1158,7 @@ def main() -> None:
                                                 "base_name": base_name,
                                                 "wrapper_mode": wrapper_mode or "plain",
                                                 "append_format_hint": bool(append_format_hint),
+                                                "reasoning_guidance": reasoning_guidance,
                                             },
                                             ensure_ascii=False,
                                             indent=2,
@@ -1159,6 +1196,7 @@ def main() -> None:
                                             intervene_vars=args.intervene_vars,
                                             wrapper_mode=wrapper_mode,
                                             append_format_hint=bool(append_format_hint),
+                                            reasoning_guidance=reasoning_guidance,
                                         )
                                         n_rows = 0
                                         for tok_row in token_iter:
@@ -1182,7 +1220,8 @@ def main() -> None:
                                         continue
                                     print(
                                         f"[config] style={style} anon={anon} obs={obs_n} int={int_n} "
-                                        f"row={row_ord} col={col_ord} shuf={shuf_n} model={model}",
+                                        f"row={row_ord} col={col_ord} shuf={shuf_n} "
+                                        f"reasoning={reasoning_guidance} model={model}",
                                         file=sys.stderr,
                                         flush=True,
                                     )
@@ -1234,6 +1273,7 @@ def main() -> None:
                                         intervene_vars=args.intervene_vars,
                                         wrapper_mode=wrapper_mode,
                                         append_format_hint=bool(append_format_hint),
+                                        reasoning_guidance=reasoning_guidance,
                                     )
                                     _run_model_for_config(
                                         dataset=dataset,

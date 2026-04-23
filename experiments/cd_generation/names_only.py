@@ -126,6 +126,7 @@ def iter_names_only_prompts_in_memory(
     causal_rules: bool,
     wrapper_mode: Optional[str] = None,
     append_format_hint: Optional[bool] = None,
+    reasoning_guidance: Optional[str] = None,
     prefill_think: Optional[bool] = None,
     prefill_answer: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
@@ -192,6 +193,8 @@ def iter_names_only_prompts_in_memory(
         base_name += f"_wrap{resolved_wrapper_mode}"
     if resolved_append_format_hint:
         base_name += "_fmthint"
+    if reasoning_guidance and str(reasoning_guidance).strip().lower() != "staged":
+        base_name += f"_reason{str(reasoning_guidance).strip().lower()}"
     if col_order != "original":
         base_name += f"_col{col_order.capitalize()}"
 
@@ -209,6 +212,7 @@ def iter_names_only_prompts_in_memory(
         task="causal_discovery",
         wrapper_mode=resolved_wrapper_mode,
         append_format_hint=resolved_append_format_hint,
+        reasoning_guidance=str(reasoning_guidance or "staged"),
         prefill_think=prefill_think,
         prefill_answer=prefill_answer,
     )
@@ -255,6 +259,12 @@ def main():
             "Append the canonical Formatting requirement line. For causal discovery this "
             "adds the optional stage-by-stage reasoning instructions."
         ),
+    )
+    ap.add_argument(
+        "--reasoning-guidance",
+        choices=["staged", "concise", "none"],
+        default="staged",
+        help="Control how much reasoning structure the prompt asks for.",
     )
     
     # --- Dummy Arguments (Accepted to ignore) ---
@@ -371,6 +381,7 @@ def main():
         task="causal_discovery",
         wrapper_mode=resolved_wrapper_mode,
         append_format_hint=bool(args.append_format_hint),
+        reasoning_guidance=args.reasoning_guidance,
     )
     
     print(f"Generating 'Names Only' prompts into {out_dir}...")

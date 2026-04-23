@@ -65,6 +65,17 @@ def main():
             "adds the optional stage-by-stage reasoning instructions."
         ),
     )
+    ap.add_argument(
+        "--reasoning-guidance",
+        choices=["staged", "concise", "none"],
+        default="staged",
+        help=(
+            "How much guidance to give for the <think> block. "
+            "'staged' keeps the current 3-stage scaffold, "
+            "'concise' says to reason however you want but keep it concise, "
+            "and 'none' uses only the output contract."
+        ),
+    )
     args = ap.parse_args()
 
     dataset_name = Path(args.bif_file).stem
@@ -255,6 +266,8 @@ def main():
             cmd.extend(["--wrapper-mode", "chat"])
         if args.append_format_hint:
             cmd.append("--append-format-hint")
+        if args.reasoning_guidance != "staged":
+            cmd.extend(["--reasoning-guidance", args.reasoning_guidance])
         
         if int_n > 0:
             cmd.extend(["--intervene-vars", "all"]) 

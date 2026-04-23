@@ -22,6 +22,7 @@ try:
     from cd_generation.prompt_utils import (
         LARGE_GRAPH_EDGE_LIST_THRESHOLD,
         build_causal_discovery_method_lines,
+        build_causal_discovery_reasoning_guidance_lines,
         build_causal_discovery_reminder_lines,
         build_causal_graph_assumption_lines,
         build_intervention_semantics_lines,
@@ -29,12 +30,14 @@ try:
         get_topological_sort,
         normalize_variable_names,
         render_prompt_text,
+        resolve_reasoning_guidance,
         resolve_wrapper_mode,
     )
 except ImportError:
     from experiments.cd_generation.prompt_utils import (
         LARGE_GRAPH_EDGE_LIST_THRESHOLD,
         build_causal_discovery_method_lines,
+        build_causal_discovery_reasoning_guidance_lines,
         build_causal_discovery_reminder_lines,
         build_causal_graph_assumption_lines,
         build_intervention_semantics_lines,
@@ -42,6 +45,7 @@ except ImportError:
         get_topological_sort,
         normalize_variable_names,
         render_prompt_text,
+        resolve_reasoning_guidance,
         resolve_wrapper_mode,
     )
 
@@ -138,6 +142,7 @@ def iter_prompts_in_memory(
     anonymize: bool,
     causal_rules: bool,
     give_steps: bool,
+    reasoning_guidance: Optional[str] = None,
     def_int: bool,
     intervene_vars: str,
     wrapper_mode: Optional[str] = None,
@@ -157,6 +162,7 @@ def iter_prompts_in_memory(
         prompt_style = "summary"
     codebook = build_codebook(graph, base_variables, str(graph_abs))
     resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=wrapper_mode)
+    resolved_reasoning_guidance = resolve_reasoning_guidance(reasoning_guidance=reasoning_guidance)
     resolved_append_format_hint = bool(append_format_hint)
     require_think_answer_blocks = True
 
@@ -229,6 +235,8 @@ def iter_prompts_in_memory(
         tags.append("rules")
     if give_steps:
         tags.append("steps")
+    if resolved_reasoning_guidance != "staged":
+        tags.append(f"reason{resolved_reasoning_guidance}")
     if resolved_wrapper_mode != "plain":
         tags.append(f"wrap{resolved_wrapper_mode}")
     if resolved_append_format_hint:
@@ -362,6 +370,7 @@ def iter_prompts_in_memory(
                         state_names=state_names_out if state_names_out else None,
                         include_causal_rules=causal_rules,
                         include_give_steps=give_steps,
+                        reasoning_guidance=resolved_reasoning_guidance,
                         include_def_int=include_def_int,
                         anonymize=anonymize,
                         include_probabilities=False,
@@ -373,6 +382,7 @@ def iter_prompts_in_memory(
                     prompt_text = format_prompt_cb_matrix(
                         variables_out, rows_text_source, dataset_name,
                         causal_rules, give_steps, include_def_int=include_def_int,
+                        reasoning_guidance=resolved_reasoning_guidance,
                         require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
@@ -386,6 +396,7 @@ def iter_prompts_in_memory(
                     task="causal_discovery",
                     wrapper_mode=resolved_wrapper_mode,
                     append_format_hint=resolved_append_format_hint,
+                    reasoning_guidance=resolved_reasoning_guidance,
                     prefill_think=prefill_think,
                     prefill_answer=prefill_answer,
                 )
@@ -857,6 +868,7 @@ def format_prompt_cb_matrix(
     dataset_name: str,
     include_causal_rules: bool = False,
     include_give_steps: bool = False,
+    reasoning_guidance: str = "staged",
     given_edges: Optional[List[Tuple[str, str]]] = None,
     include_def_int: bool = False,
     state_names: Optional[Dict[str, Dict[str, str]]] = None,  # optional: {var: {"0":"low","1":"high"}}
@@ -952,14 +964,15 @@ def format_prompt_cb_matrix(
     lines.append("\n--- END OF DATA ---")
 
     # --- Minimal internal method (optional) ---
-    if include_give_steps:
-        lines.extend(
-            build_causal_discovery_method_lines(
-                has_observational_data=bool(obs_rows),
-                has_interventional_data=bool(int_buckets),
-                require_think_answer_blocks=require_think_answer_blocks,
-            )
+    guidance_mode = "staged" if include_give_steps else reasoning_guidance
+    lines.extend(
+        build_causal_discovery_reasoning_guidance_lines(
+            reasoning_guidance=guidance_mode,
+            has_observational_data=bool(obs_rows),
+            has_interventional_data=bool(int_buckets),
+            require_think_answer_blocks=require_think_answer_blocks,
         )
+    )
 
     # Put strict formatting constraints at the very end for stronger adherence.
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
@@ -1357,6 +1370,7 @@ def format_prompt_summary_full_joint(
     state_names: Optional[List[List[str]]] = None,
     include_causal_rules: bool = False,
     include_give_steps: bool = False,
+    reasoning_guidance: str = "staged",
     include_def_int: bool = False,
     # formatting controls
     decimals: int = DEFAULT_DISTRIBUTION_DECIMALS,
@@ -1647,14 +1661,15 @@ def format_prompt_summary_full_joint(
 
     lines.append("\n--- END OF DATA ---")
 
-    if include_give_steps:
-        lines.extend(
-            build_causal_discovery_method_lines(
-                has_observational_data=bool(obs_rows_num),
-                has_interventional_data=bool(int_groups_num),
-                require_think_answer_blocks=require_think_answer_blocks,
-            )
+    guidance_mode = "staged" if include_give_steps else reasoning_guidance
+    lines.extend(
+        build_causal_discovery_reasoning_guidance_lines(
+            reasoning_guidance=guidance_mode,
+            has_observational_data=bool(obs_rows_num),
+            has_interventional_data=bool(int_groups_num),
+            require_think_answer_blocks=require_think_answer_blocks,
         )
+    )
 
     lines.append("\n--- OUTPUT INSTRUCTIONS ---")
     lines.extend(
@@ -1892,6 +1907,17 @@ def main():
     ap.add_argument("--anonymize", action="store_true")
     ap.add_argument("--causal-rules", action="store_true")
     ap.add_argument("--give-steps", action="store_true")
+    ap.add_argument(
+        "--reasoning-guidance",
+        choices=["staged", "concise", "none"],
+        default="staged",
+        help=(
+            "How much guidance to give for the <think> block. "
+            "'staged' keeps the current 3-stage scaffold, "
+            "'concise' says to reason however you want but keep it concise, "
+            "and 'none' uses only the output contract."
+        ),
+    )
     ap.add_argument(
         "--wrapper-mode",
         choices=["plain", "chat"],
@@ -2205,6 +2231,7 @@ def main():
                         state_names=state_names if state_names else None,
                         include_causal_rules=args.causal_rules,
                         include_give_steps=args.give_steps,
+                        reasoning_guidance=args.reasoning_guidance,
                         include_def_int=include_def_int,
                         anonymize=args.anonymize,
                         include_probabilities=False,
@@ -2219,6 +2246,7 @@ def main():
                         dataset_name,
                         include_causal_rules=args.causal_rules,
                         include_give_steps=args.give_steps,
+                        reasoning_guidance=args.reasoning_guidance,
                         include_def_int=include_def_int,
                         anonymize=args.anonymize,
                         require_think_answer_blocks=require_think_answer_blocks,
@@ -2235,6 +2263,7 @@ def main():
                     task="causal_discovery",
                     wrapper_mode=resolved_wrapper_mode,
                     append_format_hint=bool(args.append_format_hint),
+                    reasoning_guidance=args.reasoning_guidance,
                 )
                 
                 # Write Prompt File

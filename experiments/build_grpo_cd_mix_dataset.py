@@ -39,6 +39,7 @@ def _iter_rows_for_config(
     anonymize: bool,
     wrapper_mode: str | None,
     append_format_hint: bool,
+    reasoning_guidance: str = "staged",
     col_order: str = "original",
     col_perms: int = 1,
 ):
@@ -63,6 +64,7 @@ def _iter_rows_for_config(
             anonymize=bool(anonymize),
             causal_rules=False,
             give_steps=False,
+            reasoning_guidance=str(reasoning_guidance),
             def_int=False,
             intervene_vars="all",
             wrapper_mode=wrapper_mode,
@@ -150,6 +152,17 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--reasoning-guidance",
+        choices=["staged", "concise", "none"],
+        default="staged",
+        help=(
+            "How much guidance to give for the <think> block. "
+            "'staged' keeps the current 3-stage scaffold, "
+            "'concise' says to reason however you want but keep it concise, "
+            "and 'none' uses only the output contract."
+        ),
+    )
+    ap.add_argument(
         "--cot-hint",
         action="store_true",
         help=(
@@ -206,6 +219,7 @@ def main() -> None:
                         anonymize=bool(args.anonymize),
                         wrapper_mode=("chat" if args.cot_hint else None),
                         append_format_hint=bool(args.append_format_hint),
+                        reasoning_guidance=str(args.reasoning_guidance),
                         col_order=args.col_order,
                         col_perms=int(args.col_perms),
                     ):

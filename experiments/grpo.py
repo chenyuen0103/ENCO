@@ -1612,9 +1612,28 @@ def _dataset_from_cd_config_file(
         return sorted(seen)
 
     rows: list[dict[str, str]] = []
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, legacy_wrapper_mode, config_append_format_hint in configs:
+    staged_hint = default_format_hint_text(task, response_format=response_format, reasoning_guidance="staged")
+    for (
+        style,
+        anon,
+        obs_n,
+        int_n,
+        row_ord,
+        col_ord,
+        shuf_n,
+        legacy_wrapper_mode,
+        config_append_format_hint,
+        reasoning_guidance,
+    ) in configs:
         if obs_n == 0 and int_n == 0 and int(shuf_n) != 1:
             continue
+        config_format_hint_text = str(format_hint_text)
+        if config_format_hint_text == staged_hint:
+            config_format_hint_text = default_format_hint_text(
+                task,
+                response_format=response_format,
+                reasoning_guidance=reasoning_guidance,
+            )
         _base_name, answer_obj, prompt_iter = _iter_cfg_prompts(
             bif_file=str(bif_path),
             num_prompts=int(num_prompts),
@@ -1632,6 +1651,7 @@ def _dataset_from_cd_config_file(
             intervene_vars=str(intervene_vars),
             wrapper_mode=legacy_wrapper_mode,
             append_format_hint=bool(config_append_format_hint),
+            reasoning_guidance=reasoning_guidance,
         )
         adj = answer_obj.get("adjacency_matrix") if isinstance(answer_obj, dict) else None
         variables_out = answer_obj.get("variables") if isinstance(answer_obj, dict) else None
@@ -1687,8 +1707,9 @@ def _dataset_from_cd_config_file(
                         task=task,
                         response_format=response_format,
                         wrap_system_prompt=bool(wrap_system_prompt),
-                        append_format_hint=bool(append_format_hint),
-                        format_hint_text=str(format_hint_text),
+                        append_format_hint=bool(config_append_format_hint),
+                        format_hint_text=config_format_hint_text,
+                        reasoning_guidance=reasoning_guidance,
                         prefill_think=not bool(prefill_answer),
                         prefill_answer=bool(prefill_answer),
                         think_text=str(think_text),
@@ -1716,8 +1737,9 @@ def _dataset_from_cd_config_file(
                 task=task,
                 response_format=response_format,
                 wrap_system_prompt=bool(wrap_system_prompt),
-                append_format_hint=bool(append_format_hint),
-                format_hint_text=str(format_hint_text),
+                append_format_hint=bool(config_append_format_hint),
+                format_hint_text=config_format_hint_text,
+                reasoning_guidance=reasoning_guidance,
                 prefill_think=not bool(prefill_answer),
                 prefill_answer=bool(prefill_answer),
                 think_text=str(think_text),

@@ -10,6 +10,7 @@ except Exception:
 
 LARGE_GRAPH_EDGE_LIST_THRESHOLD = 100
 PROMPT_WRAPPER_MODES = ("plain", "chat")
+REASONING_GUIDANCE_MODES = ("staged", "concise", "none")
 
 
 def get_topological_sort(adj_matrix: List[List[int]]) -> List[int]:
@@ -77,6 +78,21 @@ def resolve_wrapper_mode(
         raise ValueError(
             f"Unsupported wrapper_mode={wrapper_mode!r}. "
             f"Expected one of {PROMPT_WRAPPER_MODES}."
+        )
+    return mode
+
+
+def resolve_reasoning_guidance(
+    *,
+    reasoning_guidance: Optional[str] = None,
+) -> str:
+    mode = str(reasoning_guidance or "").strip().lower()
+    if not mode:
+        return "staged"
+    if mode not in REASONING_GUIDANCE_MODES:
+        raise ValueError(
+            f"Unsupported reasoning_guidance={reasoning_guidance!r}. "
+            f"Expected one of {REASONING_GUIDANCE_MODES}."
         )
     return mode
 
@@ -151,6 +167,32 @@ def build_causal_discovery_method_lines(
     return lines
 
 
+def build_causal_discovery_reasoning_guidance_lines(
+    *,
+    reasoning_guidance: str,
+    has_observational_data: bool,
+    has_interventional_data: bool,
+    require_think_answer_blocks: bool,
+) -> List[str]:
+    mode = resolve_reasoning_guidance(reasoning_guidance=reasoning_guidance)
+    if mode == "none":
+        return []
+    if mode == "concise":
+        return [
+            "\n--- REASONING GUIDANCE ---",
+            (
+                "Reason however you want in the <think>...</think> block, but keep it concise and focused on the causal evidence."
+                if require_think_answer_blocks
+                else "Reason however you want internally, but keep it concise and focused on the causal evidence."
+            ),
+        ]
+    return build_causal_discovery_method_lines(
+        has_observational_data=has_observational_data,
+        has_interventional_data=has_interventional_data,
+        require_think_answer_blocks=require_think_answer_blocks,
+    )
+
+
 def render_prompt_text(
     prompt_text: str,
     *,
@@ -158,6 +200,7 @@ def render_prompt_text(
     wrapper_mode: str = "plain",
     append_format_hint: Optional[bool] = None,
     format_hint_text: Optional[str] = None,
+    reasoning_guidance: str = "staged",
     prefill_think: Optional[bool] = None,
     prefill_answer: bool = False,
     think_text: str = "",
@@ -179,6 +222,7 @@ def render_prompt_text(
         wrap_system_prompt=(mode == "chat"),
         append_format_hint=bool(append_format_hint),
         format_hint_text=resolved_format_hint_text,
+        reasoning_guidance=resolve_reasoning_guidance(reasoning_guidance=reasoning_guidance),
         prefill_think=bool(prefill_think),
         prefill_answer=bool(prefill_answer),
         think_text=think_text,
