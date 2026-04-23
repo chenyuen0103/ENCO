@@ -1,0 +1,22 @@
+{
+  "configs": [
+    {
+      "prompt_style": "summary",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "matrix",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    }
+  ]
+}

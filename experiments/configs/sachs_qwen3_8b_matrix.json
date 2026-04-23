@@ -1,0 +1,31 @@
+{
+  "configs": [
+    {
+      "prompt_style": "matrix",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "matrix",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "matrix",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    }
+  ]
+}

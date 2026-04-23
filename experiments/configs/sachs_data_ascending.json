@@ -1,0 +1,112 @@
+{
+  "configs": [
+    {
+      "style": "matrix",
+      "anonymize": false,
+      "obs_per_prompt": 0,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "matrix",
+      "anonymize": true,
+      "obs_per_prompt": 0,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": false,
+      "obs_per_prompt": 0,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": true,
+      "obs_per_prompt": 0,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "matrix",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "matrix",
+      "anonymize": true,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": true,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "matrix",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "matrix",
+      "anonymize": true,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": false,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "style": "summary",
+      "anonymize": true,
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    }
+  ]
+}
