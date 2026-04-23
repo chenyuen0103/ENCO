@@ -67,7 +67,7 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
-    if cell.style == "summary_joint":
+    if cell.style == "summary":
         tags.append("summary")
     elif cell.style == "matrix":
         tags.append("matrix")
@@ -346,7 +346,7 @@ class BenchmarkRunner:
                 if entry["kind"] == "names_only":
                     config_rows.append(
                         {
-                            "style": "summary_joint",
+                            "style": "summary",
                             "anonymize": False,
                             "obs_per_prompt": 0,
                             "int_per_combo": 0,

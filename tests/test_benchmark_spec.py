@@ -49,7 +49,7 @@ class TestBenchmarkSpec(unittest.TestCase):
         cell = next(
             cell
             for cell in spec.prompt_cells
-            if cell.style == "summary_joint"
+            if cell.style == "summary"
             and cell.obs_per_prompt == 100
             and cell.int_per_combo == 0
             and not cell.anonymize
@@ -62,14 +62,14 @@ class TestBenchmarkSpec(unittest.TestCase):
     def test_external_llm_adapters_bind_to_expected_configs(self) -> None:
         adapters = build_baseline_adapters(Path(".").resolve())
         names_only = PromptCellSpec(style="names_only", obs_per_prompt=0, int_per_combo=0)
-        observational = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=0)
+        observational = PromptCellSpec(style="summary", obs_per_prompt=100, int_per_combo=0)
         anonymized_observational = PromptCellSpec(
-            style="summary_joint",
+            style="summary",
             obs_per_prompt=100,
             int_per_combo=0,
             anonymize=True,
         )
-        summary = PromptCellSpec(style="summary_joint", obs_per_prompt=100, int_per_combo=50)
+        summary = PromptCellSpec(style="summary", obs_per_prompt=100, int_per_combo=50)
         matrix = PromptCellSpec(style="matrix", obs_per_prompt=100, int_per_combo=50)
         self.assertFalse(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), names_only))
         self.assertTrue(adapters["TakayamaSCP"].applies_to(BaselineSpec(name="TakayamaSCP"), observational))

@@ -184,11 +184,11 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         if self.method_name == "CausalLLMPrompt":
             return _is_names_only_cell(cell)
         if self.method_name == "JiralerspongBFS":
-            return (not _is_names_only_cell(cell)) and cell.style == "summary_joint" and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
+            return (not _is_names_only_cell(cell)) and cell.style == "summary" and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "TakayamaSCP":
             return (not _is_names_only_cell(cell)) and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "CausalLLMData":
-            return (not _is_names_only_cell(cell)) and cell.style == "summary_joint"
+            return (not _is_names_only_cell(cell)) and cell.style == "summary"
         return False
 
     def _effective_sample_size_inters(self, baseline: BaselineSpec, cell: PromptCellSpec) -> int:
@@ -289,7 +289,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 "--edge_threshold",
                 str(baseline.edge_threshold),
                 "--prompt_mode",
-                ("summary_joint" if self.method_name == "JiralerspongBFS" else ("names_only" if _is_names_only_cell(cell) else "summary_joint")),
+                ("summary" if self.method_name == "JiralerspongBFS" else ("names_only" if _is_names_only_cell(cell) else "summary")),
                 "--naming_regime",
                 naming_regime,
             ]

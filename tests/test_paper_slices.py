@@ -35,7 +35,7 @@ class TestPaperSlices(unittest.TestCase):
         )
 
         styles = [cell.style for cell in spec.prompt_cells]
-        self.assertEqual(styles, ["summary_joint", "matrix", "summary_joint", "summary_joint"])
+        self.assertEqual(styles, ["summary", "matrix", "summary", "summary"])
         anonymized = [cell.anonymize for cell in spec.prompt_cells]
         self.assertEqual(anonymized, [False, False, False, True])
         ints = [cell.int_per_combo for cell in spec.prompt_cells]
