@@ -1050,6 +1050,9 @@ def _is_trivial_state_names(names: List[str]) -> bool:
     return all(str(s) == str(name) for s, name in enumerate(names))
 
 
+DEFAULT_DISTRIBUTION_DECIMALS = 4
+
+
 def format_prompt_descendants_summary(
     variables: List[str],
     *,
@@ -1061,7 +1064,7 @@ def format_prompt_descendants_summary(
     state_names: Optional[List[List[str]]] = None,
     include_causal_rules: bool = False,
     include_def_int: bool = False,
-    decimals: int = 6,
+    decimals: int = DEFAULT_DISTRIBUTION_DECIMALS,
     anonymize: bool = True,
 ) -> str:
     """
@@ -1356,7 +1359,7 @@ def format_prompt_summary_full_joint(
     include_give_steps: bool = False,
     include_def_int: bool = False,
     # formatting controls
-    decimals: int = 6,
+    decimals: int = DEFAULT_DISTRIBUTION_DECIMALS,
     omitted_are_zero_prob: bool = False,
     include_probabilities: bool = True,
     # readability / size controls

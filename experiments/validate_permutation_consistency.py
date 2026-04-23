@@ -40,6 +40,7 @@ sys.path.insert(0, str(_HERE))
 from build_cd_descendant_tasks import _descendants_from_adj
 from collect_descendant_sft_data import _compute_tv_from_rows, build_descendant_think
 from generate_prompts import (
+    DEFAULT_DISTRIBUTION_DECIMALS,
     format_prompt_descendants_matrix,
     format_prompt_descendants_summary,
     iter_prompts_in_memory,
@@ -329,7 +330,7 @@ def _validate_summary_prompt(
                 idx = int(round(float(row[j])))
                 counts[idx] += 1.0
             denom = float(len(rows)) if rows else 1.0
-            out.append([round(c / denom, 6) for c in counts])
+            out.append([round(c / denom, DEFAULT_DISTRIBUTION_DECIMALS) for c in counts])
         return out
 
     obs_expected = {variables[j]: _marginals(obs_rows_num)[j] for j in range(m)}

@@ -65,6 +65,7 @@ except ModuleNotFoundError:
         validate_sft_example,
     )
 from generate_prompts import (
+    DEFAULT_DISTRIBUTION_DECIMALS,
     format_prompt_descendants_matrix,
     format_prompt_descendants_summary,
     iter_prompts_in_memory,
@@ -77,6 +78,7 @@ def _compute_tv_from_rows(
     intervention_target: str,
     obs_rows_num: List[List[float]],
     intervention_rows_num: List[List[float]],
+    decimals: int = DEFAULT_DISTRIBUTION_DECIMALS,
 ) -> Tuple[List[Tuple[str, float]], int]:
     """Compute TV(obs, do) scores directly from raw rows (used for matrix-style prompts)."""
     n = len(variables)
@@ -115,7 +117,7 @@ def _compute_tv_from_rows(
         if var == intervention_target:
             continue
         p, q = obs_probs[j], do_probs[j]
-        tv = round(0.5 * sum(abs(p[s] - q[s]) for s in range(min(len(p), len(q)))), 6)
+        tv = round(0.5 * sum(abs(p[s] - q[s]) for s in range(min(len(p), len(q)))), decimals)
         tv_scores.append((var, tv))
     tv_scores.sort(key=lambda x: x[1], reverse=True)
     return tv_scores, do_n
