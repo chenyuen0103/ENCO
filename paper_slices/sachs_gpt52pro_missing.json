@@ -1,0 +1,87 @@
+{
+  "name": "sachs_gpt52pro_missing",
+  "role": "supporting",
+  "dataset": "sachs",
+  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "model": "gpt-5.2-pro",
+  "seed": 42,
+  "num_prompts": 3,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 200,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "baselines": [],
+  "notes": "Catch-up-only Sachs manifest for missing gpt-5.2-pro model cells. Uses canonical prompt styles and matches the older cached p=3 runs instead of the full p=5 paper grid."
+}

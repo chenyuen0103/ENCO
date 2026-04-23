@@ -10,7 +10,7 @@
   "shuffles_per_graph": 1,
   "prompt_cells": [
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 1000,
       "int_per_combo": 200,
       "anonymize": false,

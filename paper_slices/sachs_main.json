@@ -10,7 +10,7 @@
   "shuffles_per_graph": 1,
   "prompt_cells": [
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 1000,
       "int_per_combo": 50,
       "anonymize": false,
@@ -34,7 +34,7 @@
       "intervene_vars": "all"
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 1000,
       "int_per_combo": 0,
       "row_order": "random",
@@ -46,7 +46,7 @@
       "anonymize": false
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 1000,
       "int_per_combo": 0,
       "row_order": "random",
@@ -58,7 +58,7 @@
       "anonymize": true
     }
   ],
-  "notes": "Canonical Sachs paper slice: summary_joint vs matrix at obs1000/int50, plus names_only and observational summary_joint controls for CausalLLMPrompt, JiralerspongBFS, TakayamaSCP, PC, and GES.",
+  "notes": "Canonical Sachs paper slice: summary vs matrix at obs1000/int50, plus names_only and observational summary controls for CausalLLMPrompt, JiralerspongBFS, TakayamaSCP, PC, and GES.",
   "names_only": {
     "enabled": true,
     "col_order": "original"
