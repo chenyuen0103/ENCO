@@ -82,8 +82,9 @@ Because this manifest uses in-memory prompting, the full prompt CSVs are not wri
   `CausalLLMPrompt`, and `CausalLLMData`. `CausalLLMPrompt` is a semantic names-only
   baseline, `JiralerspongBFS` is an observational-summary querying baseline, and
   `CausalLLMData` is a one-shot data-backed prompting baseline.
-- `TakayamaSCP` is observational-only and currently requires `provider: "openai"` because it uses
-  token logprobs for faithful yes/no probability extraction.
+- `TakayamaSCP` is observational-only. `provider: "openai"` is the faithful path because it
+  uses token logprobs for yes/no probability extraction. `provider: "illinois"` is also
+  supported as a pragmatic fallback that parses yes/no text responses and uses checkpointed resume.
 - The demo is for authoring evidence, not for headline paper claims.
 
 ## Execution Policy

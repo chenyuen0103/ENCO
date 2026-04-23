@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .interfaces import CommandPlan, Evaluator
 from .schema import EvaluatorSpec
+
+PYTHON_EXE = sys.executable or "python3"
 
 
 @dataclass
@@ -16,7 +19,7 @@ class EvalScriptEvaluator(Evaluator):
 
     def build_eval_command(self, *, response_csv: Path, evaluator: EvaluatorSpec) -> CommandPlan:
         cmd = [
-            "python3",
+            PYTHON_EXE,
             "evaluate.py",
             "--csv",
             str(response_csv),

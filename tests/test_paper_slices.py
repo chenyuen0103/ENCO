@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-import json
 import unittest
 from pathlib import Path
+
+from benchmark_builder.schema import load_benchmark_spec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,28 +18,53 @@ class TestPaperSlices(unittest.TestCase):
         manifests = sorted(SLICES_DIR.glob("*.json"))
         self.assertGreaterEqual(len(manifests), 3)
         for path in manifests:
-            with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            self.assertIn("name", data)
-            self.assertIn("dataset", data)
-            self.assertIn("model", data)
-            self.assertIn("role", data)
+            spec = load_benchmark_spec(path)
+            self.assertTrue(spec.name)
+            self.assertEqual(len(spec.datasets), 1)
+            self.assertTrue(spec.models)
+            self.assertTrue(spec.role)
 
-    def test_sachs_main_has_enco_and_two_cells(self) -> None:
-        path = SLICES_DIR / "sachs_main.json"
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        self.assertEqual(data["dataset"], "sachs")
-        self.assertTrue(data["enco"]["enabled"])
-        styles = [cell["style"] for cell in data["prompt_cells"]]
-        self.assertEqual(styles, ["summary_joint", "matrix"])
+    def test_sachs_main_matches_current_paper_roster(self) -> None:
+        spec = load_benchmark_spec(SLICES_DIR / "sachs_main.json")
+        self.assertEqual(spec.datasets[0].name, "sachs")
+        self.assertTrue(spec.names_only.enabled)
+        baseline_names = [baseline.name for baseline in spec.baselines]
+        self.assertEqual(
+            baseline_names,
+            ["PC", "GES", "ENCO", "CausalLLMPrompt", "JiralerspongBFS", "TakayamaSCP"],
+        )
+
+        styles = [cell.style for cell in spec.prompt_cells]
+        self.assertEqual(styles, ["summary_joint", "matrix", "summary_joint", "summary_joint"])
+        anonymized = [cell.anonymize for cell in spec.prompt_cells]
+        self.assertEqual(anonymized, [False, False, False, True])
+        ints = [cell.int_per_combo for cell in spec.prompt_cells]
+        self.assertEqual(ints, [50, 50, 0, 0])
+
+        scope_by_name = {baseline.name: baseline.scope for baseline in spec.baselines}
+        self.assertEqual(scope_by_name["PC"], "observational")
+        self.assertEqual(scope_by_name["GES"], "observational")
+        self.assertEqual(scope_by_name["ENCO"], "interventional")
+        self.assertEqual(scope_by_name["TakayamaSCP"], "observational")
 
     def test_cancer_manifests_are_smoke_only(self) -> None:
         for name in ["cancer_smoke_summary.json", "cancer_smoke_names_only.json"]:
-            with (SLICES_DIR / name).open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            self.assertEqual(data["dataset"], "cancer")
-            self.assertEqual(data["role"], "smoke")
+            spec = load_benchmark_spec(SLICES_DIR / name)
+            self.assertEqual(spec.datasets[0].name, "cancer")
+            self.assertEqual(spec.role, "smoke")
+
+    def test_compact_breadth_slices_exist(self) -> None:
+        expected = {
+            "asia_compact.json": ("asia", ["PC", "GES", "ENCO", "CausalLLMPrompt", "TakayamaSCP"]),
+            "child_compact.json": ("child", ["PC", "GES", "ENCO", "CausalLLMPrompt"]),
+            "alarm_compact.json": ("alarm", ["PC", "GES", "ENCO", "CausalLLMPrompt"]),
+        }
+        for filename, (dataset_name, baseline_names) in expected.items():
+            spec = load_benchmark_spec(SLICES_DIR / filename)
+            self.assertEqual(spec.datasets[0].name, dataset_name)
+            self.assertEqual(spec.role, "control")
+            self.assertTrue(spec.names_only.enabled)
+            self.assertEqual([baseline.name for baseline in spec.baselines], baseline_names)
 
 
 if __name__ == "__main__":

@@ -550,16 +550,19 @@ def main() -> int:
     parser.add_argument("--sample_size_obs", type=int, default=100)
     parser.add_argument("--sample_size_inters", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out_dir", type=str, default="responses")
+    parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--model", type=str, default="gpt-5-mini")
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--edge_threshold", type=float, default=0.5)
-    parser.add_argument("--prompt_mode", choices=["names_only", "summary"], default="names_only")
+    parser.add_argument("--prompt_mode", choices=["names_only", "summary", "summary_joint"], default="names_only")
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
+
+    if args.prompt_mode == "summary":
+        args.prompt_mode = "summary_joint"
 
     names_only_methods = {"TakayamaSCP", "CausalLLMPrompt"}
     if args.method in names_only_methods and args.prompt_mode != "names_only":
@@ -666,3 +669,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,12 +9,23 @@ from typing import Any
 from .interfaces import BaselineAdapter
 from .schema import BaselineSpec, BenchmarkSpec, DatasetSpec, PromptCellSpec
 
+PYTHON_EXE = sys.executable or "python3"
+
 
 def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
     if dry_run:
         print("[dry-run]", " ".join(str(c) for c in cmd))
         return
     subprocess.run([str(c) for c in cmd], cwd=str(cwd), check=True)
+
+
+def _reuse_if_exists(path: Path, *, dry_run: bool) -> bool:
+    if dry_run:
+        return False
+    if path.exists():
+        print(f"[reuse] {path}")
+        return True
+    return False
 
 
 def _is_names_only_cell(cell: PromptCellSpec) -> bool:
@@ -52,7 +64,7 @@ class ClassicalBaselineAdapter(BaselineAdapter):
             f"predictions_obs{sample_size_obs}_int0_{self.method_name}.csv"
         )
         cmd = [
-            "python3",
+            PYTHON_EXE,
             "run_classical_baselines.py",
             "--method",
             self.method_name,
@@ -87,7 +99,8 @@ class ClassicalBaselineAdapter(BaselineAdapter):
                     str(baseline.ges_min_improvement),
                 ]
             )
-        _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+        if not _reuse_if_exists(out_csv, dry_run=dry_run):
+            _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
         return out_csv
 
 
@@ -123,7 +136,7 @@ class ENCOBaselineAdapter(BaselineAdapter):
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
         sample_size_inters = baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
         cmd = [
-            "python3",
+            PYTHON_EXE,
             "run_exported_graphs.py",
             "--graph_files",
             str(graph_path),
@@ -138,11 +151,13 @@ class ENCOBaselineAdapter(BaselineAdapter):
             "--checkpoint_dir",
             checkpoint_dir,
         ]
-        _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
         dataset_name = graph_path.stem
-        return self.repo_root / "experiments" / "responses" / dataset_name / (
+        out_csv = self.repo_root / "experiments" / "responses" / dataset_name / (
             f"predictions_obs{sample_size_obs}_int{sample_size_inters}_ENCO.csv"
         )
+        if not _reuse_if_exists(out_csv, dry_run=dry_run):
+            _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+        return out_csv
 
 
 @dataclass
@@ -199,7 +214,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
         if self.method_name == "TakayamaSCP":
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "run_takayama_scd.py",
                 "--graph_files",
                 str(graph_path),
@@ -228,7 +243,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
         else:
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "run_external_llm_baselines.py",
                 "--method",
                 self.method_name,
@@ -259,7 +274,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             ]
             if baseline.max_new_tokens is not None:
                 cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
-        _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+        if not _reuse_if_exists(out_csv, dry_run=dry_run):
+            _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
         return out_csv
 
 

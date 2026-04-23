@@ -1,0 +1,87 @@
+{
+  "name": "child_compact",
+  "role": "control",
+  "dataset": "child",
+  "bif_file": "causal_graphs/real_data/small_graphs/child.bif",
+  "model": "gpt-5-mini",
+  "seed": 42,
+  "num_prompts": 3,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "baselines": [
+    {
+      "name": "PC",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "sample_size_obs": 1000,
+      "seed": 42,
+      "pc_variant": "stable",
+      "pc_ci_test": "chi_square",
+      "pc_significance_level": 0.01,
+      "pc_max_cond_vars": 5
+    },
+    {
+      "name": "GES",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "sample_size_obs": 1000,
+      "seed": 42,
+      "ges_scoring_method": "bic-d",
+      "ges_min_improvement": 1e-6
+    },
+    {
+      "name": "ENCO",
+      "enabled": true,
+      "scope": "interventional",
+      "library": "internal",
+      "sample_size_obs": 1000,
+      "sample_size_inters": 50,
+      "max_inters": -1,
+      "seed": 42,
+      "checkpoint_dir": "experiments/checkpoints/paper_slices/child_compact/enco"
+    },
+    {
+      "name": "CausalLLMPrompt",
+      "enabled": true,
+      "scope": "all",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Semantic-only names-only one-shot full-DAG baseline for Child."
+    }
+  ],
+  "notes": "Compact breadth slice for Child: summary-only observational/interventional cells at obs1000 plus names_only."
+}

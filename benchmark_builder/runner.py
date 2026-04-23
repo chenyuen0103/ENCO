@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .schema import BenchmarkSpec, DatasetSpec, ModelSpec, PromptCellSpec, load_
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_EXE = sys.executable or "python3"
 
 
 def _run(plan: CommandPlan, *, dry_run: bool) -> None:
@@ -23,6 +25,15 @@ def _run(plan: CommandPlan, *, dry_run: bool) -> None:
         print("[dry-run]", " ".join(str(c) for c in plan.cmd))
         return
     subprocess.run([str(c) for c in plan.cmd], cwd=str(plan.cwd), check=True)
+
+
+def _reuse_existing(path: Path, *, dry_run: bool, label: str) -> bool:
+    if dry_run:
+        return False
+    if path.exists():
+        print(f"[reuse:{label}] {path}")
+        return True
+    return False
 
 
 def _json_dump(path: Path, payload: dict[str, Any]) -> None:
@@ -56,9 +67,10 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
-    tags.append("thinktags")
-    if cell.style in {"matrix", "summary_joint"}:
-        tags.append(cell.style)
+    if cell.style == "summary_joint":
+        tags.append("summary")
+    elif cell.style == "matrix":
+        tags.append("matrix")
     if cell.row_order != "random":
         tags.append(f"row{cell.row_order}")
     if cell.col_order != "original":
@@ -86,6 +98,14 @@ def _response_name_for_base(base_name: str, model_name: str) -> str:
 def _manifest_hash(spec: BenchmarkSpec) -> str:
     payload = json.dumps(spec.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _merge_response_entries(existing: list[dict[str, Any]], new_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for entry in existing + new_entries:
+        key = str(entry.get("response_csv"))
+        merged[key] = entry
+    return list(merged.values())
 
 
 @dataclass
@@ -149,7 +169,7 @@ class BenchmarkRunner:
         prompt_csv = out_dir / f"{base_name}.csv"
         if self.spec.execution.prompt_storage == "disk":
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "generate_prompts.py",
                 "--graph-file",
                 str(graph_path),
@@ -182,7 +202,8 @@ class BenchmarkRunner:
                 cmd.append("--give-steps")
             if cell.def_int:
                 cmd.append("--def-int")
-            _run(CommandPlan(label=f"build:{dataset.name}:{config_name}", cmd=cmd, cwd=self.experiments_dir), dry_run=dry_run)
+            if not _reuse_existing(prompt_csv, dry_run=dry_run, label="prompt"):
+                _run(CommandPlan(label=f"build:{dataset.name}:{config_name}", cmd=cmd, cwd=self.experiments_dir), dry_run=dry_run)
         return {
             "dataset": dataset.name,
             "kind": "prompt_cell",
@@ -207,8 +228,9 @@ class BenchmarkRunner:
         prompt_csv = out_dir / f"{base_name}.csv"
         if self.spec.execution.prompt_storage == "disk":
             cmd = [
-                "python3",
-                "cd_generation/names_only.py",
+                PYTHON_EXE,
+                "-m",
+                "cd_generation.names_only",
                 "--graph-file",
                 str(graph_path),
                 "--out-dir",
@@ -220,7 +242,8 @@ class BenchmarkRunner:
                 "--col-order",
                 self.spec.names_only.col_order,
             ]
-            _run(CommandPlan(label=f"build:{dataset.name}:names_only", cmd=cmd, cwd=self.experiments_dir), dry_run=dry_run)
+            if not _reuse_existing(prompt_csv, dry_run=dry_run, label="prompt"):
+                _run(CommandPlan(label=f"build:{dataset.name}:names_only", cmd=cmd, cwd=self.experiments_dir), dry_run=dry_run)
         return {
             "dataset": dataset.name,
             "kind": "names_only",
@@ -249,8 +272,9 @@ class BenchmarkRunner:
                 if not model.enabled:
                     continue
                 response_csv = self.experiments_dir / "responses" / entry["dataset"] / _response_name_for_prompt(prompt_csv, model.name)
+                summary_path = Path(str(response_csv) + ".summary.json")
                 query_cmd = [
-                    "python3",
+                    PYTHON_EXE,
                     "query_api.py",
                     "--csv",
                     str(prompt_csv),
@@ -263,8 +287,10 @@ class BenchmarkRunner:
                 ]
                 if overwrite:
                     query_cmd.append("--overwrite")
-                _run(CommandPlan(label=f"query:{entry['dataset']}:{model.name}:{entry['config_name']}", cmd=query_cmd, cwd=self.experiments_dir), dry_run=dry_run)
-                _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
+                if overwrite or not _reuse_existing(response_csv, dry_run=dry_run, label="response"):
+                    _run(CommandPlan(label=f"query:{entry['dataset']}:{model.name}:{entry['config_name']}", cmd=query_cmd, cwd=self.experiments_dir), dry_run=dry_run)
+                if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                    _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(
                         entry=entry,
@@ -280,12 +306,16 @@ class BenchmarkRunner:
                     )
                 )
         if not dry_run:
+            existing_entries: list[dict[str, Any]] = []
+            bundle_path = self.run_root / "response_bundle.json"
+            if bundle_path.exists():
+                existing_entries = json.loads(bundle_path.read_text(encoding="utf-8")).get("entries", [])
             _json_dump(
-                self.run_root / "response_bundle.json",
+                bundle_path,
                 {
                     "schema_version": "response_bundle/v1",
                     "benchmark": self.spec.name,
-                    "entries": response_entries,
+                    "entries": _merge_response_entries(existing_entries, response_entries),
                 },
             )
         return response_entries
@@ -352,7 +382,7 @@ class BenchmarkRunner:
             if not dry_run:
                 _json_dump(config_path, {"configs": config_rows})
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "run_experiment1_in_memory.py",
                 "--bif-file",
                 str(graph_path),
@@ -386,7 +416,9 @@ class BenchmarkRunner:
                         str(entry["prompt_basename"]),
                         model.name,
                     )
-                    _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
+                    summary_path = Path(str(response_csv) + ".summary.json")
+                    if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                        _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                     response_entries.append(
                         self._response_record(
                             entry=entry,
@@ -405,12 +437,16 @@ class BenchmarkRunner:
                     )
 
         if not dry_run:
+            existing_entries: list[dict[str, Any]] = []
+            bundle_path = self.run_root / "response_bundle.json"
+            if bundle_path.exists():
+                existing_entries = json.loads(bundle_path.read_text(encoding="utf-8")).get("entries", [])
             _json_dump(
-                self.run_root / "response_bundle.json",
+                bundle_path,
                 {
                     "schema_version": "response_bundle/v1",
                     "benchmark": self.spec.name,
-                    "entries": response_entries,
+                    "entries": _merge_response_entries(existing_entries, response_entries),
                 },
             )
         return response_entries
@@ -466,7 +502,9 @@ class BenchmarkRunner:
                     spec=self.spec,
                     dry_run=dry_run,
                 )
-                _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
+                summary_path = Path(str(response_csv) + ".summary.json")
+                if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                    _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(
                         entry=entry,
@@ -477,17 +515,16 @@ class BenchmarkRunner:
                     )
                 )
         if not dry_run:
-            existing = {}
             bundle_path = self.run_root / "response_bundle.json"
+            existing_entries: list[dict[str, Any]] = []
             if bundle_path.exists():
-                existing = json.loads(bundle_path.read_text(encoding="utf-8"))
-            merged = list(existing.get("entries", [])) + response_entries
+                existing_entries = json.loads(bundle_path.read_text(encoding="utf-8")).get("entries", [])
             _json_dump(
                 bundle_path,
                 {
                     "schema_version": "response_bundle/v1",
                     "benchmark": self.spec.name,
-                    "entries": merged,
+                    "entries": _merge_response_entries(existing_entries, response_entries),
                 },
             )
         return response_entries
