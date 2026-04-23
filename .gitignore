@@ -143,6 +143,7 @@ checkpoints/*
 *.csv
 *.json
 *.jsonl
+!experiments/configs/*.json
 !benchmark_specs/*.json
 !paper_slices/*.json
 out/
