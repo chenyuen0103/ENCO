@@ -879,6 +879,9 @@ def main():
         for row in rows:
             raw = row.get(RAW_COL, "") or ""
             row["format_ok"] = is_format_ok(raw)
+            pred_existing = row.get(args.pred_col, "") or ""
+            if str(pred_existing).strip():
+                continue
             ans_s = row.get(answer_col, "") or ""
             _A_true_for_vars, vars_for_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
             mat = extract_adjacency_from_response(raw, fallback_variables=vars_for_this)
