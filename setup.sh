@@ -66,7 +66,13 @@ cat <<EOF
 
 Next:
   ${ACTIVATE_HINT}
-  # Experiment 1 (LLM prompt pipeline) dry-run from repo root:
+  # Fastest repo sanity check:
+  python -m unittest tests.test_benchmark_spec tests.test_paper_slices
+
+  # Recommended first benchmark run:
+  python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json --dry-run
+
+  # Legacy experiment pipeline (still supported):
   python experiments/run_experiment1_pipeline.py --dry-run \\
     --bif-file causal_graphs/real_data/small_graphs/cancer.bif \\
     --dataset cancer \\
@@ -76,6 +82,7 @@ Next:
 LLM notes:
   - Export OPENAI_API_KEY for OpenAI runs.
   - Export GOOGLE_API_KEY (or GEMINI_API_KEY) for Gemini runs.
+  - Export ILLINOIS_CHAT_API for Illinois-backed runs.
 
 Torch notes:
   - This installs a default torch build from pip. If you want GPU PyTorch, install the

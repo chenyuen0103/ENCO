@@ -29,7 +29,10 @@ class TestBenchmarkSpec(unittest.TestCase):
         self.assertEqual(len(spec.datasets), 1)
         self.assertEqual(spec.datasets[0].name, "sachs")
         self.assertEqual(spec.models[0].name, "gpt-5-mini")
-        self.assertEqual(spec.baselines[0].name, "ENCO")
+        self.assertEqual(
+            [baseline.name for baseline in spec.baselines],
+            ["PC", "GES", "ENCO", "CausalLLMPrompt", "JiralerspongBFS", "TakayamaSCP"],
+        )
 
     def test_registry_resolves_named_manifest(self) -> None:
         registry = BenchmarkRegistry()
@@ -53,7 +56,7 @@ class TestBenchmarkSpec(unittest.TestCase):
         )
         self.assertEqual(
             _prompt_base_name(cell=cell, num_prompts=spec.num_prompts, shuffles_per_graph=spec.shuffles_per_graph),
-            "prompts_obs100_int0_shuf1_p5_thinktags_summary_joint",
+            "prompts_obs100_int0_shuf1_p5_summary",
         )
 
     def test_external_llm_adapters_bind_to_expected_configs(self) -> None:

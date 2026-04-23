@@ -557,9 +557,12 @@ def main() -> int:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--edge_threshold", type=float, default=0.5)
-    parser.add_argument("--prompt_mode", choices=["names_only", "summary"], default="names_only")
+    parser.add_argument("--prompt_mode", choices=["names_only", "summary", "summary_joint"], default="names_only")
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
+
+    if args.prompt_mode == "summary":
+        args.prompt_mode = "summary_joint"
 
     names_only_methods = {"TakayamaSCP", "CausalLLMPrompt"}
     if args.method in names_only_methods and args.prompt_mode != "names_only":

@@ -1,30 +1,18 @@
 {
-  "name": "sachs_main",
-  "role": "main",
-  "dataset": "sachs",
-  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "name": "asia_compact",
+  "role": "control",
+  "dataset": "asia",
+  "bif_file": "causal_graphs/real_data/small_graphs/asia.bif",
   "model": "gpt-5-mini",
   "seed": 42,
-  "num_prompts": 5,
+  "num_prompts": 3,
   "temperature": 0.0,
   "shuffles_per_graph": 1,
   "prompt_cells": [
     {
       "style": "summary_joint",
       "obs_per_prompt": 100,
-      "int_per_combo": 50,
-      "anonymize": false,
-      "row_order": "random",
-      "col_order": "original",
-      "causal_rules": false,
-      "give_steps": false,
-      "def_int": false,
-      "intervene_vars": "all"
-    },
-    {
-      "style": "matrix",
-      "obs_per_prompt": 100,
-      "int_per_combo": 50,
+      "int_per_combo": 0,
       "anonymize": false,
       "row_order": "random",
       "col_order": "original",
@@ -36,29 +24,16 @@
     {
       "style": "summary_joint",
       "obs_per_prompt": 100,
-      "int_per_combo": 0,
+      "int_per_combo": 50,
+      "anonymize": false,
       "row_order": "random",
       "col_order": "original",
       "causal_rules": false,
       "give_steps": false,
       "def_int": false,
-      "intervene_vars": "all",
-      "anonymize": false
-    },
-    {
-      "style": "summary_joint",
-      "obs_per_prompt": 100,
-      "int_per_combo": 0,
-      "row_order": "random",
-      "col_order": "original",
-      "causal_rules": false,
-      "give_steps": false,
-      "def_int": false,
-      "intervene_vars": "all",
-      "anonymize": true
+      "intervene_vars": "all"
     }
   ],
-  "notes": "Canonical Sachs paper slice: summary_joint vs matrix at obs100/int50, plus names_only and observational summary_joint controls for CausalLLMPrompt, JiralerspongBFS, TakayamaSCP, PC, and GES.",
   "names_only": {
     "enabled": true,
     "col_order": "original"
@@ -95,7 +70,7 @@
       "sample_size_inters": 50,
       "max_inters": -1,
       "seed": 42,
-      "checkpoint_dir": "experiments/checkpoints/paper_slices/sachs_main/enco"
+      "checkpoint_dir": "experiments/checkpoints/paper_slices/asia_compact/enco"
     },
     {
       "name": "CausalLLMPrompt",
@@ -105,17 +80,7 @@
       "provider": "auto",
       "temperature": 0.0,
       "num_samples": 1,
-      "notes": "Semantic-only names-only one-shot full-DAG baseline for Sachs."
-    },
-    {
-      "name": "JiralerspongBFS",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-5-mini",
-      "provider": "auto",
-      "temperature": 0.0,
-      "num_samples": 1,
-      "notes": "Observational-summary BFS-style querying baseline for Sachs."
+      "notes": "Semantic-only names-only one-shot full-DAG baseline for Asia."
     },
     {
       "name": "TakayamaSCP",
@@ -126,8 +91,9 @@
       "temperature": 0.0,
       "num_samples": 5,
       "takayama_pattern": 2,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Observational-only combined-information PC-based Takayama baseline for Sachs."
+      "takayama_bootstrap_samples": 50,
+      "notes": "Compact combined-information observational baseline for Asia."
     }
-  ]
+  ],
+  "notes": "Compact breadth slice for Asia: summary-only observational/interventional cells plus names_only."
 }

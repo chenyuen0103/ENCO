@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .schema import BenchmarkSpec, DatasetSpec, ModelSpec, PromptCellSpec, load_
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_EXE = sys.executable or "python3"
 
 
 def _run(plan: CommandPlan, *, dry_run: bool) -> None:
@@ -56,9 +58,10 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
-    tags.append("thinktags")
-    if cell.style in {"matrix", "summary_joint"}:
-        tags.append(cell.style)
+    if cell.style == "summary_joint":
+        tags.append("summary")
+    elif cell.style == "matrix":
+        tags.append("matrix")
     if cell.row_order != "random":
         tags.append(f"row{cell.row_order}")
     if cell.col_order != "original":
@@ -149,7 +152,7 @@ class BenchmarkRunner:
         prompt_csv = out_dir / f"{base_name}.csv"
         if self.spec.execution.prompt_storage == "disk":
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "generate_prompts.py",
                 "--graph-file",
                 str(graph_path),
@@ -207,8 +210,9 @@ class BenchmarkRunner:
         prompt_csv = out_dir / f"{base_name}.csv"
         if self.spec.execution.prompt_storage == "disk":
             cmd = [
-                "python3",
-                "cd_generation/names_only.py",
+                PYTHON_EXE,
+                "-m",
+                "cd_generation.names_only",
                 "--graph-file",
                 str(graph_path),
                 "--out-dir",
@@ -250,7 +254,7 @@ class BenchmarkRunner:
                     continue
                 response_csv = self.experiments_dir / "responses" / entry["dataset"] / _response_name_for_prompt(prompt_csv, model.name)
                 query_cmd = [
-                    "python3",
+                    PYTHON_EXE,
                     "query_api.py",
                     "--csv",
                     str(prompt_csv),
@@ -352,7 +356,7 @@ class BenchmarkRunner:
             if not dry_run:
                 _json_dump(config_path, {"configs": config_rows})
             cmd = [
-                "python3",
+                PYTHON_EXE,
                 "run_experiment1_in_memory.py",
                 "--bif-file",
                 str(graph_path),

@@ -60,6 +60,8 @@ Environment variables:
 
 - `OPENAI_API_KEY` for OpenAI-backed querying
 - `GOOGLE_API_KEY` or `GEMINI_API_KEY` for Gemini-backed querying
+- `ILLINOIS_CHAT_API` for Illinois-backed querying
+- optional `ILLINOIS_CHAT_COURSE` (defaults to `llm_cd`)
 
 ## Data Assets
 
@@ -93,6 +95,42 @@ Pick the workflow that matches your goal:
 | Evaluate a finetuned / local model | `eval_sft_on_jsonl.py` |
 | Generate prompts only (single graph, no querying) | `generate_prompts.py` |
 | Query a prompt CSV without the full pipeline | `query_api.py` |
+
+## Recommended Start for New Researchers
+
+If you are new to the repo, start with the manifest-driven workflow rather than
+the older script-by-script pipeline.
+
+1. Set up the environment.
+2. Run the focused Sachs paper slice:
+
+```bash
+python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json
+```
+
+3. Inspect the reusable benchmark suite before running it:
+
+```bash
+python scripts/run_benchmark.py --manifest benchmark_specs/reference_suite.json --dry-run
+```
+
+4. Run the small validation suite before editing manifests or adapters:
+
+```bash
+python -m unittest \
+  tests.test_benchmark_spec \
+  tests.test_paper_slices \
+  tests.test_external_llm_baselines \
+  tests.test_takayama_scd
+```
+
+This is the shortest path to the current architecture:
+
+- `benchmark_specs/`: reusable benchmark definitions
+- `paper_slices/`: frozen paper-facing manifests
+- `benchmark_builder/`: schema, adapters, orchestration, evaluation
+- `scripts/run_benchmark.py`: reusable entrypoint
+- `scripts/run_paper_slice.py`: paper-facing compatibility wrapper
 
 ## Main Workflows
 
@@ -183,6 +221,13 @@ python experiments/evaluate.py \
 `evaluate.py` prints mean precision, recall, F1, and SHD (structural Hamming
 distance) to stdout and writes a per-row metrics CSV alongside the input file.
 Pass `--summary-csv path/to/summary.csv` to accumulate results across runs.
+
+`TakayamaSCP` is implemented separately in `experiments/run_takayama_scd.py`.
+It is observational-only, supports checkpoint/resume for the pairwise LLM stage,
+and can run with:
+
+- `provider=openai` for the faithful logprob-based path
+- `provider=illinois` for a practical fallback that parses yes/no text answers and retries transient HTTP failures
 
 ### 5. Build mixed prompt/answer CSV datasets
 
