@@ -11,7 +11,7 @@
   "prompt_cells": [
     {
       "style": "summary_joint",
-      "obs_per_prompt": 100,
+      "obs_per_prompt": 1000,
       "int_per_combo": 50,
       "anonymize": false,
       "row_order": "random",
@@ -23,7 +23,7 @@
     },
     {
       "style": "matrix",
-      "obs_per_prompt": 100,
+      "obs_per_prompt": 1000,
       "int_per_combo": 50,
       "anonymize": false,
       "row_order": "random",
@@ -35,7 +35,7 @@
     },
     {
       "style": "summary_joint",
-      "obs_per_prompt": 100,
+      "obs_per_prompt": 1000,
       "int_per_combo": 0,
       "row_order": "random",
       "col_order": "original",
@@ -47,7 +47,7 @@
     },
     {
       "style": "summary_joint",
-      "obs_per_prompt": 100,
+      "obs_per_prompt": 1000,
       "int_per_combo": 0,
       "row_order": "random",
       "col_order": "original",
@@ -58,7 +58,7 @@
       "anonymize": true
     }
   ],
-  "notes": "Canonical Sachs paper slice: summary_joint vs matrix at obs100/int50, plus names_only and observational summary_joint controls for CausalLLMPrompt, JiralerspongBFS, TakayamaSCP, PC, and GES.",
+  "notes": "Canonical Sachs paper slice: summary_joint vs matrix at obs1000/int50, plus names_only and observational summary_joint controls for CausalLLMPrompt, JiralerspongBFS, TakayamaSCP, PC, and GES.",
   "names_only": {
     "enabled": true,
     "col_order": "original"
@@ -69,7 +69,7 @@
       "enabled": true,
       "scope": "observational",
       "library": "pgmpy",
-      "sample_size_obs": 100,
+      "sample_size_obs": 1000,
       "seed": 42,
       "pc_variant": "stable",
       "pc_ci_test": "chi_square",
@@ -81,7 +81,7 @@
       "enabled": true,
       "scope": "observational",
       "library": "pgmpy",
-      "sample_size_obs": 100,
+      "sample_size_obs": 1000,
       "seed": 42,
       "ges_scoring_method": "bic-d",
       "ges_min_improvement": 1e-6
@@ -91,7 +91,7 @@
       "enabled": true,
       "scope": "interventional",
       "library": "internal",
-      "sample_size_obs": 100,
+      "sample_size_obs": 1000,
       "sample_size_inters": 50,
       "max_inters": -1,
       "seed": 42,

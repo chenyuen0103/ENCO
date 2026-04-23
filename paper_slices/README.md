@@ -22,8 +22,8 @@ python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json
 
 The current `sachs_main.json` slice is intentionally small and benchmark-native:
 
-- `summary_joint` and `matrix` at `obs=100, int=50`
-- observational `summary_joint` controls at `obs=100, int=0` for real and anonymized names
+- `summary_joint` and `matrix` at `obs=1000, int=50`
+- observational `summary_joint` controls at `obs=1000, int=0` for real and anonymized names
 - `names_only` enabled
 - baselines: `PC`, `GES`, `ENCO`, `CausalLLMPrompt`, `JiralerspongBFS`, `TakayamaSCP`
 
@@ -34,8 +34,8 @@ Additional compact breadth slices are available for:
 - `alarm_compact.json`
 
 These are intended for the multi-graph breadth block in the paper. They keep
-only `summary_joint` observational/interventional cells plus `names_only` so
-they are cheaper to run than the Sachs main slice.
+only `summary_joint` observational/interventional cells at `obs=1000` plus
+`names_only` so they are cheaper to run than the Sachs main slice.
 
 For new benchmark definitions, prefer:
 
