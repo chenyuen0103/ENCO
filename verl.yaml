@@ -1,0 +1,51 @@
+name: verl
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - cmake
+  - ninja
+  - packaging>=24,<26
+  - numpy<2
+  - pandas
+  - scipy
+  - pyarrow>=19
+  - fsspec
+  - tqdm
+  - pip:
+      # Core model / training stack for local VERL GRPO runs.
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - torchaudio==2.8.0
+      - transformers==4.57.1
+      - tokenizers==0.22.2
+      - sentencepiece>=0.2.0,<0.3
+      - safetensors>=0.6.0,<0.7
+      - accelerate==1.12.0
+      - datasets==4.3.0
+      - peft==0.18.1
+      - huggingface_hub>=0.34,<1
+      - protobuf>=5,<7
+
+      # VERL runtime.
+      - hydra-core==1.3.2
+      - ray[default]>=2.41,<2.60
+      - tensordict>=0.8.0,<=0.10.0,!=0.9.0
+      - torchdata==0.11.0
+      - wandb>=0.19,<1
+      - tensorboard
+      - pylatexenc==2.10
+
+      # vLLM rollouts used by the repo's VERL GRPO scripts.
+      - vllm
+
+      # Install the local VERL checkout instead of pinning a published wheel.
+      # Run `conda env create -f verl.yaml` from the repo root so this resolves.
+      - -e ./verl
+
+      # Optional packages:
+      # - flash-attn -- enable if you want FlashAttention 2 paths
+      # - math-verify -- only needed for math rewards in experiments/verifier_verl.py

@@ -14,6 +14,7 @@ import inspect
 import shlex
 import warnings
 import shutil
+import signal
 from typing import Any
 from contextlib import redirect_stdout, redirect_stderr
 import torch
@@ -99,6 +100,17 @@ def _has_full_model_config(model_dir: Path) -> bool:
     return (model_dir / "config.json").exists() or (model_dir / "params.json").exists()
 
 
+def _has_tokenizer_assets(model_dir: Path) -> bool:
+    model_dir = Path(model_dir)
+    required_any = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "spiece.model",
+    ]
+    return any((model_dir / filename).exists() for filename in required_any)
+
+
 def _is_adapter_dir(model_dir: Path) -> bool:
     return (Path(model_dir) / "adapter_config.json").exists()
 
@@ -112,9 +124,11 @@ def _merge_adapter_for_vllm(model_dir: Path, *, base_model_override: str | None 
     """
     model_dir = Path(model_dir).resolve()
     merged_dir = model_dir.parent / f"{model_dir.name}_merged_vllm"
-    if _has_full_model_config(merged_dir):
+    if _has_full_model_config(merged_dir) and _has_tokenizer_assets(merged_dir):
         print(f"[vllm] reusing existing merged model for adapter checkpoint: {merged_dir}")
         return merged_dir
+    if _has_full_model_config(merged_dir) and not _has_tokenizer_assets(merged_dir):
+        print(f"[vllm] merged model missing tokenizer assets; repairing: {merged_dir}")
 
     from peft import PeftModel
 
@@ -125,7 +139,7 @@ def _merge_adapter_for_vllm(model_dir: Path, *, base_model_override: str | None 
             f"Cannot merge adapter {model_dir}: no base model override was provided and "
             "adapter_config.json does not declare base_model_name_or_path"
         )
-    tokenizer_source = Path(base_model_name) if Path(base_model_name).exists() else Path(str(base_model_name))
+    tokenizer_source = Path(base_model_name).expanduser()
 
     print(f"[vllm] merging adapter for vLLM: {model_dir} -> {merged_dir}")
     base = AutoModelForCausalLM.from_pretrained(
@@ -149,10 +163,21 @@ def _merge_adapter_for_vllm(model_dir: Path, *, base_model_override: str | None 
         "merges.txt",
         "spiece.model",
     ]
+    copied_tokenizer_files = 0
     for filename in tokenizer_files:
         src = tokenizer_source / filename
         if src.exists():
             shutil.copy2(src, merged_dir / filename)
+            copied_tokenizer_files += 1
+
+    if copied_tokenizer_files == 0:
+        # Remote model IDs such as "Qwen/Qwen3-4B-Thinking-2507" do not map to a
+        # local directory, so copy-by-path leaves the merged checkpoint without any
+        # tokenizer assets. Materialize the base tokenizer explicitly instead.
+        print(f"[vllm] saving tokenizer assets from base model: {base_model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(str(base_model_name), trust_remote_code=True)
+        tokenizer.save_pretrained(str(merged_dir))
+
     chat_template_src = model_dir / "chat_template.jinja"
     if chat_template_src.exists():
         shutil.copy2(chat_template_src, merged_dir / "chat_template.jinja")
@@ -347,6 +372,41 @@ def _resolve_model_reference_for_attention(args) -> str:
         except Exception:
             pass
     return model_id
+
+
+def _resolve_tokenizer_source(model_ref: str, *, base_model_override: str | None = None) -> tuple[str, Path | None]:
+    """
+    Resolve which tokenizer to load for a model reference.
+
+    PEFT adapter directories may ship tokenizer_config.json variants that are not
+    accepted by the currently installed Transformers version. In that case, use
+    the base model tokenizer and then overlay any adapter chat template.
+    """
+    model_path = Path(str(model_ref)).expanduser()
+    if model_path.exists() and _is_adapter_dir(model_path):
+        adapter_cfg = json.loads((model_path / "adapter_config.json").read_text(encoding="utf-8"))
+        base_model_name = str(base_model_override or adapter_cfg.get("base_model_name_or_path") or "").strip()
+        if not base_model_name:
+            raise ValueError(
+                f"Cannot resolve tokenizer source for adapter {model_path}: "
+                "no base model override was provided and adapter_config.json does not "
+                "declare base_model_name_or_path"
+            )
+        return base_model_name, model_path
+    return str(model_ref), model_path if model_path.exists() else None
+
+
+def _load_tokenizer(model_ref: str, *, base_model_override: str | None = None):
+    tokenizer_source, overlay_dir = _resolve_tokenizer_source(
+        model_ref,
+        base_model_override=base_model_override,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True, trust_remote_code=True)
+    if overlay_dir is not None:
+        chat_template_path = overlay_dir / "chat_template.jinja"
+        if chat_template_path.exists():
+            tokenizer.chat_template = chat_template_path.read_text(encoding="utf-8")
+    return tokenizer
 
 
 def _resolve_attn_implementation(args) -> str:
@@ -1863,7 +1923,7 @@ def _eval_on_dataset(
     progress_payload_base: dict | None = None,
     enable_thinking: bool = False,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True)
+    tokenizer = _load_tokenizer(model_id_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -2279,6 +2339,37 @@ def _build_trl_vllm_serve_cmd(args, host: str, port: int):
     return cmd
 
 
+def _terminate_process_group(proc: subprocess.Popen | None, *, label: str, timeout_s: float = 10.0) -> None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=timeout_s)
+        return
+    except Exception:
+        pass
+
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
 def _maybe_launch_local_vllm_and_reexec_train(args):
     if args.mode != "train" or not args.use_vllm or not args.auto_launch_vllm_server:
         return
@@ -2309,6 +2400,8 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
     server_env = os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = server_gpu
     log_file = open(args.vllm_server_log_file, "w", encoding="utf-8")
+    server_proc: subprocess.Popen | None = None
+    child_proc: subprocess.Popen | None = None
 
     server_cmd = _build_trl_vllm_serve_cmd(args, host=host, port=port)
     try:
@@ -2317,6 +2410,7 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
             env=server_env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         log_file.close()
@@ -2359,7 +2453,12 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
             f"server url={args.vllm_server_base_url}"
         )
         try:
-            rc = subprocess.call(child_cmd, env=child_env)
+            child_proc = subprocess.Popen(
+                child_cmd,
+                env=child_env,
+                start_new_session=True,
+            )
+            rc = child_proc.wait()
         except FileNotFoundError as exc:
             if child_cmd and child_cmd[0] == "accelerate":
                 raise RuntimeError(
@@ -2369,14 +2468,8 @@ def _maybe_launch_local_vllm_and_reexec_train(args):
             raise
         raise SystemExit(rc)
     finally:
-        try:
-            server_proc.terminate()
-            server_proc.wait(timeout=10)
-        except Exception:
-            try:
-                server_proc.kill()
-            except Exception:
-                pass
+        _terminate_process_group(child_proc, label="training child")
+        _terminate_process_group(server_proc, label="vLLM server")
         log_file.close()
 
 
@@ -2582,7 +2675,10 @@ def run_train(args, argv: list[str] | None = None):
     _log_startup_timing("W&B setup")
 
     # ---- Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
+    tokenizer = _load_tokenizer(
+        args.model_id,
+        base_model_override=getattr(args, "base_model_override", None),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
