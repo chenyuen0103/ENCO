@@ -3,6 +3,7 @@ import re
 import argparse
 import json
 import logging
+import math
 import time
 import socket
 import gc
@@ -73,6 +74,7 @@ from verifier_cd import (
     build_cd_skeleton_f1_reward,
     build_cd_vstruct_f1_reward,
     build_cd_orientation_f1_reward,
+    build_cd_descendant_consistency_reward,
     build_length_penalty_reward,
     build_cd_stage_targets,
     completion_to_text as cd_completion_to_text,
@@ -93,6 +95,11 @@ except Exception:
 
 FORMAT_RE = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+ANSWER_END_RE = re.compile(r"</answer>\s*$")
+
+
+def _completion_ended_with_answer_tag(text: str) -> bool:
+    return bool(ANSWER_END_RE.search(str(text or "")))
 
 
 def _has_full_model_config(model_dir: Path) -> bool:
@@ -383,6 +390,8 @@ def _resolve_tokenizer_source(model_ref: str, *, base_model_override: str | None
     the base model tokenizer and then overlay any adapter chat template.
     """
     model_path = Path(str(model_ref)).expanduser()
+    if _looks_like_local_model_ref(model_ref) and not model_path.exists():
+        raise FileNotFoundError(f"Local model/checkpoint path not found: {model_path}")
     if model_path.exists() and _is_adapter_dir(model_path):
         adapter_cfg = json.loads((model_path / "adapter_config.json").read_text(encoding="utf-8"))
         base_model_name = str(base_model_override or adapter_cfg.get("base_model_name_or_path") or "").strip()
@@ -394,6 +403,15 @@ def _resolve_tokenizer_source(model_ref: str, *, base_model_override: str | None
             )
         return base_model_name, model_path
     return str(model_ref), model_path if model_path.exists() else None
+
+
+def _looks_like_local_model_ref(model_ref: str) -> bool:
+    s = str(model_ref).strip()
+    if not s:
+        return False
+    if s.startswith((".", "/", "~")):
+        return True
+    return os.sep in s or (os.altsep is not None and os.altsep in s)
 
 
 def _load_tokenizer(model_ref: str, *, base_model_override: str | None = None):
@@ -686,6 +704,39 @@ class RewardExtremaCallback(TrainerCallback):
                 for key, value in payload.items():
                     wandb_payload[f"train/{key}"] = value
                 _wandb.log(wandb_payload, step=int(state.global_step))
+        except Exception:
+            pass
+
+
+class TotalRewardWandbCallback(TrainerCallback):
+    """Mirror TRL's aggregate reward under explicit total-reward metric names."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_local_process_zero or not logs:
+            return
+
+        reward = logs.get("reward")
+        if reward is None:
+            return
+
+        try:
+            reward_total = float(reward)
+        except (TypeError, ValueError):
+            return
+
+        # Keep the JSON/JSONL logs explicit too; callbacks receive the same logs dict.
+        logs["reward_total"] = reward_total
+
+        try:
+            import wandb as _wandb
+            if _wandb.run is not None:
+                _wandb.log(
+                    {
+                        "reward_total": reward_total,
+                        "train/reward_total": reward_total,
+                    },
+                    step=int(state.global_step),
+                )
         except Exception:
             pass
 
@@ -1112,6 +1163,12 @@ def build_argparser():
         type=float,
         default=0.0,
         help="Hard reward: directed edge F1 parsed from Stage 3 of <think> vs ground truth (0 disables).",
+    )
+    p.add_argument(
+        "--cd-descendant-consistency-reward-scale",
+        type=float,
+        default=0.0,
+        help="Optional reward for intervention-local descendant consistency implied by the final predicted graph.",
     )
     p.add_argument(
         "--cd-descendant-cot-structure-reward-scale",
@@ -1740,7 +1797,11 @@ def _score_answer_with_meta(answer_text: str, solution: str):
 
 
 def _load_eval_model(model_id_or_path: str):
-    is_adapter = (Path(model_id_or_path) / "adapter_config.json").exists()
+    model_path = Path(model_id_or_path).expanduser()
+    if _looks_like_local_model_ref(model_id_or_path) and not model_path.exists():
+        raise FileNotFoundError(f"Local model/checkpoint path not found: {model_path}")
+
+    is_adapter = (model_path / "adapter_config.json").exists()
     if is_adapter:
         from peft import AutoPeftModelForCausalLM
 
@@ -1749,7 +1810,7 @@ def _load_eval_model(model_id_or_path: str):
         # "TypeError: unhashable type: 'set'". For eval we can place the adapter
         # model on a single CUDA device when available.
         model = AutoPeftModelForCausalLM.from_pretrained(
-            model_id_or_path,
+            str(model_path),
             dtype="auto",
         ).eval()
         if torch.cuda.is_available():
@@ -1758,7 +1819,7 @@ def _load_eval_model(model_id_or_path: str):
         return model
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id_or_path,
+        str(model_path),
         dtype="auto",
         device_map="auto",
     ).eval()
@@ -3011,6 +3072,10 @@ def run_train(args, argv: list[str] | None = None):
             reward_funcs.append(build_cd_vstruct_f1_reward(scale=float(args.cd_vstruct_f1_reward_scale)))
         if float(args.cd_orientation_f1_reward_scale) > 0.0:
             reward_funcs.append(build_cd_orientation_f1_reward(scale=float(args.cd_orientation_f1_reward_scale)))
+        if float(args.cd_descendant_consistency_reward_scale) > 0.0:
+            reward_funcs.append(
+                build_cd_descendant_consistency_reward(scale=float(args.cd_descendant_consistency_reward_scale))
+            )
         reward_funcs.append(cd_graph_reward)
     elif args.task == "cd_descendants":
         if float(args.cd_format_reward_scale) > 0.0:
@@ -3282,6 +3347,7 @@ def run_train(args, argv: list[str] | None = None):
                     "completion_truncated_for_eval_log": int(completion_log_text != str(completion_text or "")),
                     "answer_text_truncated_for_eval_log": int(answer_log_text != str(answer_text or "")),
                     "format_ok_scored_on_full_completion": 1,
+                    "ended_with_answer_tag": int(_completion_ended_with_answer_tag(completion_text)),
                     "rewards": {},
                     "_sampled_for_log": i in sampled_indices,
                     "_sample_completion_full": str(completion_text or "") if i in sampled_indices else "",
@@ -3301,12 +3367,14 @@ def run_train(args, argv: list[str] | None = None):
             eval_file = eval_response_log_path.open("a", encoding="utf-8") if decision.get("persist_eval") else None
             step_totals = []
             step_reward_values = {}
+            step_answer_tag_flags = []
             try:
                 for key in emit_keys:
                     row = pending_reward_rows.pop(key)
                     rewards_map = row.get("rewards", {})
                     row["reward_total"] = float(sum(float(v) for v in rewards_map.values()))
                     step_totals.append(float(row["reward_total"]))
+                    step_answer_tag_flags.append(int(row.get("ended_with_answer_tag", 0)))
                     for reward_key, reward_value in rewards_map.items():
                         step_reward_values.setdefault(str(reward_key), []).append(float(reward_value))
                     if eval_file is not None:
@@ -3323,6 +3391,7 @@ def run_train(args, argv: list[str] | None = None):
                             "prompt_key": row["prompt_key"],
                             "format_ok": row["format_ok"],
                             "format_ok_scored_on_full_completion": row["format_ok_scored_on_full_completion"],
+                            "ended_with_answer_tag": row["ended_with_answer_tag"],
                             "prompt": _truncate_sample_text(row["prompt"]),
                             "prompt_model_input": _truncate_sample_text(row["prompt_model_input"]),
                             "completion": _sanitize_for_log(row.get("_sample_completion_full", row["completion"]), 0),
@@ -3340,6 +3409,12 @@ def run_train(args, argv: list[str] | None = None):
                 if step_totals:
                     payload["reward_min"] = min(step_totals)
                     payload["reward_max"] = max(step_totals)
+                    payload["reward_total/min"] = payload["reward_min"]
+                    payload["reward_total/max"] = payload["reward_max"]
+                if step_answer_tag_flags:
+                    payload["ended_with_answer_tag_rate"] = (
+                        sum(step_answer_tag_flags) / len(step_answer_tag_flags)
+                    )
                 for reward_key, values in step_reward_values.items():
                     if not values:
                         continue
@@ -3532,6 +3607,7 @@ def run_train(args, argv: list[str] | None = None):
                 shd_scale=float(args.cd_low_shd_reward_scale),
             ),
             RewardExtremaCallback(reward_extrema_snapshot),
+            TotalRewardWandbCallback(),
             TrainStateSnapshotCallback(train_state_snapshot),
             SaveLaunchCommandCallback(argv),
         ]
@@ -3540,12 +3616,14 @@ def run_train(args, argv: list[str] | None = None):
             if args.train_log_jsonl
             else (logs_dir / "train_metrics.jsonl")
         )
-        metrics_json_path = metrics_jsonl_path.with_suffix(".json")
         metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-        callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
-        callbacks.append(JsonMetricsCallback(str(metrics_json_path)))
-        print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
-        print(f"[train] JSON logging enabled: {metrics_json_path}")
+        metrics_suffix = metrics_jsonl_path.suffix.lower()
+        if metrics_suffix == ".json":
+            callbacks.append(JsonMetricsCallback(str(metrics_jsonl_path)))
+            print(f"[train] JSON logging enabled: {metrics_jsonl_path}")
+        else:
+            callbacks.append(JsonlMetricsCallback(str(metrics_jsonl_path)))
+            print(f"[train] JSONL logging enabled: {metrics_jsonl_path}")
 
         # Debug: verify the prompt the model actually sees (with special tokens)
         if int(os.environ.get("RANK", "0")) == 0:
