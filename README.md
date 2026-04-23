@@ -263,7 +263,33 @@ python experiments/export_cd_train_eval_csv.py \
   --eval-csv experiments/data/sft_eval_child.csv
 ```
 
-### 7. Convert prompt CSVs into SFT JSONL
+### 7. Generate SFT train/eval data in one command
+
+`run_scripts/generate_sft_data.sh` wraps the full Sachs eval export plus JSONL
+conversion pipeline. By default it writes:
+
+- `experiments/data/grpo_sachs_train.csv`
+- `experiments/data/sft_eval_child.csv`
+- `experiments/data/format_sft_stages_v4_mixed.jsonl`
+- `experiments/data/sft_eval.jsonl`
+
+```bash
+bash experiments/run_scripts/generate_sft_data.sh
+```
+
+Useful overrides:
+
+```bash
+REASONING_TARGET=stages \
+TRAIN_JSONL=experiments/data/format_sft_strict_v4_mixed.jsonl \
+EVAL_JSONL=experiments/data/sft_eval.jsonl \
+bash experiments/run_scripts/generate_sft_data.sh
+```
+
+The Sachs config uses `col_order=random` for the names-only prompt so the
+train/eval export stays leak-free across different seeds.
+
+### 8. Convert prompt CSVs into SFT JSONL
 
 `collect_format_sft_data.py` converts prompt/answer CSV rows into
 chat-formatted SFT records with `<think>...</think><answer>...</answer>`.
@@ -281,7 +307,21 @@ python experiments/collect_format_sft_data.py \
   --seed 42
 ```
 
-### 8. Evaluate a finetuned SFT / LoRA model
+Held-out eval JSONL from the exported Sachs CSV:
+
+```bash
+python experiments/collect_format_sft_data.py \
+  --output experiments/data/sft_eval.jsonl \
+  --csv experiments/data/sft_eval_child.csv:sft_eval_child \
+  --prompt-col prompt_text \
+  --answer-col answer \
+  --reasoning-target stages \
+  --wrapper-mode chat \
+  --n-per-source 999999 \
+  --seed 1337
+```
+
+### 9. Evaluate a finetuned SFT / LoRA model
 
 `eval_sft_on_jsonl.py` evaluates a local adapter or HF model on a JSONL or CSV
 eval set.
@@ -308,6 +348,7 @@ All scripts live under `experiments/`.
 | `export_cd_train_eval_csv.py` | Leak-free train/eval CSV splits from a config file |
 | `collect_format_sft_data.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
 | `collect_descendant_sft_data.py` | SFT data for the descendant-identification task |
+| `run_scripts/generate_sft_data.sh` | Convenience wrapper to export Sachs eval CSVs and build train/eval causal-discovery SFT JSONL |
 
 ### Querying and evaluation
 
