@@ -63,6 +63,39 @@ def _format_ok(text: str) -> int:
     return int(isinstance(obj, dict) and isinstance(obj.get("adjacency_matrix"), list))
 
 
+def _classify_error_type(raw_response: str) -> str:
+    text = (raw_response or "").strip()
+    if not text.startswith("[ERROR]"):
+        return ""
+    low = text.lower()
+    if "input too long" in low or "string_above_max_length" in low or "prompt too long" in low:
+        return "input_too_long"
+    if "rate limit" in low or "ratelimit" in low or "too many requests" in low:
+        return "rate_limit"
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    if "missing api key" in low:
+        return "missing_api_key"
+    if "device-side assert triggered" in low or "acceleratorerror" in low:
+        return "cuda_device_assert"
+    if "out of memory" in low or "cuda out of memory" in low:
+        return "oom"
+    return "error"
+
+
+def _clear_cuda_cache() -> None:
+    if torch is None or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def _compose_prompt(prompt_text: str, extra_output_instruction: str) -> str:
     if extra_output_instruction and extra_output_instruction.strip():
         return (
@@ -515,6 +548,7 @@ def _run_model_for_config(
         "prompt_tokens",
         "output_tokens",
         "total_tokens",
+        "error_type",
     ]
 
     with out_path.open("w", encoding="utf-8", newline="") as fout:
@@ -573,6 +607,7 @@ def _run_model_for_config(
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
             valid = 1 if adj is not None else 0
             format_ok = _format_ok(resp)
+            error_type = "" if valid else _classify_error_type(resp)
             truncation_suspected = _truncation_suspected(
                 resp,
                 output_tokens=output_tokens,
@@ -596,6 +631,7 @@ def _run_model_for_config(
                 "prompt_tokens": prompt_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "error_type": error_type,
             }
             writer.writerow(out_row)
             wrote += 1
@@ -622,13 +658,16 @@ def _run_model_for_config(
                     file=sys.stderr,
                     flush=True,
                 )
-            responses = call_hf_textgen_batch(
-                hf_pipe,
-                prompts,
-                temperature=temperature,
-                max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
-                batch_size=max(1, int(hf_batch_size)),
-            )
+            try:
+                responses = call_hf_textgen_batch(
+                    hf_pipe,
+                    prompts,
+                    temperature=temperature,
+                    max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
+                    batch_size=max(1, int(hf_batch_size)),
+                )
+            except Exception as e:
+                responses = [f"[ERROR] {type(e).__name__}: {e}"] * len(hf_pending)
             if log_calls:
                 dt = time.monotonic() - t0
                 print(
@@ -644,6 +683,16 @@ def _run_model_for_config(
                 while len(fixed) < len(hf_pending):
                     fixed.append("[ERROR] Missing HF batch response.")
                 responses = fixed
+
+            error_types = [_classify_error_type(str(resp)) for resp in responses]
+            if any(err == "oom" for err in error_types):
+                if log_calls:
+                    print(
+                        f"[hf:recover] provider=hf model={model} batch_size={len(prompts)} action=empty_cache",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                _clear_cuda_cache()
 
             for item, resp in zip(hf_pending, responses):
                 _write_out_row(
