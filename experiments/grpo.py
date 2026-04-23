@@ -1935,6 +1935,8 @@ def _eval_on_dataset(
     pass_k_ok = 0.0
     verify_timeouts = 0
     verify_errors = 0
+    primary_meta_sums: dict[str, float] = {}
+    primary_meta_counts: dict[str, int] = {}
     debug_rows = []
     sample_rows = []
 
@@ -2028,6 +2030,11 @@ def _eval_on_dataset(
                 sample_scores.append(score)
                 verify_timeouts += int(timed_out)
                 verify_errors += int(had_error)
+                if sample_idx == 0 and task != "math":
+                    for meta_key, meta_value in meta.items():
+                        if isinstance(meta_value, (int, float)) and math.isfinite(float(meta_value)):
+                            primary_meta_sums[meta_key] = primary_meta_sums.get(meta_key, 0.0) + float(meta_value)
+                            primary_meta_counts[meta_key] = primary_meta_counts.get(meta_key, 0) + 1
 
                 sample_row = {
                     "model": model_id_or_path,
@@ -2043,6 +2050,14 @@ def _eval_on_dataset(
                     "verify_timed_out": int(timed_out),
                     "verify_error": int(had_error),
                 }
+                if task != "math":
+                    sample_row.update(
+                        {
+                            f"meta/{meta_key}": meta_value
+                            for meta_key, meta_value in meta.items()
+                            if isinstance(meta_value, (int, float, str, bool))
+                        }
+                    )
                 sample_rows.append(sample_row)
 
                 if debug_model_label is not None:
@@ -2064,6 +2079,16 @@ def _eval_on_dataset(
             "verify_timeouts": verify_timeouts,
             "verify_errors": verify_errors,
         }
+        for meta_key, meta_sum in primary_meta_sums.items():
+            count = primary_meta_counts.get(meta_key, 0)
+            if count:
+                metric_key = {
+                    "parse_ok": "parse_rate",
+                    "dag_ok": "dag_rate",
+                    "target_ok": "target_rate",
+                    "shd_norm": "normalized_shd",
+                }.get(meta_key, meta_key)
+                running_metrics[metric_key] = meta_sum / count
         progress_bar.set_postfix(
             acc=f"{running_metrics['accuracy']:.4f}",
             fmt=f"{running_metrics['format_rate']:.4f}",
@@ -2089,6 +2114,16 @@ def _eval_on_dataset(
         "verify_timeouts": verify_timeouts,
         "verify_errors": verify_errors,
     }
+    for meta_key, meta_sum in primary_meta_sums.items():
+        count = primary_meta_counts.get(meta_key, 0)
+        if count:
+            metric_key = {
+                "parse_ok": "parse_rate",
+                "dag_ok": "dag_rate",
+                "target_ok": "target_rate",
+                "shd_norm": "normalized_shd",
+            }.get(meta_key, meta_key)
+            metrics[metric_key] = meta_sum / count
     del model
     del tokenizer
     gc.collect()
@@ -2137,6 +2172,13 @@ def _build_frozen_eval_dataset(args):
             append_format_hint=bool(args.cd_append_format_hint),
             format_hint_text=str(args.cd_format_hint_text),
         )
+
+    if not args.cd_test_csv and 0.0 < float(args.cd_test_fraction) < 1.0:
+        split = full_eval.train_test_split(
+            test_size=float(args.cd_test_fraction),
+            seed=int(args.eval_seed),
+        )
+        full_eval = split["test"]
 
     n = min(args.eval_n, len(full_eval))
     frozen_eval = full_eval.shuffle(seed=args.eval_seed).select(range(n))
