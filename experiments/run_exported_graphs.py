@@ -96,7 +96,7 @@ if __name__ == '__main__':
 
         # we’ll only special-case the cancer graph here; adjust if you want more
         date_name = graph_path.split("/")[-1].rsplit(".", 1)[0]
-        out_root = Path("responses/") / date_name
+        out_root = Path(__file__).resolve().parent / "responses" / date_name
         out_root.mkdir(parents=True, exist_ok=True)
 
         out_csv = out_root / f"predictions_obs{num_obs}_int{args.sample_size_inters}_ENCO.csv"

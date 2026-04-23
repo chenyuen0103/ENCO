@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample_size_obs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out_dir", type=str, default="responses")
+    parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--pc-variant", choices=["orig", "stable", "parallel"], default="stable")
     parser.add_argument("--pc-ci-test", default="chi_square")
     parser.add_argument("--pc-significance-level", type=float, default=0.01)
@@ -185,3 +185,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
