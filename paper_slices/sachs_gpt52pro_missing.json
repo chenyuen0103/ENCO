@@ -83,5 +83,5 @@
     }
   ],
   "baselines": [],
-  "notes": "Catch-up-only manifest for missing gpt-5.2-pro Sachs cells; not a paper-clean full rerun."
+  "notes": "Catch-up-only Sachs manifest for missing gpt-5.2-pro model cells. Uses canonical prompt styles and matches the older cached p=3 runs instead of the full p=5 paper grid."
 }
