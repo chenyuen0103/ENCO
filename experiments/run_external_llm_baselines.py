@@ -16,6 +16,9 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmark_builder.graph_io import load_causal_graph
+
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
+
 try:
     from experiments.generate_prompts import iter_prompts_in_memory
     from experiments.cd_generation.names_only import iter_names_only_prompts_in_memory
@@ -669,4 +672,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"

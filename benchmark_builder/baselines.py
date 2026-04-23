@@ -49,6 +49,17 @@ class ClassicalBaselineAdapter(BaselineAdapter):
             return cell.int_per_combo > 0
         return True
 
+    def dedupe_key(
+        self,
+        *,
+        baseline: BaselineSpec,
+        dataset: DatasetSpec,
+        cell: PromptCellSpec,
+        entry: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
+        return (baseline.name, dataset.name, sample_size_obs)
+
     def run(
         self,
         *,
@@ -168,6 +179,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
         if not baseline.enabled:
             return False
+        if cell.naming_regime == "anonymized":
+            return False
         if self.method_name == "CausalLLMPrompt":
             return _is_names_only_cell(cell)
         if self.method_name == "JiralerspongBFS":
@@ -178,6 +191,11 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             return (not _is_names_only_cell(cell)) and cell.style == "summary_joint"
         return False
 
+    def _effective_sample_size_inters(self, baseline: BaselineSpec, cell: PromptCellSpec) -> int:
+        if self.method_name in {"TakayamaSCP", "JiralerspongBFS", "CausalLLMPrompt"}:
+            return 0
+        return baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
+
     def dedupe_key(
         self,
         *,
@@ -186,8 +204,11 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         cell: PromptCellSpec,
         entry: dict[str, Any],
     ) -> tuple[Any, ...]:
-        if self.method_name == "TakayamaSCP":
-            return (baseline.name, dataset.name, entry["obs_n"], entry["naming_regime"])
+        sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
+        if self.method_name in {"TakayamaSCP", "JiralerspongBFS"}:
+            return (baseline.name, dataset.name, sample_size_obs, entry["naming_regime"])
+        if self.method_name == "CausalLLMPrompt":
+            return (baseline.name, dataset.name, "names_only")
         return (baseline.name, dataset.name, entry["config_name"])
 
     def run(
@@ -201,7 +222,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         dry_run: bool,
     ) -> Path:
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
-        sample_size_inters = baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
+        sample_size_inters = self._effective_sample_size_inters(baseline, cell)
         naming_regime = "names_only" if _is_names_only_cell(cell) else cell.naming_regime
         naming_suffix = ""
         if naming_regime == "anonymized":
