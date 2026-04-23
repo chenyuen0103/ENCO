@@ -18,6 +18,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmark_builder.graph_io import load_causal_graph
 
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
+
 
 def _progress(message: str) -> None:
     print(f"[TakayamaSCP {time.strftime('%H:%M:%S')}] {message}", flush=True)
@@ -314,14 +316,20 @@ def _chat_text_completion(
     top_logprobs: int = 5,
 ) -> dict[str, Any]:
     if provider == "openai":
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_new_tokens or (1500 if logprobs else 3000),
-            logprobs=logprobs if logprobs else None,
-            top_logprobs=top_logprobs if logprobs else None,
-        )
+        completion_tokens = max_new_tokens or (1500 if logprobs else 3000)
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "logprobs": logprobs if logprobs else None,
+            "top_logprobs": top_logprobs if logprobs else None,
+        }
+        # GPT-5 family endpoints reject max_tokens in favor of max_completion_tokens.
+        if "gpt-5" in model_name.lower():
+            kwargs["max_completion_tokens"] = completion_tokens
+        else:
+            kwargs["max_tokens"] = completion_tokens
+        response = client.chat.completions.create(**kwargs)
         text = ""
         try:
             text = response.choices[0].message.content or ""
@@ -772,7 +780,7 @@ def main() -> int:
     parser.add_argument("--sample_size_obs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--model", type=str, default="gpt-5-mini")
+    parser.add_argument("--model", type=str, default="gpt-4.1-mini")
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=None)
@@ -875,4 +883,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"

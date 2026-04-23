@@ -239,9 +239,12 @@ def _build_dataset(item: dict[str, Any]) -> DatasetSpec:
 
 
 def _build_prompt_cell(item: dict[str, Any]) -> PromptCellSpec:
-    _expect(item.get("style") in {"summary_joint", "matrix"}, "Supported prompt styles are `summary_joint` and `matrix`.")
+    style = item.get("style")
+    if style in {"summary_joint", "summary_join"}:
+        style = "summary"
+    _expect(style in {"summary", "matrix"}, "Supported prompt styles are `summary` and `matrix`.")
     return PromptCellSpec(
-        style=item["style"],
+        style=style,
         obs_per_prompt=int(item["obs_per_prompt"]),
         int_per_combo=int(item["int_per_combo"]),
         anonymize=bool(item.get("anonymize", False)),

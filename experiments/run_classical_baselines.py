@@ -19,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 from benchmark_builder.graph_io import load_causal_graph
 from experiments.evaluate import eval_pair
 
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
+
 
 warnings.filterwarnings("ignore", category=FutureWarning, module=r"pgmpy\..*")
 
@@ -185,4 +187,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "responses"
