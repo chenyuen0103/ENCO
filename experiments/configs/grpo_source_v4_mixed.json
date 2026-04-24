@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "description": "Pure GRPO source prompt config for the mixed v4 pool reused by downstream SFT sampling.",
+    "notes": [
+      "This config defines only the prompt distribution.",
+      "Downstream SFT datasets should be sampled from CSVs generated from this GRPO source pool.",
+      "Each graph/config combination is intended to use 16 random column permutations."
+    ]
+  },
+  "dataset_generation": {
+    "graphs_dir": "causal_graphs/real_data/small_graphs",
+    "graph_names": [
+      "cancer",
+      "earthquake",
+      "asia",
+      "sachs"
+    ],
+    "num_prompts_per_config": 25,
+    "seed": 42,
+    "reasoning_guidances": [
+      "staged",
+      "concise",
+      "none"
+    ]
+  },
+  "config_defaults": {
+    "wrapper_mode": "chat",
+    "append_format_hint": true,
+    "row_order": "random",
+    "col_order": "random",
+    "col_perms": 16,
+    "shuffles_per_graph": 1
+  },
+  "config_product": {
+    "prompt_style": [
+      "summary",
+      "matrix"
+    ],
+    "obs_per_prompt": [
+      100,
+      1000
+    ],
+    "int_per_combo": [
+      10,
+      50
+    ],
+    "anonymize": [
+      false,
+      true
+    ]
+  }
+}

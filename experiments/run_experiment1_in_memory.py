@@ -426,6 +426,25 @@ def _load_configs_from_file(
     allowed_row_orders: set[str],
     allowed_col_orders: set[str],
 ) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool, str, float | None]]:
+    def _expand_config_product(raw_product: Any) -> list[dict[str, Any]]:
+        if raw_product is None:
+            return []
+        if not isinstance(raw_product, dict) or not raw_product:
+            raise SystemExit("'config_product' must be a non-empty object when present.")
+        keys = list(raw_product.keys())
+        value_lists: list[list[Any]] = []
+        for key in keys:
+            raw_vals = raw_product.get(key)
+            if isinstance(raw_vals, list):
+                vals = list(raw_vals)
+            else:
+                vals = [raw_vals]
+            vals = [v for v in vals if v is not None]
+            if not vals:
+                raise SystemExit(f"'config_product.{key}' must contain at least one value.")
+            value_lists.append(vals)
+        return [dict(zip(keys, combo)) for combo in itertools.product(*value_lists)]
+
     try:
         payload = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception as e:
@@ -433,20 +452,35 @@ def _load_configs_from_file(
 
     if isinstance(payload, dict):
         raw_configs = payload.get("configs")
+        raw_product = payload.get("config_product", payload.get("config_grid"))
+        raw_defaults = payload.get("config_defaults", payload.get("defaults", {}))
     elif isinstance(payload, list):
         raw_configs = payload
+        raw_product = None
+        raw_defaults = {}
     else:
         raise SystemExit("--config-file must contain either a JSON list or an object with key 'configs'.")
-
-    if not isinstance(raw_configs, list) or not raw_configs:
+    configs_from_product = _expand_config_product(raw_product)
+    if raw_configs is None:
+        raw_configs = []
+    if not isinstance(raw_configs, list):
+        raise SystemExit("'configs' must be a list when present.")
+    raw_configs = list(raw_configs) + configs_from_product
+    if not raw_configs:
         raise SystemExit("--config-file contains no configs.")
+    if raw_defaults is None:
+        raw_defaults = {}
+    if not isinstance(raw_defaults, dict):
+        raise SystemExit("'config_defaults' must be an object when present.")
 
     out: list[tuple[str, bool, int, int, str, str, int, str | None, bool, str, float | None]] = []
     for i, item in enumerate(raw_configs):
         if not isinstance(item, dict):
             raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
+        merged = dict(raw_defaults)
+        merged.update(item)
 
-        style_raw = str(item.get("prompt_style", item.get("style", "cases"))).strip().lower()
+        style_raw = str(merged.get("prompt_style", merged.get("style", "cases"))).strip().lower()
         style = style_aliases.get(style_raw, style_raw)
         if style not in allowed_styles:
             raise SystemExit(
@@ -454,24 +488,24 @@ def _load_configs_from_file(
                 f"Allowed: {sorted(allowed_styles)}"
             )
 
-        row_ord = str(item.get("row_order", "random")).strip().lower()
-        col_ord = str(item.get("col_order", "original")).strip().lower()
+        row_ord = str(merged.get("row_order", "random")).strip().lower()
+        col_ord = str(merged.get("col_order", "original")).strip().lower()
         if row_ord not in allowed_row_orders:
             raise SystemExit(f"Config #{i}: invalid row_order '{row_ord}'. Allowed: {sorted(allowed_row_orders)}")
         if col_ord not in allowed_col_orders:
             raise SystemExit(f"Config #{i}: invalid col_order '{col_ord}'. Allowed: {sorted(allowed_col_orders)}")
 
         try:
-            obs_n = int(item.get("obs_per_prompt", item.get("obs", 0)))
-            int_n = int(item.get("int_per_combo", item.get("int", 0)))
-            shuf_n = int(item.get("shuffles_per_graph", item.get("shuffle", item.get("shuf", 1))))
+            obs_n = int(merged.get("obs_per_prompt", merged.get("obs", 0)))
+            int_n = int(merged.get("int_per_combo", merged.get("int", 0)))
+            shuf_n = int(merged.get("shuffles_per_graph", merged.get("shuffle", merged.get("shuf", 1))))
         except Exception as e:
             raise SystemExit(f"Config #{i}: obs/int/shuf must be integers: {e}") from e
 
         if shuf_n <= 0:
             raise SystemExit(f"Config #{i}: shuffles_per_graph must be > 0.")
 
-        anon_raw = item.get("anonymize", False)
+        anon_raw = merged.get("anonymize", False)
         if isinstance(anon_raw, bool):
             anon = anon_raw
         elif isinstance(anon_raw, str):
@@ -481,11 +515,11 @@ def _load_configs_from_file(
         else:
             anon = False
 
-        wrapper_mode_raw = item.get("wrapper_mode", None)
+        wrapper_mode_raw = merged.get("wrapper_mode", None)
         if wrapper_mode_raw is None:
             # Legacy config compatibility only: historical `cot_hint` files used this
             # field as a proxy for chat wrapping. It does not control staged reasoning.
-            cot_hint_raw = item.get("cot_hint", False)
+            cot_hint_raw = merged.get("cot_hint", False)
             if isinstance(cot_hint_raw, bool):
                 wrapper_mode = "chat" if cot_hint_raw else None
             elif isinstance(cot_hint_raw, str):
@@ -503,7 +537,7 @@ def _load_configs_from_file(
                     f"Config #{i}: invalid wrapper_mode '{wrapper_mode_raw}'. Allowed: ['plain', 'chat']."
                 )
 
-        append_format_hint_raw = item.get("append_format_hint", False)
+        append_format_hint_raw = merged.get("append_format_hint", False)
         if isinstance(append_format_hint_raw, bool):
             append_format_hint = append_format_hint_raw
         elif isinstance(append_format_hint_raw, str):
@@ -513,14 +547,14 @@ def _load_configs_from_file(
         else:
             append_format_hint = False
 
-        reasoning_guidance = str(item.get("reasoning_guidance", "staged") or "staged").strip().lower()
+        reasoning_guidance = str(merged.get("reasoning_guidance", "staged") or "staged").strip().lower()
         if reasoning_guidance not in {"staged", "concise", "none"}:
             raise SystemExit(
-                f"Config #{i}: invalid reasoning_guidance '{item.get('reasoning_guidance')}'. "
+                f"Config #{i}: invalid reasoning_guidance '{merged.get('reasoning_guidance')}'. "
                 "Allowed: ['staged', 'concise', 'none']."
             )
         hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
-            item.get("hist_mass_keep_frac"),
+            merged.get("hist_mass_keep_frac"),
             field_name=f"Config #{i}: hist_mass_keep_frac",
         )
 

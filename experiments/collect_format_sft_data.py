@@ -100,6 +100,13 @@ except ImportError:
     from experiments.cd_generation.prompt_utils import render_prompt_text  # noqa: E402
 from generate_prompts import iter_prompts_in_memory  # noqa: E402
 
+SUPPORTED_REASONING_TARGETS = {
+    "answer_only",
+    "concise_evidence",
+    "stages",
+    "stages_evidence",
+}
+
 
 # ---------------------------------------------------------------------------
 # CSV helpers (shared across all modes)
@@ -129,6 +136,22 @@ def _sample_rows(path: Path, n: int, rng: random.Random) -> List[dict]:
                 reservoir[j] = row
     rng.shuffle(reservoir)
     return reservoir
+
+
+def _parse_reasoning_targets(raw_values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for raw in raw_values or []:
+        for tok in str(raw).split(","):
+            val = tok.strip()
+            if not val:
+                continue
+            if val not in SUPPORTED_REASONING_TARGETS:
+                raise SystemExit(
+                    f"Unsupported reasoning target {val!r}. "
+                    f"Allowed: {sorted(SUPPORTED_REASONING_TARGETS)}"
+                )
+            out.append(val)
+    return out or ["stages_evidence"]
 
 
 def _build_think_sections(
@@ -312,6 +335,7 @@ def _build_record(
         "gold_stage3": stage3_text,
         "source": source_name,
         "graph": row_graph_name,
+        "reasoning_target": reasoning_target,
         "think_style": _reasoning_style_label(reasoning_target),
     }
 
@@ -460,6 +484,7 @@ def _build_records_in_memory(
                 "gold_stage3": stage3_text,
                 "source": source_tag,
                 "graph": graph_name,
+                "reasoning_target": reasoning_target,
                 "think_style": _reasoning_style_label(reasoning_target),
             })
 
@@ -791,6 +816,7 @@ def _build_records_perm_csv(
                 "source": source_name,
                 "graph": row_graph_name,
                 "perm": perm,
+                "reasoning_target": reasoning_target,
                 "think_style": _reasoning_style_label(reasoning_target),
             })
             built += 1
@@ -882,9 +908,12 @@ def main() -> None:
     ap.add_argument("--answer-col", default="answer")
     ap.add_argument(
         "--reasoning-target",
-        choices=["answer_only", "concise_evidence", "stages", "stages_evidence"],
-        default="stages_evidence",
-        help="Supervised completion target style.",
+        nargs="+",
+        default=["stages_evidence"],
+        help=(
+            "Supervised completion target style(s). Accepts one or more values, "
+            "either space-separated or comma-separated."
+        ),
     )
     ap.add_argument(
         "--csv", action="append", default=[], metavar="PATH[:GRAPH]",
@@ -932,6 +961,7 @@ def main() -> None:
     args = ap.parse_args()
     if args.prompt_style == "summary_joint":
         args.prompt_style = "summary"
+    reasoning_targets = _parse_reasoning_targets(args.reasoning_target)
     _set_csv_limit()
     rng = random.Random(args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -952,24 +982,29 @@ def main() -> None:
                 continue
             for obs_n in args.obs_values:
                 for int_n in args.int_values:
-                    recs = _build_records_in_memory(
-                        bif_file=bif_file,
-                        graph_name=graph_name,
-                        prompt_style=args.prompt_style,
-                        obs_per_prompt=obs_n,
-                        int_per_combo=int_n,
-                        num_prompts=args.num_prompts_per_config,
-                        seed=config_seed,
-                        anonymize=args.anonymize,
-                        col_perms=args.col_perms,
-                        reasoning_target=args.reasoning_target,
-                        wrapper_mode=args.wrapper_mode,
-                    )
+                    recs: List[dict] = []
+                    for reasoning_target in reasoning_targets:
+                        recs.extend(
+                            _build_records_in_memory(
+                                bif_file=bif_file,
+                                graph_name=graph_name,
+                                prompt_style=args.prompt_style,
+                                obs_per_prompt=obs_n,
+                                int_per_combo=int_n,
+                                num_prompts=args.num_prompts_per_config,
+                                seed=config_seed,
+                                anonymize=args.anonymize,
+                                col_perms=args.col_perms,
+                                reasoning_target=reasoning_target,
+                                wrapper_mode=args.wrapper_mode,
+                            )
+                        )
                     config_seed += 1000
                     all_records.extend(recs)
                     print(
                         f"  {graph_name:12s}  obs={obs_n:4d}  int={int_n:3d}"
-                        f"  col_perms={args.col_perms}  → {len(recs)} records"
+                        f"  col_perms={args.col_perms}  targets={','.join(reasoning_targets)}"
+                        f"  → {len(recs)} records"
                     )
 
     # ------------------------------------------------------------------ #
@@ -1028,18 +1063,24 @@ def main() -> None:
                   f"rows_per_source={args.rows_per_source}, max_perms={args.max_perms}\n")
             unique_answers: set = set()
             for csv_path, source_name, graph_name in sources:
-                recs, built, skipped = _build_records_perm_csv(
-                    csv_path=csv_path,
-                    source_name=source_name,
-                    graph_name=graph_name,
-                    rows_per_source=args.rows_per_source,
-                    max_perms=args.max_perms,
-                    rng=rng,
-                    prompt_col=args.prompt_col,
-                    answer_col=args.answer_col,
-                    reasoning_target=args.reasoning_target,
-                    wrapper_mode=args.wrapper_mode,
-                )
+                recs: List[dict] = []
+                built = skipped = 0
+                for reasoning_target in reasoning_targets:
+                    target_recs, target_built, target_skipped = _build_records_perm_csv(
+                        csv_path=csv_path,
+                        source_name=source_name,
+                        graph_name=graph_name,
+                        rows_per_source=args.rows_per_source,
+                        max_perms=args.max_perms,
+                        rng=rng,
+                        prompt_col=args.prompt_col,
+                        answer_col=args.answer_col,
+                        reasoning_target=reasoning_target,
+                        wrapper_mode=args.wrapper_mode,
+                    )
+                    recs.extend(target_recs)
+                    built += target_built
+                    skipped += target_skipped
                 all_records.extend(recs)
                 for rec in recs:
                     unique_answers.add(rec["answer"].split("<answer>")[-1])
@@ -1054,20 +1095,21 @@ def main() -> None:
                 sampled = _sample_rows(csv_path, args.n_per_source, rng)
                 built = skipped = 0
                 for row in sampled:
-                    rec = _build_record(
-                        row,
-                        source_name=source_name,
-                        graph_name=graph_name,
-                        prompt_col=args.prompt_col,
-                        answer_col=args.answer_col,
-                        reasoning_target=args.reasoning_target,
-                        wrapper_mode=args.wrapper_mode,
-                    )
-                    if rec is None:
-                        skipped += 1
-                    else:
-                        all_records.append(rec)
-                        built += 1
+                    for reasoning_target in reasoning_targets:
+                        rec = _build_record(
+                            row,
+                            source_name=source_name,
+                            graph_name=graph_name,
+                            prompt_col=args.prompt_col,
+                            answer_col=args.answer_col,
+                            reasoning_target=reasoning_target,
+                            wrapper_mode=args.wrapper_mode,
+                        )
+                        if rec is None:
+                            skipped += 1
+                        else:
+                            all_records.append(rec)
+                            built += 1
                 print(f"  {source_name:50s}  built={built:4d}  skipped={skipped}")
 
     # Final shuffle + write

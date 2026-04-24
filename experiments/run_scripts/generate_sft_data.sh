@@ -11,13 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 BIF_FILE="${BIF_FILE:-${REPO_ROOT}/causal_graphs/real_data/small_graphs/sachs.bif}"
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/experiments/configs/sachs_qwen_configs.json}"
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/experiments/configs/sft_eval.json}"
 
 NUM_PROMPTS="${NUM_PROMPTS:-20}"
-TRAIN_SEED="${TRAIN_SEED:-42}"
 EVAL_SEED="${EVAL_SEED:-1337}"
-
-TRAIN_CSV="${TRAIN_CSV:-${REPO_ROOT}/experiments/data/grpo_sachs_train.csv}"
 EVAL_CSV="${EVAL_CSV:-${REPO_ROOT}/experiments/data/sft_eval_child.csv}"
 
 MIX_ANON_CSV="${MIX_ANON_CSV:-${REPO_ROOT}/experiments/data/grpo_mix_anon.csv}"
@@ -37,7 +34,6 @@ echo " Generating SFT data"
 echo " Repo root:          ${REPO_ROOT}"
 echo " BIF file:           ${BIF_FILE}"
 echo " Config file:        ${CONFIG_FILE}"
-echo " Train seed:         ${TRAIN_SEED}"
 echo " Eval seed:          ${EVAL_SEED}"
 echo " Reasoning target:   ${REASONING_TARGET}"
 echo " Wrapper mode:       ${WRAPPER_MODE}"
@@ -47,14 +43,13 @@ echo "============================================"
 
 cd "${REPO_ROOT}"
 
-python experiments/export_cd_train_eval_csv.py \
-  --bif-file "${BIF_FILE}" \
+python experiments/build_grpo_cd_mix_dataset.py \
   --config-file "${CONFIG_FILE}" \
-  --num-prompts "${NUM_PROMPTS}" \
-  --train-seed "${TRAIN_SEED}" \
-  --eval-seed "${EVAL_SEED}" \
-  --train-csv "${TRAIN_CSV}" \
-  --eval-csv "${EVAL_CSV}"
+  --graphs-dir "$(dirname "${BIF_FILE}")" \
+  --graph-names "$(basename "${BIF_FILE}" .bif)" \
+  --num-prompts-per-config "${NUM_PROMPTS}" \
+  --seed "${EVAL_SEED}" \
+  --output-csv "${EVAL_CSV}"
 
 python experiments/collect_format_sft_data.py \
   --output "${TRAIN_JSONL}" \
@@ -65,7 +60,7 @@ python experiments/collect_format_sft_data.py \
   --reasoning-target "${REASONING_TARGET}" \
   --wrapper-mode "${WRAPPER_MODE}" \
   --n-per-source "${TRAIN_ROWS_PER_SOURCE}" \
-  --seed "${TRAIN_SEED}"
+  --seed 42
 
 python experiments/collect_format_sft_data.py \
   --output "${EVAL_JSONL}" \
@@ -79,7 +74,6 @@ python experiments/collect_format_sft_data.py \
 
 echo ""
 echo "Done."
-echo "  train csv:  ${TRAIN_CSV}"
 echo "  eval csv:   ${EVAL_CSV}"
 echo "  train jsonl:${TRAIN_JSONL}"
 echo "  eval jsonl: ${EVAL_JSONL}"

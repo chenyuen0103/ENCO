@@ -23,7 +23,7 @@ GPU selection precedence in the launcher is:
 ## Main Files
 - [run_cd_curriculum.py](/home/yuen_chen/ENCO/experiments/run_cd_curriculum.py): curriculum orchestrator
 - [run_sft_then_grpo.py](/home/yuen_chen/ENCO/experiments/run_sft_then_grpo.py): SFT helper used by the launcher
-- [export_cd_train_eval_csv.py](/home/yuen_chen/ENCO/experiments/export_cd_train_eval_csv.py): exports train/eval CSVs from config JSONs
+- [build_grpo_cd_mix_dataset.py](/home/yuen_chen/ENCO/experiments/build_grpo_cd_mix_dataset.py): builds prompt CSVs from compact config JSONs
 - [cd_curriculum_debug_cancer.json](/home/yuen_chen/ENCO/experiments/cd_curriculum_debug_cancer.json): small 2-stage cancer debug curriculum
 
 ## What Was Changed
@@ -40,23 +40,21 @@ Use the repo conda env.
 ```bash
 mkdir -p experiments/prompts/cancer_debug
 
-python experiments/export_cd_train_eval_csv.py \
-  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+python experiments/build_grpo_cd_mix_dataset.py \
   --config-file experiments/cancer_summary_joint_matrix_obs100_int10_nonanon.json \
-  --num-prompts 2 \
-  --train-seed 11 \
-  --eval-seed 22 \
-  --train-csv experiments/prompts/cancer_debug/cancer_obs100_int10_train.csv \
-  --eval-csv experiments/prompts/cancer_debug/cancer_obs100_int10_eval.csv
+  --graphs-dir causal_graphs/real_data/small_graphs \
+  --graph-names cancer \
+  --num-prompts-per-config 2 \
+  --seed 11 \
+  --output-csv experiments/prompts/cancer_debug/cancer_obs100_int10_train.csv
 
-python experiments/export_cd_train_eval_csv.py \
-  --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
+python experiments/build_grpo_cd_mix_dataset.py \
   --config-file experiments/cancer_summary_joint_matrix_obs500_int20_nonanon.json \
-  --num-prompts 2 \
-  --train-seed 33 \
-  --eval-seed 44 \
-  --train-csv experiments/prompts/cancer_debug/cancer_obs500_int20_train.csv \
-  --eval-csv experiments/prompts/cancer_debug/cancer_obs500_int20_eval.csv
+  --graphs-dir causal_graphs/real_data/small_graphs \
+  --graph-names cancer \
+  --num-prompts-per-config 2 \
+  --seed 33 \
+  --output-csv experiments/prompts/cancer_debug/cancer_obs500_int20_train.csv
 ```
 
 ### 2. Dry run the launcher

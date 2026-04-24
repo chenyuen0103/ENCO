@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "description": "SFT sampling config for mixed-format datasets built from GRPO source CSVs, excluding stages_evidence.",
+    "source_grpo_config": "experiments/configs/grpo_source_v4_mixed.json",
+    "notes": [
+      "This config only describes how to sample SFT datasets from already-generated GRPO source CSVs.",
+      "The stages_evidence target is intentionally excluded."
+    ]
+  },
+  "sft_collections": [
+    {
+      "name": "stages",
+      "output_jsonl": "experiments/data/format_sft_stages_v4_mixed.jsonl",
+      "script": "experiments/collect_format_sft_data.py",
+      "source_csvs": [
+        {
+          "path": "experiments/data/grpo_mix_anon.csv",
+          "label": "grpo_mix_anon"
+        },
+        {
+          "path": "experiments/data/grpo_mix_named.csv",
+          "label": "grpo_mix_named"
+        }
+      ],
+      "prompt_col": "prompt_text",
+      "answer_col": "answer",
+      "reasoning_target": "stages",
+      "wrapper_mode": "chat",
+      "n_per_source": 1725,
+      "seed": 42,
+      "expected_think_style": "strict"
+    },
+    {
+      "name": "concise",
+      "output_jsonl": "experiments/data/format_sft_concise_v4_mixed.jsonl",
+      "script": "experiments/collect_format_sft_data.py",
+      "source_csvs": [
+        {
+          "path": "experiments/data/grpo_mix_anon.csv",
+          "label": "grpo_mix_anon"
+        },
+        {
+          "path": "experiments/data/grpo_mix_named.csv",
+          "label": "grpo_mix_named"
+        }
+      ],
+      "prompt_col": "prompt_text",
+      "answer_col": "answer",
+      "reasoning_target": "concise_evidence",
+      "wrapper_mode": "chat",
+      "n_per_source": 1725,
+      "seed": 42,
+      "expected_think_style": "concise"
+    },
+    {
+      "name": "answer_only",
+      "output_jsonl": "experiments/data/format_sft_answer_only_v4_mixed.jsonl",
+      "script": "experiments/collect_format_sft_data.py",
+      "source_csvs": [
+        {
+          "path": "experiments/data/grpo_mix_anon.csv",
+          "label": "grpo_mix_anon"
+        },
+        {
+          "path": "experiments/data/grpo_mix_named.csv",
+          "label": "grpo_mix_named"
+        }
+      ],
+      "prompt_col": "prompt_text",
+      "answer_col": "answer",
+      "reasoning_target": "answer_only",
+      "wrapper_mode": "chat",
+      "n_per_source": 1725,
+      "seed": 42,
+      "expected_think_style": "answer_only"
+    }
+  ]
+}

@@ -1,0 +1,134 @@
+{
+  "metadata": {
+    "output_jsonl": "experiments/data/format_sft_stages_v4_mixed.jsonl",
+    "description": "Reconstructed config for the mixed staged-reasoning SFT dataset built from grpo_mix_anon.csv and grpo_mix_named.csv.",
+    "graph_names": [
+      "cancer",
+      "earthquake",
+      "asia",
+      "sachs"
+    ]
+  },
+  "source_prompt_configs": [
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 10,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 10,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 10,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 10,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    },
+    {
+      "prompt_style": "summary_joint",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "wrapper_mode": "chat",
+      "append_format_hint": true,
+      "reasoning_guidance": "staged",
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "shuffles_per_graph": 1
+    }
+  ],
+  "sft_collection": {
+    "script": "experiments/collect_format_sft_data.py",
+    "source_csvs": [
+      {
+        "path": "experiments/data/grpo_mix_anon.csv",
+        "label": "grpo_mix_anon"
+      },
+      {
+        "path": "experiments/data/grpo_mix_named.csv",
+        "label": "grpo_mix_named"
+      }
+    ],
+    "prompt_col": "prompt_text",
+    "answer_col": "answer",
+    "reasoning_target": "stages",
+    "wrapper_mode": "chat",
+    "n_per_source": 1725,
+    "seed": 42
+  },
+  "notes": [
+    "The final JSONL contains 3450 rows: 1725 sampled from grpo_mix_anon and 1725 sampled from grpo_mix_named.",
+    "All prompts in the source CSVs use summary_joint format with chat wrapping and staged formatting hints.",
+    "think_style in the produced JSONL is strict, which matches reasoning_target=stages."
+  ]
+}
