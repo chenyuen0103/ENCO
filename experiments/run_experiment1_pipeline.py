@@ -33,6 +33,11 @@ _ENCO_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_PRED_RE = re.compile(
+    r"^predictions_obs(?P<obs>\d+)_int(?P<int>\d+)_(?P<method>.+)$",
+    flags=re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ResponseMeta:
@@ -195,6 +200,46 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             give_steps=False,
         )
 
+    # Generic prediction baseline:
+    #   predictions_obs{N}_int{M}_{Method}.csv
+    #   predictions_obs{N}_int{M}_{Method}_anon.csv
+    #   predictions_obs0_int0_{Method}_names_only.csv
+    m_pred = _PRED_RE.match(stem)
+    if m_pred:
+        method = m_pred.group("method")
+        anonymize = False
+        is_names_only = False
+        prompt_style = "baseline"
+        if method.endswith("_anon"):
+            anonymize = True
+            method = method[: -len("_anon")]
+        if method.endswith("_names_only"):
+            is_names_only = True
+            method = method[: -len("_names_only")]
+            prompt_style = "names_only"
+        elif method in {"TakayamaSCP", "JiralerspongBFS", "CausalLLMData"}:
+            prompt_style = "summary"
+        elif method == "ENCO":
+            prompt_style = "enco"
+        return ResponseMeta(
+            dataset=dataset,
+            csv_path=csv_path,
+            model=method,
+            reasoning_guidance="baseline",
+            is_names_only=is_names_only,
+            obs_n=int(m_pred.group("obs")),
+            int_n=int(m_pred.group("int")),
+            shuf_n=None,
+            anonymize=anonymize,
+            prompt_style=prompt_style,
+            row_order="random",
+            col_order="original",
+            wrapper_mode="plain",
+            append_format_hint=False,
+            causal_rules=False,
+            give_steps=False,
+        )
+
     # Names-only: "responses_names_only..." (no obs/int/shuf encoded)
     if "responses_names_only" in stem:
         model = _infer_model_from_stem(stem)
@@ -311,16 +356,20 @@ def _find_response_csvs(experiments_dir: Path, dataset: str) -> list[Path]:
     resp_dirs = [d for d in resp_dirs if d.exists()]
     if not resp_dirs:
         return []
-    # Only include *raw response* CSVs produced by query scripts / in-memory runs.
-    # Exclude derived artifacts like *.per_row.csv or eval_summary.csv to avoid
-    # mis-evaluating them as model outputs.
+    # Include both raw model responses and prediction CSVs from classical /
+    # semantic / mixed-method baselines. Exclude derived artifacts like
+    # *.per_row.csv so we do not mis-evaluate them as primary outputs.
     out: list[Path] = []
     for resp_dir in resp_dirs:
         for p in resp_dir.glob("responses_*.csv"):
             if p.name.endswith(".per_row.csv"):
                 continue
             out.append(p)
-    return sorted(out)
+        for p in resp_dir.glob("predictions_*.csv"):
+            if p.name.endswith(".per_row.csv"):
+                continue
+            out.append(p)
+    return sorted({p.resolve(): p for p in out}.values())
 
 
 def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any]:
@@ -663,101 +712,6 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
     summary_rows: list[dict[str, Any]] = []
     ordering_rows: list[dict[str, Any]] = []
 
-    def _parse_enco_csvs(responses_dir_override: Optional[Path]) -> list[dict[str, Any]]:
-        """
-        Parse ENCO baseline rows from prediction CSVs:
-          predictions_obs{N}_int{M}_ENCO.csv
-
-        We read f1/SHD directly from the CSV single row (or first row if multiple),
-        and return rows compatible with <dataset>_summary.csv schema.
-        """
-        if responses_dir_override is not None:
-            resp_dirs = [Path(responses_dir_override)]
-        else:
-            resp_dirs = [
-                experiments_dir / "responses" / args.dataset,
-                experiments_dir.parent / "responses" / args.dataset,
-            ]
-        resp_dirs = [d for d in resp_dirs if d.exists()]
-        if not resp_dirs:
-            return []
-
-        out: list[dict[str, Any]] = []
-        seen: set[Path] = set()
-        for resp_dir in resp_dirs:
-            for csv_path in sorted(resp_dir.glob("predictions_obs*_int*_ENCO.csv")):
-                csv_abs = csv_path.resolve()
-                if csv_abs in seen:
-                    continue
-                seen.add(csv_abs)
-                meta = _parse_response_meta(args.dataset, csv_path)
-                try:
-                    with csv_path.open("r", encoding="utf-8", newline="") as f:
-                        reader = csv.DictReader(f)
-                        rows = list(reader)
-                except Exception:
-                    continue
-                if not rows:
-                    continue
-                row0 = rows[0]
-                try:
-                    raw_f1 = row0.get("f1", row0.get("avg_f1", ""))
-                    raw_shd = row0.get("SHD", row0.get("shd", row0.get("avg_shd", "")))
-                    f1 = float(raw_f1)
-                    shd = int(float(raw_shd))
-                except Exception:
-                    continue
-
-                out.append(
-                    {
-                        "dataset": args.dataset,
-                        "model": "ENCO",
-                        "reasoning_guidance": "baseline",
-                        "prompt_style": "enco",
-                        # ENCO filenames do not encode a naming regime. Keep this as the
-                        # default/non-anonymized value and let downstream plots place ENCO
-                        # explicitly where needed instead of forcing it into the anon slice.
-                        "anonymize": 0,
-                        "is_names_only": 0,
-                        "obs_n": meta.obs_n,
-                        "int_n": meta.int_n,
-                        "shuffles_per_graph": None,
-                        "row_order": "random",
-                        "col_order": "original",
-                        "wrapper_mode": "plain",
-                        "append_format_hint": 0,
-                        "causal_rules": 0,
-                        "give_steps": 0,
-                        "response_csv": str(csv_path),
-                        "summary_json": str(csv_path),
-                        "evaluated": 1,
-                        # Use avg_* slots for ENCO (single run per cell).
-                        "avg_f1": f1,
-                        "avg_shd": shd,
-                        "consensus_f1": None,
-                        "consensus_shd": None,
-                        "num_rows": len(rows),
-                        "valid_rows": None,
-                        "tau": None,
-                        "context_window": None,
-                        "prompt_tokens_max": None,
-                        "prompt_tokens_mean": None,
-                        "prompt_tokens_rows": None,
-                        "prompt_tokens_missing_rows": None,
-                        "context_exceeded_by_tokens_rows": 0,
-                        "context_exceeded_by_error_rows": 0,
-                        "context_exceeded_any": 0,
-                        # ENCO rows are single-run point estimates.
-                        "avg_f1_sd": 0.0,
-                        "avg_f1_se": 0.0,
-                        "avg_shd_sd": 0.0,
-                        "avg_shd_se": 0.0,
-                        "spread_n": 1,
-                    }
-                )
-                _enrich_summary_row(out[-1])
-        return out
-
     for csv_path in resp_csvs:
         meta = _parse_response_meta(args.dataset, csv_path)
         ctx = _context_window_for(meta.model)
@@ -815,10 +769,6 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                     **ob,
                 }
             )
-
-    if getattr(args, "include_enco_in_summary", False):
-        enco_rows = _parse_enco_csvs(getattr(args, "enco_responses_dir", None))
-        summary_rows.extend(enco_rows)
 
     if not summary_rows:
         raise SystemExit(
@@ -902,14 +852,14 @@ def main() -> None:
         "--include-enco-in-summary",
         action="store_true",
         default=True,
-        help="Append ENCO baseline cells into experiments/responses/<dataset>/<dataset>_summary.csv (default: enabled).",
+        help="Deprecated; prediction CSVs are now summarized automatically for all methods.",
     )
     ap.add_argument(
         "--enco-responses-dir",
         default="experiments/responses/sachs",
         help=(
-            "Optional ENCO responses directory override. "
-            "Default: experiments/responses/sachs."
+            "Deprecated legacy option; prediction CSVs are discovered automatically. "
+            "Default retained for backward compatibility."
         ),
     )
 
