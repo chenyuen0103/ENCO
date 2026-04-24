@@ -47,6 +47,46 @@ def _infer_prompt_style_from_stem(stem: str) -> str:
     return ""
 
 
+def _normalize_stem_for_parse(stem: str) -> str:
+    out = stem
+    out = out.replace("summary_joint", "summary")
+    out = out.replace("summary_join", "summary")
+    out = out.replace("thinktags_cothint", "wrapchat_fmthint")
+    out = out.replace("cothint_thinktags", "wrapchat_fmthint")
+    out = out.replace("thinktags", "wrapchat")
+    out = out.replace("cothint", "fmthint")
+    out = out.replace("respthink_answer", "")
+    out = out.replace("wrapplain", "")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
+def _infer_model_from_stem(stem: str) -> str:
+    stem = _normalize_stem_for_parse(stem)
+    tag_re = (
+        r"(?:anon|rules|steps|wrapchat|fmthint|reason(?:concise|none)|shuf\d+|"
+        r"row[A-Za-z0-9]+|col[A-Za-z0-9]+)"
+    )
+    m_names = re.match(
+        rf"^responses_names_only(?:_p\d+)?(?P<tags>(?:_{tag_re})*)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_names:
+        return m_names.group("model")
+
+    m_resp = re.match(
+        rf"^responses_obs\d+_int\d+_shuf\d+_p\d+(?:_{tag_re})*"
+        rf"_(?:summary_probs|payload_topk|payload|summary|matrix|cases)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_resp:
+        return m_resp.group("model")
+    return ""
+
+
 def _infer_from_response_csv(response_csv: str) -> dict[str, Any]:
     p = Path(str(response_csv))
     stem = p.stem
@@ -54,18 +94,7 @@ def _infer_from_response_csv(response_csv: str) -> dict[str, Any]:
 
     model = ""
     try:
-        m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
-        if m_names:
-            model = m_names.group("model")
-        else:
-            m_resp = re.match(
-                r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-                r"(?:matrix|summary|cases|payload|payload_topk)_(?P<model>.+)$",
-                stem,
-                flags=re.IGNORECASE,
-            )
-            if m_resp:
-                model = m_resp.group("model")
+        model = _infer_model_from_stem(stem)
     except Exception:
         model = ""
 

@@ -2,8 +2,8 @@
   "configs": [
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -11,8 +11,8 @@
     },
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -20,8 +20,8 @@
     },
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -29,8 +29,8 @@
     },
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -38,8 +38,8 @@
     },
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -47,8 +47,8 @@
     },
     {
       "prompt_style": "summary",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -56,8 +56,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -65,8 +65,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -74,8 +74,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": false,
@@ -83,8 +83,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -92,8 +92,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -101,8 +101,8 @@
     },
     {
       "prompt_style": "matrix",
-      "obs_per_prompt": 5000,
-      "int_per_combo": 200,
+      "obs_per_prompt": 100,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -111,7 +111,7 @@
     {
       "prompt_style": "summary",
       "obs_per_prompt": 0,
-      "int_per_combo": 200,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -120,7 +120,7 @@
     {
       "prompt_style": "summary",
       "obs_per_prompt": 0,
-      "int_per_combo": 200,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,
@@ -129,7 +129,7 @@
     {
       "prompt_style": "summary",
       "obs_per_prompt": 0,
-      "int_per_combo": 200,
+      "int_per_combo": 50,
       "row_order": "random",
       "col_order": "original",
       "anonymize": true,

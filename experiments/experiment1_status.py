@@ -124,7 +124,8 @@ def _compute_file_status(path: Path, *, num_prompts: int, shuf_n: int) -> FileSt
                 completed_keys.add((di, si))
 
     missing_keys = expected_keys - completed_keys
-    eval_done = path.with_suffix(path.suffix + ".summary.json").exists()
+    per_row_path = path.with_suffix(path.suffix + ".per_row.csv")
+    eval_done = per_row_path.exists() and per_row_path.stat().st_mtime >= path.stat().st_mtime
     return FileStatus(
         path=path,
         expected_rows=expected_rows,
@@ -230,4 +231,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -39,6 +39,7 @@ class ResponseMeta:
     dataset: str
     csv_path: Path
     model: str
+    reasoning_guidance: str
     is_names_only: bool
     obs_n: Optional[int]
     int_n: Optional[int]
@@ -99,7 +100,9 @@ def _infer_model_from_stem(stem: str) -> str:
     stem = _normalize_stem_for_parse(stem)
     # Preserve full model suffix (including underscores), e.g. grpo_sft_8192_from4096.
     m_names = re.match(
-        r"^responses_names_only(?:_p\d+)?(?P<tags>(?:_(?:anon|rules|steps|wrapchat|fmthint|row[A-Za-z0-9]+|col[A-Za-z0-9]+))*)_(?P<model>.+)$",
+        r"^responses_names_only(?:_p\d+)?"
+        r"(?P<tags>(?:_(?:anon|rules|steps|wrapchat|fmthint|reason(?:concise|none)|shuf\d+|"
+        r"row[A-Za-z0-9]+|col[A-Za-z0-9]+))*)_(?P<model>.+)$",
         stem,
         flags=re.IGNORECASE,
     )
@@ -157,6 +160,15 @@ def _parse_prompt_suffix(suffix: str) -> tuple[str, str]:
     return m.group("tags"), m.group("model").strip()
 
 
+def _infer_reasoning_guidance(text: str) -> str:
+    lowered = _normalize_stem_for_parse(text).lower()
+    if "reasonconcise" in lowered:
+        return "concise"
+    if "reasonnone" in lowered:
+        return "none"
+    return "staged"
+
+
 def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     raw_stem = csv_path.stem
     stem = _normalize_stem_for_parse(raw_stem)
@@ -168,6 +180,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             dataset=dataset,
             csv_path=csv_path,
             model="ENCO",
+            reasoning_guidance="baseline",
             is_names_only=False,
             obs_n=int(m_enco.group("obs")),
             int_n=int(m_enco.group("int")),
@@ -193,6 +206,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             dataset=dataset,
             csv_path=csv_path,
             model=model,
+            reasoning_guidance=_infer_reasoning_guidance(stem),
             is_names_only=True,
             obs_n=None,
             int_n=None,
@@ -225,6 +239,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             dataset=dataset,
             csv_path=csv_path,
             model=_infer_model_from_stem(stem),
+            reasoning_guidance=_infer_reasoning_guidance(stem),
             is_names_only=False,
             obs_n=None,
             int_n=None,
@@ -269,6 +284,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
         dataset=dataset,
         csv_path=csv_path,
         model=model,
+        reasoning_guidance=_infer_reasoning_guidance(tags),
         is_names_only=False,
         obs_n=obs_n,
         int_n=int_n,
@@ -415,8 +431,12 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
         )
 
     for csv_path in resp_csvs:
-        summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-        if summary_path.exists() and not args.overwrite_eval:
+        per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
+        if (
+            per_row_path.exists()
+            and per_row_path.stat().st_mtime >= csv_path.stat().st_mtime
+            and not args.overwrite_eval
+        ):
             continue
         cmd = [sys.executable, "evaluate.py", "--csv", str(csv_path), "--tau", str(args.tau)]
         _run(cmd, cwd=experiments_dir, dry_run=dry_run)
@@ -497,6 +517,87 @@ def _add_metric_spread_columns(row: dict[str, Any]) -> None:
     row["spread_n"] = int(n)
 
 
+def _safe_rate(numer: Any, denom: Any) -> Optional[float]:
+    n = _safe_float(numer)
+    d = _safe_float(denom)
+    if n is None or d is None or d <= 0:
+        return None
+    return float(n / d)
+
+
+def _build_config_summary(
+    *,
+    prompt_style: str,
+    anonymize: Any,
+    obs_n: Any,
+    int_n: Any,
+    shuffles_per_graph: Any,
+    reasoning_guidance: str,
+    row_order: str,
+    col_order: str,
+    wrapper_mode: str,
+    append_format_hint: Any,
+    causal_rules: Any,
+    give_steps: Any,
+    is_names_only: Any,
+) -> str:
+    parts: list[str] = []
+    if _safe_int(is_names_only) == 1:
+        parts.append("style=names_only")
+    else:
+        parts.append(f"style={prompt_style}")
+        if obs_n is not None:
+            parts.append(f"obs={obs_n}")
+        if int_n is not None:
+            parts.append(f"int={int_n}")
+        if shuffles_per_graph is not None:
+            parts.append(f"shuf={shuffles_per_graph}")
+
+    parts.append(f"anon={int(bool(_safe_int(anonymize) == 1))}")
+    parts.append(f"reason={reasoning_guidance}")
+
+    if row_order:
+        parts.append(f"row={row_order}")
+    if col_order:
+        parts.append(f"col={col_order}")
+    if wrapper_mode:
+        parts.append(f"wrap={wrapper_mode}")
+    if _safe_int(append_format_hint) == 1:
+        parts.append("fmthint=1")
+    if _safe_int(causal_rules) == 1:
+        parts.append("rules=1")
+    if _safe_int(give_steps) == 1:
+        parts.append("steps=1")
+    return ",".join(parts)
+
+
+def _enrich_summary_row(row: dict[str, Any]) -> None:
+    row["config"] = _build_config_summary(
+        prompt_style=str(row.get("prompt_style") or ""),
+        anonymize=row.get("anonymize"),
+        obs_n=row.get("obs_n"),
+        int_n=row.get("int_n"),
+        shuffles_per_graph=row.get("shuffles_per_graph"),
+        reasoning_guidance=str(row.get("reasoning_guidance") or ""),
+        row_order=str(row.get("row_order") or ""),
+        col_order=str(row.get("col_order") or ""),
+        wrapper_mode=str(row.get("wrapper_mode") or ""),
+        append_format_hint=row.get("append_format_hint"),
+        causal_rules=row.get("causal_rules"),
+        give_steps=row.get("give_steps"),
+        is_names_only=row.get("is_names_only"),
+    )
+    row["valid_rate"] = _safe_rate(row.get("valid_rows"), row.get("num_rows"))
+    row["avg_F1"] = row.get("avg_f1")
+
+
+def _ordered_fieldnames(rows: list[dict[str, Any]], priority: list[str]) -> list[str]:
+    all_fields = {k for r in rows for k in r.keys()}
+    ordered = [k for k in priority if k in all_fields]
+    ordered.extend(sorted(all_fields - set(ordered)))
+    return ordered
+
+
 def _ordering_bias_from_csv(csv_path: Path) -> dict[str, Any]:
     """
     Estimate ordering sensitivity by grouping rows by data_idx and measuring the spread
@@ -548,6 +649,10 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             f"No response CSVs found under {(experiments_dir/'responses'/args.dataset)} or {(experiments_dir.parent/'responses'/args.dataset)}. "
             "Run the model step first."
         )
+    try:
+        from evaluate import evaluate_response_csv
+    except ModuleNotFoundError:
+        from experiments.evaluate import evaluate_response_csv
 
     out_dir = experiments_dir / "out" / "experiment1"
     summary_dir = experiments_dir / "responses" / args.dataset
@@ -607,6 +712,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                     {
                         "dataset": args.dataset,
                         "model": "ENCO",
+                        "reasoning_guidance": "baseline",
                         "prompt_style": "enco",
                         # ENCO filenames do not encode a naming regime. Keep this as the
                         # default/non-anonymized value and let downstream plots place ENCO
@@ -649,19 +755,23 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                         "spread_n": 1,
                     }
                 )
+                _enrich_summary_row(out[-1])
         return out
 
     for csv_path in resp_csvs:
         meta = _parse_response_meta(args.dataset, csv_path)
-        summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
         ctx = _context_window_for(meta.model)
         pt_stats = _prompt_token_stats(csv_path, context_window=ctx)
-        summary: dict[str, Any] = {}
-        if summary_path.exists():
-            summary = _read_json(summary_path)
+        summary = evaluate_response_csv(
+            csv_path,
+            tau=args.tau,
+            write_artifacts=False,
+            verbose=False,
+        )["summary"]
         row: dict[str, Any] = {
             "dataset": meta.dataset,
             "model": meta.model,
+            "reasoning_guidance": meta.reasoning_guidance,
             "is_names_only": int(meta.is_names_only),
             "obs_n": meta.obs_n,
             "int_n": meta.int_n,
@@ -675,12 +785,13 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             "causal_rules": int(meta.causal_rules),
             "give_steps": int(meta.give_steps),
             "response_csv": str(csv_path),
-            "summary_json": str(summary_path),
-            "evaluated": int(bool(summary)),
+            "summary_json": "",
+            "evaluated": 1,
         }
         row.update(summary)
         row.update(pt_stats)
         _add_metric_spread_columns(row)
+        _enrich_summary_row(row)
         summary_rows.append(row)
 
         # 2) Ordering bias analysis (only makes sense if shuffle_idx varies)
@@ -690,6 +801,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                 {
                     "dataset": meta.dataset,
                     "model": meta.model,
+                    "reasoning_guidance": meta.reasoning_guidance,
                     "obs_n": meta.obs_n,
                     "int_n": meta.int_n,
                     "shuffles_per_graph": meta.shuf_n,
@@ -710,14 +822,18 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
 
     if not summary_rows:
         raise SystemExit(
-            "No *.summary.json found next to response CSVs. Run the evaluate step first."
+            "No response CSV summaries could be computed. Check the response CSV files."
         )
 
     summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
         summary_dir.mkdir(parents=True, exist_ok=True)
+        fieldnames = _ordered_fieldnames(
+            summary_rows,
+            ["model", "config", "valid_rate", "avg_F1", "avg_shd"],
+        )
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=sorted({k for r in summary_rows for k in r.keys()}))
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in summary_rows:
                 writer.writerow(r)

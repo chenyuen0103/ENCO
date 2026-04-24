@@ -3,8 +3,7 @@
 Generate a LaTeX table for an LLM baseline sweep (table-range grid), comparable to ENCO.
 
 Expected inputs:
-  - response CSVs under: experiments/responses/<dataset>/*.csv
-  - evaluation summaries next to each response CSV: <csv>.summary.json
+  - consolidated summary CSV: experiments/responses/<dataset>/<dataset>_summary.csv
 
 The table cells report F1 with SHD in parentheses, using either:
   - consensus_{f1,shd} (recommended when there are multiple rows / shuffles), or
@@ -22,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import re
 from pathlib import Path
 from typing import Iterable, Optional
@@ -126,10 +124,6 @@ def _render_table(
     lines.append(r"\end{table*}")
     lines.append("")
     return "\n".join(lines)
-
-
-def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _read_summary_csv(path: Path) -> list[dict[str, str]]:
@@ -464,12 +458,26 @@ def main() -> int:
         if not args.model:
             p.error("--model is required unless --compare --all-models-avg is set.")
 
-    if args.compare:
-        summary_csv = args.summary_csv or (
-            Path("experiments") / "responses" / args.dataset / f"{args.dataset}_summary.csv"
-        )
-        rows = _read_summary_csv(Path(summary_csv))
+    def _resolve_summary_csv_path() -> Path:
+        if args.summary_csv is not None:
+            return Path(args.summary_csv)
 
+        candidates: list[Path] = []
+        if args.responses_dir is not None:
+            candidates.append(Path(args.responses_dir) / f"{args.dataset}_summary.csv")
+        candidates.extend([
+            Path("experiments") / "responses" / args.dataset / f"{args.dataset}_summary.csv",
+            Path("responses") / args.dataset / f"{args.dataset}_summary.csv",
+        ])
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return candidates[0]
+
+    summary_csv = _resolve_summary_csv_path()
+    rows = _read_summary_csv(summary_csv)
+
+    if args.compare:
         obs_sizes = _parse_int_list(args.obs_sizes) or [0, 100, 1000, 5000, 8000]
         int_sizes = _parse_int_list(args.int_sizes) or [0, 50, 100, 200, 500]
 
@@ -665,20 +673,6 @@ def main() -> int:
         responses_dir: Path | None = None,
         allow_empty: bool = False,
     ) -> str:
-        dataset = args.dataset
-        # Responses may live either under experiments/responses/<dataset> (when run from experiments/)
-        # or under repo_root/responses/<dataset> (when run from repo root).
-        if responses_dir is not None:
-            response_dirs = [Path(responses_dir)]
-        elif args.responses_dir is not None:
-            response_dirs = [Path(args.responses_dir)]
-        else:
-            response_dirs = [
-                Path("experiments") / "responses" / dataset,
-                Path("responses") / dataset,
-            ]
-        response_dirs = [d for d in response_dirs if d.exists()]
-
         metric_prefix = "consensus" if metric == "consensus" else "avg"
         f1_key = f"{metric_prefix}_f1"
         shd_key = f"{metric_prefix}_shd"
@@ -686,83 +680,62 @@ def main() -> int:
         values: dict[tuple[int, int], tuple[float, int]] = {}
         discovered_obs: set[int] = set()
         discovered_int: set[int] = set()
-        matched_csvs = 0
-        matched_missing_summaries = 0
+        matched_rows = 0
 
-        # Special-case: (obs=0,int=0) corresponds to the "names-only" prompts.
-        # Those are written as responses_names_only*.csv (without obs/int encoding).
-        # We include them only for non-anonymized tables (variable-name semantics).
         if anonymize == "non":
-            for responses_dir in response_dirs:
-                for names_csv in sorted(responses_dir.glob("responses_names_only*.csv")):
-                    if not names_csv.stem.endswith(f"_{args.model}"):
-                        continue
-                    summary_path = names_csv.with_suffix(names_csv.suffix + ".summary.json")
-                    if not summary_path.exists():
-                        continue
-                    summary = _read_json(summary_path)
-                    if f1_key in summary and shd_key in summary:
-                        values[(0, 0)] = (float(summary[f1_key]), int(float(summary[shd_key])))
-                        discovered_obs.add(0)
-                        discovered_int.add(0)
-                    break
-                if (0, 0) in values:
-                    break
+            best_names_only: tuple[float, int] | None = None
+            best_score = -1.0
+            for r in rows:
+                if (r.get("prompt_style") or "").strip().lower() != "names_only":
+                    continue
+                if _to_int(r.get("anonymize")) == 1:
+                    continue
+                if (r.get("model") or "").strip() != args.model:
+                    continue
+                f1 = _to_float(r.get(f1_key))
+                shd = _to_int(r.get(shd_key))
+                if f1 is None or shd is None:
+                    continue
+                score = float(_to_float(r.get("valid_rows")) or _to_float(r.get("num_rows")) or 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_names_only = (float(f1), int(shd))
+            if best_names_only is not None:
+                values[(0, 0)] = best_names_only
+                discovered_obs.add(0)
+                discovered_int.add(0)
 
-        for responses_dir in response_dirs:
-            for csv_path in sorted(responses_dir.glob("responses_obs*_int*_shuf*.csv")):
-                m = _RESP_RE.match(csv_path.stem)
-                if not m:
-                    continue
+        for r in rows:
+            if (r.get("prompt_style") or "").strip().lower() != prompt_style:
+                continue
+            if (r.get("model") or "").strip() != args.model:
+                continue
+            is_anon = _to_int(r.get("anonymize")) == 1
+            if anonymize == "anon" and not is_anon:
+                continue
+            if anonymize == "non" and is_anon:
+                continue
 
-                obs_n = int(m.group("obs"))
-                int_m = int(m.group("int"))
-                tags = (m.group("tags") or "").lower()
-                model_tag = (m.group("model") or "").strip()
+            obs_n = _to_int(r.get("obs_n"))
+            int_n = _to_int(r.get("int_n"))
+            if obs_n is None or int_n is None:
+                continue
 
-                if model_tag != args.model:
-                    continue
-
-                is_anon = ("_anon" in tags) or any(tok == "anon" for tok in tags.split("_"))
-                if anonymize == "anon" and not is_anon:
-                    continue
-                if anonymize == "non" and is_anon:
-                    continue
-
-                if not _has_style_tag(tags, prompt_style):
-                    continue
-
-                matched_csvs += 1
-                summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-                if not summary_path.exists():
-                    matched_missing_summaries += 1
-                    continue
-                summary = _read_json(summary_path)
-                if f1_key not in summary or shd_key not in summary:
-                    continue
-
-                raw_f1 = summary.get(f1_key)
-                raw_shd = summary.get(shd_key)
-                if raw_f1 is None or raw_shd is None:
-                    # Some evaluations may write nulls when no valid predictions were parsed.
-                    continue
-                try:
-                    f1 = float(raw_f1)
-                    shd = int(float(raw_shd))
-                except Exception:
-                    continue
-                values[(obs_n, int_m)] = (f1, shd)
-                discovered_obs.add(obs_n)
-                discovered_int.add(int_m)
+            matched_rows += 1
+            f1 = _to_float(r.get(f1_key))
+            shd = _to_int(r.get(shd_key))
+            if f1 is None or shd is None:
+                continue
+            values[(int(obs_n), int(int_n))] = (float(f1), int(shd))
+            discovered_obs.add(int(obs_n))
+            discovered_int.add(int(int_n))
 
         if not values:
             if allow_empty:
-                # Use a canonical grid so combined .tex output is stable even if some styles
-                # haven't been run/evaluated yet.
                 obs_sizes = _parse_int_list(args.obs_sizes) or [0, 100, 1000, 5000, 8000]
                 int_sizes = _parse_int_list(args.int_sizes) or [0, 50, 100, 200, 500]
                 return _render_table(
-                    dataset=dataset,
+                    dataset=args.dataset,
                     model=args.model,
                     prompt_style=prompt_style,
                     metric=metric,
@@ -773,25 +746,22 @@ def main() -> int:
                     label=label,
                 )
             extra = ""
-            if matched_csvs > 0 and matched_missing_summaries == matched_csvs:
+            if matched_rows > 0:
                 extra = (
-                    " Found matching response CSVs, but none have been evaluated yet.\n"
-                    "Run evaluation first, e.g.:\n"
-                    "  python experiments/run_experiment1_pipeline.py --dataset sachs --steps evaluate,analyze\n"
-                    "or evaluate a single file:\n"
-                    "  python experiments/evaluate.py --csv <responses_...>.csv --tau 0.7"
+                    " Found matching summary rows, but none have non-null evaluation metrics.\n"
+                    "Rebuild the summary table first, e.g.:\n"
+                    "  python experiments/run_experiment1_pipeline.py --dataset sachs --steps analyze"
                 )
             raise FileNotFoundError(
-                f"No evaluated response summaries found under {', '.join(str(d) for d in response_dirs) or '<no response dirs found>'} "
-                f"for model={args.model}, prompt_style={prompt_style}, anonymize={anonymize}, metric={metric}. "
-                f"(Expected <csv>.summary.json next to response CSVs.){extra}"
+                f"No evaluated rows found in {summary_csv} "
+                f"for model={args.model}, prompt_style={prompt_style}, anonymize={anonymize}, metric={metric}.{extra}"
             )
 
         obs_sizes = _parse_int_list(args.obs_sizes) or sorted(discovered_obs)
         int_sizes = _parse_int_list(args.int_sizes) or sorted(discovered_int)
 
         return _render_table(
-            dataset=dataset,
+            dataset=args.dataset,
             model=args.model,
             prompt_style=prompt_style,
             metric=metric,
@@ -803,31 +773,12 @@ def main() -> int:
         )
 
     def _style_available(style_tag: str) -> Path | None:
-        dataset = args.dataset
-        # Mirror run_experiment1_pipeline.py: responses may live under experiments/responses/<dataset>
-        # or repo_root/responses/<dataset>.
-        if args.responses_dir is not None:
-            resp_dirs = [Path(args.responses_dir)]
-        else:
-            resp_dirs = [
-                Path("experiments") / "responses" / dataset,
-                Path("responses") / dataset,
-            ]
-        resp_dirs = [d for d in resp_dirs if d.exists()]
-        for responses_dir in resp_dirs:
-            for csv_path in responses_dir.glob("responses_obs*_int*_shuf*.csv"):
-                m = _RESP_RE.match(csv_path.stem)
-                if not m:
-                    continue
-                model_tag = (m.group("model") or "").strip()
-                if model_tag != args.model:
-                    continue
-                tags = (m.group("tags") or "").lower()
-                if not _has_style_tag(tags, style_tag.lower()):
-                    continue
-                summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-                if summary_path.exists():
-                    return responses_dir
+        for r in rows:
+            if (r.get("model") or "").strip() != args.model:
+                continue
+            if (r.get("prompt_style") or "").strip().lower() != style_tag.lower():
+                continue
+            return summary_csv.parent
         return None
 
     out_dir = args.out_dir or (Path("experiments") / "out" / "baselines")

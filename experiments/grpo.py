@@ -364,6 +364,110 @@ def _argv_has_flag(argv: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(flag + "=") for arg in argv)
 
 
+def _append_repeat_cli_arg(cmd: list[str], flag: str, values: list[str] | tuple[str, ...]) -> None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        cmd.extend([flag, text])
+
+
+def _is_completed_eval_artifact(json_path: Path, csv_path: Path) -> bool:
+    if not json_path.is_file() or not csv_path.is_file():
+        return False
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return str(payload.get("status", "")).lower() == "completed"
+
+
+def _build_train_checkpoint_eval_command(
+    run_args,
+    *,
+    checkpoint_dir: Path,
+    output_json: Path,
+    output_csv: Path,
+) -> list[str]:
+    script_path = Path(__file__).resolve()
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--mode",
+        "eval",
+        "--task",
+        str(run_args.task),
+        "--eval_model",
+        str(checkpoint_dir),
+        "--eval_output_json",
+        str(output_json),
+        "--eval_debug_csv",
+        str(output_csv),
+        "--max_prompt_tokens",
+        str(run_args.max_prompt_tokens),
+        "--eval_n",
+        str(run_args.eval_n),
+        "--eval_seed",
+        str(run_args.eval_seed),
+        "--eval_batch_size",
+        str(run_args.eval_batch_size),
+        "--eval_pass_k",
+        str(run_args.eval_pass_k),
+        "--eval_max_new_tokens",
+        str(run_args.eval_max_new_tokens),
+        "--eval_temperature",
+        str(run_args.eval_temperature),
+        "--eval_top_p",
+        str(run_args.eval_top_p),
+        "--report_to",
+        "none",
+        "--no-use-vllm",
+    ]
+
+    if bool(run_args.eval_do_sample):
+        cmd.append("--eval_do_sample")
+    if bool(run_args.enable_thinking):
+        cmd.append("--enable-thinking")
+    else:
+        cmd.append("--no-enable-thinking")
+
+    if str(run_args.task) == "math":
+        cmd.extend(["--dataset_id", str(run_args.dataset_id)])
+        cmd.extend(["--eval_split", str(run_args.eval_split)])
+        return cmd
+
+    wrapper_mode = "chat" if bool(run_args.cd_wrap_system_prompt) else "plain"
+    cmd.extend(["--cd-wrapper-mode", wrapper_mode])
+    cmd.extend(["--cd-response-format", str(run_args.cd_response_format)])
+    if bool(run_args.cd_append_format_hint):
+        cmd.append("--cd-append-format-hint")
+    else:
+        cmd.append("--no-cd-append-format-hint")
+    if getattr(run_args, "cd_format_hint_text", None):
+        cmd.extend(["--cd-format-hint-text", str(run_args.cd_format_hint_text)])
+
+    if getattr(run_args, "cd_config_file", None):
+        cmd.extend(["--cd-config-file", str(run_args.cd_config_file)])
+        cmd.extend(["--cd-bif-file", str(run_args.cd_bif_file)])
+        cmd.extend(["--cd-config-num-prompts", str(run_args.cd_config_num_prompts)])
+        cmd.extend(["--cd-config-seed", str(run_args.cd_config_seed)])
+        if bool(run_args.cd_config_causal_rules):
+            cmd.append("--cd-config-causal-rules")
+        if bool(run_args.cd_config_give_steps):
+            cmd.append("--cd-config-give-steps")
+        if bool(run_args.cd_config_def_int):
+            cmd.append("--cd-config-def-int")
+        cmd.extend(["--cd-config-intervene-vars", str(run_args.cd_config_intervene_vars)])
+    else:
+        _append_repeat_cli_arg(cmd, "--cd-train-csv", list(getattr(run_args, "cd_train_csv", []) or []))
+        _append_repeat_cli_arg(cmd, "--cd-test-csv", list(getattr(run_args, "cd_test_csv", []) or []))
+        cmd.extend(["--cd-test-fraction", str(run_args.cd_test_fraction)])
+
+    return cmd
+
+
 def _resolve_model_reference_for_attention(args) -> str:
     if getattr(args, "base_model_override", None):
         return str(args.base_model_override)
@@ -853,6 +957,105 @@ class SaveLaunchCommandCallback(TrainerCallback):
             )
 
 
+class AutoCheckpointEvalCallback(TrainerCallback):
+    """Run fixed-set eval for each saved checkpoint via the existing eval CLI path."""
+
+    def __init__(self, run_args):
+        self.run_args = run_args
+        default_dir = Path(run_args.output_dir) / "grpo_log" / "fixed_eval"
+        self.eval_dir = Path(run_args.train_eval_dir) if run_args.train_eval_dir else default_dir
+        self.repo_root = Path(__file__).resolve().parent.parent
+
+    def _child_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        for key in (
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "NODE_RANK",
+            "TORCHELASTIC_RUN_ID",
+            "TORCHELASTIC_MAX_RESTARTS",
+            "TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_USE_AGENT_STORE",
+        ):
+            env.pop(key, None)
+        env["WANDB_MODE"] = "disabled"
+        env["PYTHONUNBUFFERED"] = "1"
+        if self.run_args.train_eval_cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self.run_args.train_eval_cuda_visible_devices)
+        return env
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_local_process_zero or int(os.environ.get("RANK", "0")) != 0:
+            return
+        if not bool(getattr(self.run_args, "train_eval_on_save", False)):
+            return
+
+        step = int(state.global_step)
+        ckpt_dir = Path(args.output_dir) / f"checkpoint-{step}"
+        if not ckpt_dir.is_dir():
+            return
+
+        self.eval_dir.mkdir(parents=True, exist_ok=True)
+        out_json = self.eval_dir / f"eval_checkpoint_{step}.json"
+        out_csv = self.eval_dir / f"eval_checkpoint_{step}.csv"
+        log_path = self.eval_dir / f"eval_checkpoint_{step}.log"
+
+        if bool(getattr(self.run_args, "train_eval_skip_existing", True)) and _is_completed_eval_artifact(out_json, out_csv):
+            print(f"[auto-eval] skip checkpoint-{step}; completed eval already exists at {out_json}")
+            return
+
+        cmd = _build_train_checkpoint_eval_command(
+            self.run_args,
+            checkpoint_dir=ckpt_dir,
+            output_json=out_json,
+            output_csv=out_csv,
+        )
+        print(
+            f"[auto-eval] evaluating checkpoint-{step} -> {out_json.name} "
+            f"(log: {log_path.name})"
+        )
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("$ " + shlex.join(cmd) + "\n")
+            log_file.flush()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(self.repo_root),
+                    env=self._child_env(),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            except Exception as exc:
+                log_file.write(f"\n[auto-eval-error] {exc}\n")
+                log_file.flush()
+                print(f"[auto-eval] checkpoint-{step} failed to launch: {exc}")
+                return
+
+        if proc.returncode != 0:
+            print(
+                f"[auto-eval] checkpoint-{step} eval failed with exit code {proc.returncode}. "
+                f"See {log_path}"
+            )
+            return
+
+        if _is_completed_eval_artifact(out_json, out_csv):
+            print(f"[auto-eval] checkpoint-{step} eval complete: {out_json}")
+            return
+
+        print(
+            f"[auto-eval] checkpoint-{step} finished without a completed eval artifact. "
+            f"See {log_path}"
+        )
+
+
 def build_argparser():
     p = argparse.ArgumentParser(description="GRPO training with TRL + vLLM server mode")
     p.add_argument("--mode", type=str, default="train", choices=["train", "eval", "export_cd_csv"])
@@ -1284,6 +1487,36 @@ def build_argparser():
         default=0,
         help="Optional max chars for prompt/completion/answer fields in eval-response logs (0 = no truncation).",
     )
+    p.add_argument(
+        "--train-eval-on-save",
+        action="store_true",
+        help=(
+            "After each checkpoint save, run the existing fixed-set eval path on that checkpoint "
+            "from rank 0 and write results under output_dir/grpo_log/fixed_eval."
+        ),
+    )
+    p.add_argument(
+        "--train-eval-dir",
+        type=str,
+        default=None,
+        help="Optional output directory for checkpoint eval artifacts (defaults to output_dir/grpo_log/fixed_eval).",
+    )
+    p.add_argument(
+        "--train-eval-cuda-visible-devices",
+        type=str,
+        default=None,
+        help=(
+            "CUDA_VISIBLE_DEVICES value for checkpoint eval subprocesses. "
+            "Recommended when training already occupies other GPUs."
+        ),
+    )
+    p.add_argument(
+        "--no-train-eval-skip-existing",
+        dest="train_eval_skip_existing",
+        action="store_false",
+        help="Re-run checkpoint eval even if a completed JSON+CSV pair already exists.",
+    )
+    p.set_defaults(train_eval_skip_existing=True)
 
     # Evaluation on a frozen set
     p.add_argument("--eval_split", type=str, default="test")
@@ -1499,6 +1732,11 @@ def _load_cd_rows_from_prompt_csv(
             rows.append(
                 (
                     {
+                        "dataset": str(row.get("dataset") or row.get("dataset_name") or ""),
+                        "obs_per_prompt": _to_jsonable_config(row.get("obs_per_prompt")),
+                        "int_per_combo": _to_jsonable_config(row.get("int_per_combo")),
+                        "anonymize": _to_jsonable_config(row.get("anonymize")),
+                        "prompt_style": str(row.get("prompt_style") or ""),
                         "prompt_raw": prompt_raw,
                         "prompt": prompt_text,
                         "answer": answer_raw,
@@ -1748,6 +1986,11 @@ def _dataset_from_cd_config_file(
             rows.append(
                 (
                     {
+                        "dataset": str(item.get("dataset_name") or bif_path.stem),
+                        "obs_per_prompt": int(obs_n),
+                        "int_per_combo": int(int_n),
+                        "anonymize": bool(item.get("anonymize", anon)),
+                        "prompt_style": str(style),
                         "prompt_raw": prompt_raw,
                         "prompt": prompt_text,
                         "answer": answer_raw,
@@ -2328,7 +2571,7 @@ def run_eval(args):
         _write_eval_snapshot(args.eval_output_json, result)
         print("Saved eval JSON to:", args.eval_output_json)
     if args.eval_debug_csv:
-        fieldnames = [
+        base_fieldnames = [
             "model",
             "example_idx",
             "sample_idx",
@@ -2342,6 +2585,15 @@ def run_eval(args):
             "verify_timed_out",
             "verify_error",
         ]
+        extra_fieldnames = sorted(
+            {
+                str(key)
+                for row in debug_rows
+                for key in row.keys()
+                if str(key) not in set(base_fieldnames)
+            }
+        )
+        fieldnames = base_fieldnames + extra_fieldnames
         with open(args.eval_debug_csv, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -2930,6 +3182,11 @@ def run_train(args, argv: list[str] | None = None):
         _print_prompt_diagnostics(train_dataset, split_name="train")
         _print_prompt_diagnostics(test_dataset, split_name="test")
         keep_cols = [
+            "dataset",
+            "obs_per_prompt",
+            "int_per_combo",
+            "anonymize",
+            "prompt_style",
             "prompt",
             "prompt_raw",
             "answer",
@@ -3286,6 +3543,19 @@ def run_train(args, argv: list[str] | None = None):
             return "prompt_raw", [""] * batch_size
         return "prompt_raw", [_normalize_prompt_item(value)] * batch_size
 
+    def _extract_batch_values(kwargs: dict, key: str, batch_size: int):
+        value = kwargs.get(key)
+        if value is None:
+            return [""] * batch_size
+        if isinstance(value, (list, tuple)):
+            values = [_to_jsonable(v) for v in value]
+            if len(values) == batch_size:
+                return values
+            if len(values) == 1 and batch_size > 1:
+                return values * batch_size
+            return [""] * batch_size
+        return [_to_jsonable(value)] * batch_size
+
     def _register_generation_logging(completions) -> None:
         generation_id = active_generation_id["id"]
         if generation_id in generation_log_decisions:
@@ -3321,6 +3591,9 @@ def run_train(args, argv: list[str] | None = None):
         ts = time.time()
         prompt_key, prompt_texts = _extract_prompt_texts(kwargs, len(completions))
         _, prompt_raw_texts = _extract_raw_prompt_texts(kwargs, len(completions))
+        datasets = _extract_batch_values(kwargs, "dataset", len(completions))
+        obs_per_prompts = _extract_batch_values(kwargs, "obs_per_prompt", len(completions))
+        int_per_combos = _extract_batch_values(kwargs, "int_per_combo", len(completions))
         answers = kwargs.get("answer")
         solutions = kwargs.get("solution")
         sampled_indices = decision.get("sampled_indices", set())
@@ -3346,6 +3619,9 @@ def run_train(args, argv: list[str] | None = None):
                     "global_step": int(train_state_snapshot.get("global_step") or 0),
                     "epoch": train_state_snapshot.get("epoch"),
                     "prompt_key": prompt_key,
+                    "dataset": _value_at(datasets, i),
+                    "obs_per_prompt": _value_at(obs_per_prompts, i),
+                    "int_per_combo": _value_at(int_per_combos, i),
                     "format_ok": (
                         int(bool(FORMAT_RE.match(completion_text)))
                         if args.task == "math"
@@ -3411,6 +3687,9 @@ def run_train(args, argv: list[str] | None = None):
                             "reward_call_idx": row["last_reward_call_idx"],
                             "sample_idx": row["sample_idx"],
                             "prompt_key": row["prompt_key"],
+                            "dataset": row.get("dataset"),
+                            "obs_per_prompt": row.get("obs_per_prompt"),
+                            "int_per_combo": row.get("int_per_combo"),
                             "format_ok": row["format_ok"],
                             "format_ok_scored_on_full_completion": row["format_ok_scored_on_full_completion"],
                             "ended_with_answer_tag": row["ended_with_answer_tag"],
@@ -3621,6 +3900,12 @@ def run_train(args, argv: list[str] | None = None):
             encoding="utf-8",
         )
 
+    if args.train_eval_on_save and torch.cuda.is_available() and not args.train_eval_cuda_visible_devices:
+        raise ValueError(
+            "--train-eval-on-save requires --train-eval-cuda-visible-devices so the eval subprocess "
+            "can run on a dedicated GPU set without contending with the live training workers."
+        )
+
     try:
         callbacks = [
             CompactMetricsCallback(),
@@ -3633,6 +3918,8 @@ def run_train(args, argv: list[str] | None = None):
             TrainStateSnapshotCallback(train_state_snapshot),
             SaveLaunchCommandCallback(argv),
         ]
+        if args.train_eval_on_save:
+            callbacks.append(AutoCheckpointEvalCallback(args))
         metrics_jsonl_path = (
             Path(args.train_log_jsonl)
             if args.train_log_jsonl

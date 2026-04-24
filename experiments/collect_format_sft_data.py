@@ -3,7 +3,8 @@
 collect_format_sft_data.py
 
 Collect SFT examples that teach the model to start reasoning immediately
-after <think> in the correct staged format.
+after <think> in a chosen target style: answer-only formatting, concise
+evidence-grounded reasoning, or full staged reasoning.
 
 Three modes
 -----------
@@ -31,6 +32,13 @@ Usage examples
     python experiments/collect_format_sft_data.py \\
         --graphs cancer earthquake asia sachs \\
         --col-perms 5 --num-prompts-per-config 500
+
+    # Mode A — concise evidence-grounded reasoning targets
+    python experiments/collect_format_sft_data.py \\
+        --graphs sachs cancer \\
+        --obs-values 100 --int-values 50 \\
+        --reasoning-target concise_evidence \\
+        --output experiments/data/format_sft_concise.jsonl
 
     # Mode B — CSV discovery, 100 rows per source
     python experiments/collect_format_sft_data.py \\
@@ -71,6 +79,9 @@ try:
     from cd_sft.staged_targets import (  # noqa: E402
         _load_adj,
         _extract_variables,
+        _build_edge_effect_table,
+        _directed_edges,
+        _skeleton_edges,
         build_evidence_grounded_sections,
         build_staged_sections,
     )
@@ -80,6 +91,9 @@ except ImportError:
     from experiments.cd_sft.staged_targets import (  # noqa: E402
         _load_adj,
         _extract_variables,
+        _build_edge_effect_table,
+        _directed_edges,
+        _skeleton_edges,
         build_evidence_grounded_sections,
         build_staged_sections,
     )
@@ -140,6 +154,12 @@ def _build_reasoning_text(
 ) -> Tuple[str, str, str, str]:
     if reasoning_target == "answer_only":
         return "", "", "", ""
+    if reasoning_target == "concise_evidence":
+        return "", "", "", _build_concise_evidence_think(
+            prompt_text=prompt_text,
+            adj=adj,
+            variables=variables,
+        )
     if reasoning_target == "stages":
         stage1_text, stage2_text, stage3_text = _build_think_sections(
             prompt_text=prompt_text,
@@ -165,6 +185,65 @@ def _reasoning_style_label(reasoning_target: str) -> str:
     if reasoning_target == "stages_evidence":
         return "evidence"
     return reasoning_target
+
+
+def _reasoning_guidance_for_target(reasoning_target: str) -> str:
+    if reasoning_target in {"answer_only"}:
+        return "none"
+    if reasoning_target in {"concise_evidence"}:
+        return "concise"
+    return "staged"
+
+
+def _build_concise_evidence_think(
+    *,
+    prompt_text: str,
+    adj: List[List[int]],
+    variables: List[str],
+) -> str:
+    """
+    Build a short, evidence-grounded think block.
+
+    The goal is to teach the model to mention only the strongest causal evidence,
+    keep the graph sparse, and transition quickly into the answer payload.
+    """
+    effect_table = _build_edge_effect_table(prompt_text, variables)
+    directed_edges = _directed_edges(adj)
+    supported_edges = [
+        effect_table[(i, j)]
+        for i, j in directed_edges
+        if (i, j) in effect_table
+    ]
+    supported_edges.sort(key=lambda item: float(item["tv"]), reverse=True)
+
+    lines: List[str] = []
+    if supported_edges:
+        top_edges = supported_edges[:3]
+        edge_bits = [
+            f"{item['cause_name']} -> {item['effect_name']} (TV={float(item['tv']):.2f})"
+            for item in top_edges
+        ]
+        lines.append("Strongest intervention shifts support " + "; ".join(edge_bits) + ".")
+    else:
+        skeleton = _skeleton_edges(adj)
+        if skeleton:
+            pairs = [f"{variables[i]} -- {variables[j]}" for i, j in skeleton[:3]]
+            lines.append("The strongest dependencies suggest edges among " + ", ".join(pairs) + ".")
+        else:
+            lines.append("The evidence supports a very sparse graph with no strong direct effects.")
+
+    unsupported_true_edges = max(0, len(directed_edges) - len(supported_edges))
+    if unsupported_true_edges > 0:
+        lines.append("Keep the remaining structure sparse and only orient edges when the evidence clearly supports it.")
+    else:
+        lines.append("No extra direct edges are needed beyond the clearly supported effects.")
+
+    if effect_table:
+        lines.append("Choose the sparsest DAG consistent with these intervention patterns.")
+    else:
+        lines.append("Choose the sparsest DAG consistent with the observational and interventional evidence.")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +289,7 @@ def _build_record(
         prompt_raw,
         task="causal_discovery",
         wrapper_mode=wrapper_mode,
+        reasoning_guidance=_reasoning_guidance_for_target(reasoning_target),
         prefill_think=True,
     )
     completion = (
@@ -360,6 +440,7 @@ def _build_records_in_memory(
                 prompt_raw,
                 task="causal_discovery",
                 wrapper_mode=wrapper_mode,
+                reasoning_guidance=_reasoning_guidance_for_target(reasoning_target),
                 prefill_think=True,
             )
             completion = (
@@ -677,6 +758,7 @@ def _build_records_perm_csv(
                 prompt_perm,
                 task="causal_discovery",
                 wrapper_mode=wrapper_mode,
+                reasoning_guidance=_reasoning_guidance_for_target(reasoning_target),
                 prefill_think=True,
             )
             try:
@@ -800,7 +882,7 @@ def main() -> None:
     ap.add_argument("--answer-col", default="answer")
     ap.add_argument(
         "--reasoning-target",
-        choices=["answer_only", "stages", "stages_evidence"],
+        choices=["answer_only", "concise_evidence", "stages", "stages_evidence"],
         default="stages_evidence",
         help="Supervised completion target style.",
     )

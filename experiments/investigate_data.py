@@ -6,6 +6,7 @@ import csv
 import json
 import subprocess
 import re
+from evaluate import evaluate_response_csv
 
 # Display settings: do not abbreviate DataFrame output
 pd.set_option("display.max_rows", None)        # show all rows
@@ -213,29 +214,13 @@ def evaluate_and_write_summary(base_dir: Path = BASE_DIR, summary_csv: Path = SU
 
     for csv_path in complete_files:
         print(f"\nEvaluating {csv_path}")
-        proc = subprocess.run(
-            ["python", "evaluate.py", "--csv", str(csv_path)],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            print(f"[ERROR] evaluate.py failed on {csv_path}")
-            print(proc.stdout)
-            print(proc.stderr)
-            continue
-
-        # evaluate.py should have created <file>.summary.json
-        summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-        if not summary_path.exists():
-            print(f"[WARN] Summary JSON not found for {csv_path}: {summary_path}")
-            continue
-
         try:
-            with summary_path.open("r", encoding="utf-8") as f_sum:
-                metrics = json.load(f_sum)
+            result = evaluate_response_csv(csv_path, write_artifacts=False, verbose=False)
         except Exception as e:
-            print(f"[ERROR] Failed to read summary JSON for {csv_path}: {e}")
+            print(f"[ERROR] evaluate_response_csv failed on {csv_path}: {e}")
             continue
+
+        metrics = dict(result["summary"])
 
         # Build one combined row: file name + completeness stats + eval metrics
         base_stats = file_stats[csv_path]
