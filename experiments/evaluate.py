@@ -789,6 +789,55 @@ def _infer_prompt_style_from_stem(stem: str) -> str:
     return ""
 
 
+def _normalize_stem_for_parse(stem: str) -> str:
+    out = stem
+    out = out.replace("summary_joint", "summary")
+    out = out.replace("summary_join", "summary")
+    out = out.replace("thinktags_cothint", "wrapchat_fmthint")
+    out = out.replace("cothint_thinktags", "wrapchat_fmthint")
+    out = out.replace("thinktags", "wrapchat")
+    out = out.replace("cothint", "fmthint")
+    out = out.replace("respthink_answer", "")
+    out = out.replace("wrapplain", "")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
+def _infer_model_from_stem(stem: str) -> str:
+    stem = _normalize_stem_for_parse(stem)
+    tag_re = (
+        r"(?:anon|rules|steps|wrapchat|fmthint|reason(?:concise|none)|shuf\d+|"
+        r"row[A-Za-z0-9]+|col[A-Za-z0-9]+)"
+    )
+    m_names = re.match(
+        rf"^responses_names_only(?:_p\d+)?(?P<tags>(?:_{tag_re})*)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_names:
+        return m_names.group("model")
+
+    m_resp = re.match(
+        rf"^responses_obs\d+_int\d+_shuf\d+_p\d+(?:_{tag_re})*"
+        rf"_(?:summary_probs|payload_topk|payload|summary|matrix|cases)_(?P<model>.+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if m_resp:
+        return m_resp.group("model")
+    return ""
+
+
+def _infer_reasoning_guidance_from_stem(stem: str) -> str:
+    lowered = _normalize_stem_for_parse(stem).lower()
+    if "reasonconcise" in lowered:
+        return "concise"
+    if "reasonnone" in lowered:
+        return "none"
+    return "staged"
+
+
 def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
     """
     Best-effort extraction of metadata from the response CSV filename/path.
@@ -800,26 +849,14 @@ def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
     m = _RESP_META_RE.match(stem)
     model = ""
     try:
-        # Names-only: responses_names_only_p5_<model>
-        m_names = re.match(r"^responses_names_only_p\d+_(?P<model>.+)$", stem, flags=re.IGNORECASE)
-        if m_names:
-            model = m_names.group("model")
-        else:
-            # Regular prompts: responses_obs..._thinktags_<style>_<model>
-            m_resp = re.match(
-                r"^responses_obs\d+_int\d+_shuf\d+_p\d+_(?:anon_)?thinktags_"
-                r"(?:matrix|summary|cases|payload|payload_topk)_(?P<model>.+)$",
-                stem,
-                flags=re.IGNORECASE,
-            )
-            if m_resp:
-                model = m_resp.group("model")
+        model = _infer_model_from_stem(stem)
     except Exception:
         model = ""
 
     out: Dict[str, Any] = {
         "dataset": csv_path.parent.name,
         "model": model,
+        "reasoning_guidance": _infer_reasoning_guidance_from_stem(stem),
         "obs_n": None,
         "int_n": None,
         "prompt_style": _infer_prompt_style_from_stem(stem),
@@ -833,45 +870,24 @@ def _infer_response_metadata(csv_path: Path) -> Dict[str, Any]:
 
 # ------------------------ Main ------------------------ #
 
-def main():
-    ap = argparse.ArgumentParser(description="Evaluate predictions, compute stability, and build a consensus graph.")
-    ap.add_argument("--csv", required=True,
-                    help="CSV with columns 'answer' (GT JSON) and 'prediction' (pred adjacency JSON) or 'raw_response'.")
-    ap.add_argument("--answer-col", default=None,
-                    help="Ground-truth JSON column. If not set, will try 'answer' then 'answer_path'.")
-    ap.add_argument("--pred-col", default="prediction", help="Predicted adjacency JSON column.")
-    ap.add_argument("--per-row-out", default=None,
-                    help="If set, write per-row metrics CSV to this path (default: <csv>.per_row.csv).")
-    ap.add_argument(
-        "--inplace",
-        action="store_true",
-        help="If set, append per-row metrics columns to the input CSV (instead of writing <csv>.per_row.csv).",
-    )
-    ap.add_argument(
-        "--summary-csv",
-        default=None,
-        help=(
-            "If set, appends/writes ONE row of summary metrics to this CSV (aggregated over rows in --csv). "
-            "Useful for collecting summaries across many runs."
-        ),
-    )
-    # Consensus/stability controls & outputs
-    ap.add_argument("--tau", type=float, default=0.7,
-                    help="Consensus threshold; include edge if selection prob >= tau.")
-    ap.add_argument("--consensus-json", default=None,
-                    help="Path to save consensus artifact JSON (P, CIs, consensus adjacency). "
-                         "Default: <csv>.consensus_tau{tau}.json")
-    ap.add_argument("--save-edge-table", default=None,
-                    help="Optional CSV with per-edge probabilities and Wilson CIs.")
-    # NEW: single PDF with true vs probabilistic predicted edges
-    ap.add_argument("--prob-plot", default=None,
-                    help="Path to save the probability-labeled predicted graph vs true. "
-                         "Default: <csv>.probplot.pdf")
-    args = ap.parse_args()
+def evaluate_response_csv(
+    csv_path: Path,
+    *,
+    answer_col: Optional[str] = None,
+    pred_col: str = "prediction",
+    tau: float = 0.7,
+    consensus_json: Optional[Path] = None,
+    save_edge_table: Optional[Path] = None,
+    prob_plot: Optional[Path] = None,
+    write_artifacts: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg)
 
-    csv_path = Path(args.csv)
     if not csv_path.exists():
-        raise SystemExit(f"CSV not found: {csv_path}")
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     # Some model outputs (especially large adjacency payloads) can exceed the default
     # csv module field limit (~128KB). Raise it to avoid _csv.Error.
@@ -880,7 +896,6 @@ def main():
     except OverflowError:
         csv.field_size_limit(1_000_000)
 
-    # Read all rows
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         rows: List[Dict[str, Any]] = list(reader)
@@ -891,15 +906,13 @@ def main():
         if extras:
             malformed_csv_rows += 1
 
-    # Pick an answer column to use
-    if args.answer_col:
-        answer_col = args.answer_col
+    if answer_col:
+        resolved_answer_col = answer_col
     else:
-        # try both common names
         if "answer" in orig_fieldnames:
-            answer_col = "answer"
+            resolved_answer_col = "answer"
         elif "answer_path" in orig_fieldnames:
-            answer_col = "answer_path"
+            resolved_answer_col = "answer_path"
         else:
             answer_col = "answer_path"  # fall back; will likely yield None later
     print(f"[info] Using answer column: {answer_col}")
@@ -910,36 +923,31 @@ def main():
             file=sys.stderr,
         )
 
-    # When the GT is stored as a relative path (answer_path), resolve it relative to
-    # the experiments/ directory (so evaluation works no matter what your CWD is).
-    # Typical layout: experiments/responses/<dataset>/responses_....csv
     resolve_roots: List[Path] = []
     try:
         if len(csv_path.parents) >= 3:
-            resolve_roots.append(csv_path.parents[2])  # .../experiments
+            resolve_roots.append(csv_path.parents[2])
     except Exception:
         pass
 
-    # Optionally rebuild `prediction` from `raw_response`
     RAW_COL = "raw_response"
     if RAW_COL in orig_fieldnames:
         for row in rows:
             raw = row.get(RAW_COL, "") or ""
             row["format_ok"] = is_format_ok(raw)
-            pred_existing = row.get(args.pred_col, "") or ""
+            pred_existing = row.get(pred_col, "") or ""
             if str(pred_existing).strip():
                 continue
-            ans_s = row.get(answer_col, "") or ""
+            ans_s = row.get(resolved_answer_col, "") or ""
             _A_true_for_vars, vars_for_this = load_gt_from_cell(ans_s, resolve_roots=resolve_roots)
             mat = extract_adjacency_from_response(raw, fallback_variables=vars_for_this)
             if mat is not None:
-                row[args.pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
+                row[pred_col] = json.dumps(mat.tolist(), ensure_ascii=False)
                 row["valid"] = 1
             else:
-                row[args.pred_col] = ""
+                row[pred_col] = ""
                 row["valid"] = 0
 
-    # --- Per-row metrics (existing flow) ---
     per_row_metrics: List[Dict[str, Any]] = []
 
     tp_list: List[int] = []
@@ -964,7 +972,6 @@ def main():
     format_ok_rows = 0
     format_scored_rows = 0
 
-    # Collect for consensus/probability plot
     pred_mats_all: List[np.ndarray] = []
     true_mats_all: List[np.ndarray] = []
     variables_first: Optional[List[str]] = None
@@ -972,8 +979,8 @@ def main():
     nhd_ratio_list: List[float] = []
 
     for row_idx, row in enumerate(rows):
-        ans_s = row.get(answer_col, "") or ""
-        pred_s = row.get(args.pred_col, "") or ""
+        ans_s = row.get(resolved_answer_col, "") or ""
+        pred_s = row.get(pred_col, "") or ""
         raw_s = row.get(RAW_COL, "") or ""
         fmt_val_raw = row.get("format_ok", "")
         if fmt_val_raw == "" and raw_s:
@@ -991,21 +998,20 @@ def main():
             variables_first = vars_from_this
 
         if A_true is not None and A_pred is not None and A_true.shape != A_pred.shape:
-            # Treat wrong-size predictions as invalid rows instead of aborting the entire run.
             shape_mismatch_rows += 1
-            row[args.pred_col] = ""
+            row[pred_col] = ""
             row["valid"] = 0
             A_pred = None
 
         if A_true is None or A_pred is None:
             met = {k: None for k in [
-                "n_vars","tp","tn","fp","fn","accuracy","precision","recall",
-                "f1","shd","orient_eval_pairs","orient_tp","orient_fn","orient_acc"
+                "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall",
+                "f1", "shd", "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
             ]}
         else:
             met = eval_pair(A_true, A_pred)
             valid_rows += 1
-            # --- NHD & NHD ratio for this row ---
+
             nhd_val = nhd(A_true, A_pred, use_m2=True)
             n = A_pred.shape[0]
             off = ~np.eye(n, dtype=bool)
@@ -1017,12 +1023,13 @@ def main():
             nhd_list.append(nhd_val)
             nhd_ratio_list.append(nhd_ratio_val)
 
-            # also store on this row so it can be written out
             met["nhd"] = nhd_val
             met["nhd_ratio"] = nhd_ratio_val
 
-            tp_list.append(met["tp"]);   tn_list.append(met["tn"])
-            fp_list.append(met["fp"]);   fn_list.append(met["fn"])
+            tp_list.append(met["tp"])
+            tn_list.append(met["tn"])
+            fp_list.append(met["fp"])
+            fn_list.append(met["fn"])
             shd_list.append(met["shd"])
 
             acc_list.append(met["accuracy"])
@@ -1035,12 +1042,10 @@ def main():
             orient_fn_list.append(met["orient_fn"])
             orient_acc_list.append(met["orient_acc"])
 
-            # number of predicted (off-diagonal) edges
             n = A_pred.shape[0]
             mask_offdiag = ~np.eye(n, dtype=bool)
             pred_edges_list.append(int(A_pred[mask_offdiag].sum()))
 
-            # collect for probability plot / consensus
             pred_mats_all.append(A_pred.astype(int))
             true_mats_all.append(A_true.astype(int))
 
@@ -1055,37 +1060,35 @@ def main():
 
     df = pd.DataFrame(rows)
 
-    # Continue even if graph parsing failed, so format metrics are still reported.
     if valid_rows == 0:
-        print(f"[info] No valid rows in {csv_path}. Graph metrics will be null; format metrics will still be reported.")
+        _log(f"[info] No valid rows in {csv_path}. Graph metrics will be null; format metrics will still be reported.")
     if shape_mismatch_rows > 0:
         print(
             f"[warn] Ignored {shape_mismatch_rows} row(s) with prediction shape != GT shape in {csv_path}.",
             file=sys.stderr,
         )
 
-    # --- Global averages (existing flow) ---
     if valid_rows > 0:
         def _mean_or_none(xs: List[Optional[float]]) -> Optional[float]:
             vals = [x for x in xs if x is not None]
             return float(sum(vals) / len(vals)) if vals else None
 
-        avg_TP  = float(sum(tp_list) / valid_rows)
-        avg_TN  = float(sum(tn_list) / valid_rows)
-        avg_FP  = float(sum(fp_list) / valid_rows)
-        avg_FN  = float(sum(fn_list) / valid_rows)
+        avg_TP = float(sum(tp_list) / valid_rows)
+        avg_TN = float(sum(tn_list) / valid_rows)
+        avg_FP = float(sum(fp_list) / valid_rows)
+        avg_FN = float(sum(fn_list) / valid_rows)
         avg_SHD = float(sum(shd_list) / valid_rows)
 
-        avg_accuracy  = float(sum(acc_list) / valid_rows)
+        avg_accuracy = float(sum(acc_list) / valid_rows)
         avg_precision = _mean_or_none(prec_list)
-        avg_recall    = _mean_or_none(rec_list)
-        avg_f1        = _mean_or_none(f1_list)
+        avg_recall = _mean_or_none(rec_list)
+        avg_f1 = _mean_or_none(f1_list)
 
         avg_orient_eval = float(sum(orient_eval_list) / valid_rows)
-        avg_orient_TP   = float(sum(orient_tp_list) / valid_rows)
-        avg_orient_FN   = float(sum(orient_fn_list) / valid_rows)
-        avg_orient_acc  = _mean_or_none(orient_acc_list)
-        avg_pred_edges  = float(sum(pred_edges_list) / valid_rows)
+        avg_orient_TP = float(sum(orient_tp_list) / valid_rows)
+        avg_orient_FN = float(sum(orient_fn_list) / valid_rows)
+        avg_orient_acc = _mean_or_none(orient_acc_list)
+        avg_pred_edges = float(sum(pred_edges_list) / valid_rows)
     else:
         avg_TP = avg_TN = avg_FP = avg_FN = avg_SHD = None
         avg_accuracy = avg_precision = avg_recall = avg_f1 = None
@@ -1100,7 +1103,6 @@ def main():
     else:
         given_edge_frac = None
 
-    # --- Build probabilities/consensus & single PDF ---
     A_true_ref = true_mats_all[0] if true_mats_all else None
     P = Var = Ent = WL = WH = None
     K = 0
@@ -1114,68 +1116,68 @@ def main():
 
     if pred_mats_all:
         P, Var, Ent, WL, WH, K = edge_stability(pred_mats_all)
-        consensus_adj = consensus_from_P(P, tau=args.tau)
+        consensus_adj = consensus_from_P(P, tau=tau)
         n = consensus_adj.shape[0]
         consensus_num_edges = int(consensus_adj[~np.eye(n, dtype=bool)].sum())
         if A_true_ref is not None:
             consensus_metrics = eval_pair(A_true_ref, consensus_adj)
 
-        # Consensus artifact JSON
-        cj_path = (csv_path.with_suffix(csv_path.suffix + f".consensus_tau{args.tau:.2f}.json")
-                   if args.consensus_json is None else Path(args.consensus_json))
         artifact = {
-            "variables": (variables_first if variables_first is not None else
-                          [f"X{i+1}" for i in range(P.shape[0])]),
-            "tau": float(args.tau),
+            "variables": (
+                variables_first if variables_first is not None else [f"X{i+1}" for i in range(P.shape[0])]
+            ),
+            "tau": float(tau),
             "K": int(K),
             "adjacency_matrix_consensus": consensus_adj.tolist(),
             "P": P.tolist(),
             "wilson_low": WL.tolist(),
             "wilson_high": WH.tolist(),
         }
-        with cj_path.open("w", encoding="utf-8") as f_out:
-            json.dump(artifact, f_out, indent=2)
-        print(f"Saved consensus artifact to: {cj_path}")
 
-        # Optional: per-edge table
-        if args.save_edge_table:
-            vars_list = artifact["variables"]
-            nvars = len(vars_list)
-            rows_edges = []
-            for i in range(nvars):
-                for j in range(nvars):
-                    if i == j:
-                        continue
-                    rows_edges.append({
-                        "src_idx": i,
-                        "dst_idx": j,
-                        "src": vars_list[i],
-                        "dst": vars_list[j],
-                        "p_ij": float(P[i, j]),
-                        "wilson_low": float(WL[i, j]),
-                        "wilson_high": float(WH[i, j]),
-                        "in_consensus": int(consensus_adj[i, j]),
-                    })
-            edge_df = pd.DataFrame(rows_edges)
-            Path(args.save_edge_table).parent.mkdir(parents=True, exist_ok=True)
-            edge_df.to_csv(args.save_edge_table, index=False)
-            print(f"Saved per-edge table to: {args.save_edge_table}")
+        if write_artifacts:
+            cj_path = (
+                csv_path.with_suffix(csv_path.suffix + f".consensus_tau{tau:.2f}.json")
+                if consensus_json is None
+                else consensus_json
+            )
+            with cj_path.open("w", encoding="utf-8") as f_out:
+                json.dump(artifact, f_out, indent=2)
+            _log(f"Saved consensus artifact to: {cj_path}")
 
-        # === ONE PDF per CSV: true vs probability-labeled predicted ===
-        if A_true_ref is not None:
-            var_names = artifact["variables"]
-            prob_path = (csv_path.with_suffix(".probplot.pdf")
-                         if args.prob_plot is None else Path(args.prob_plot))
-            show_probs = (K is not None and K > 1)
-            save_true_vs_prob_graph(A_true_ref, P, var_names, prob_path, show_probs=show_probs)
-            print(f"Saved probability-labeled predicted graph: {prob_path}")
-            # --- after you have P and A_true_ref ---
-        # Compute Brier scores if we have probabilities and a GT reference
+            if save_edge_table is not None:
+                vars_list = artifact["variables"]
+                nvars = len(vars_list)
+                rows_edges = []
+                for i in range(nvars):
+                    for j in range(nvars):
+                        if i == j:
+                            continue
+                        rows_edges.append({
+                            "src_idx": i,
+                            "dst_idx": j,
+                            "src": vars_list[i],
+                            "dst": vars_list[j],
+                            "p_ij": float(P[i, j]),
+                            "wilson_low": float(WL[i, j]),
+                            "wilson_high": float(WH[i, j]),
+                            "in_consensus": int(consensus_adj[i, j]),
+                        })
+                edge_df = pd.DataFrame(rows_edges)
+                save_edge_table.parent.mkdir(parents=True, exist_ok=True)
+                edge_df.to_csv(save_edge_table, index=False)
+                _log(f"Saved per-edge table to: {save_edge_table}")
+
+            if A_true_ref is not None:
+                var_names = artifact["variables"]
+                prob_path = csv_path.with_suffix(".probplot.pdf") if prob_plot is None else prob_plot
+                show_probs = K > 1
+                save_true_vs_prob_graph(A_true_ref, P, var_names, prob_path, show_probs=show_probs)
+                _log(f"Saved probability-labeled predicted graph: {prob_path}")
+
         if A_true_ref is not None:
             brier = brier_edgewise(P, A_true_ref)
             brier_skel = brier_skeleton(P, A_true_ref)
 
-        # Compute consensus NHD / ratio now that consensus_adj exists
         if consensus_adj is not None and A_true_ref is not None:
             nhd_consensus = nhd(A_true_ref, consensus_adj, use_m2=True)
             off_cons = ~np.eye(consensus_adj.shape[0], dtype=bool)
@@ -1183,9 +1185,6 @@ def main():
             base_cons = nhd_baseline(A_true_ref, k_pred_cons, use_m2=True)
             nhd_ratio_consensus = (nhd_consensus / base_cons) if base_cons > 0 else float("nan")
 
-
-
-    # ---- Original summary keys (unchanged names) ----
     summary = {
         "num_rows": len(rows),
         "valid_rows": valid_rows,
@@ -1209,23 +1208,20 @@ def main():
         "true_num_edges": int(true_num_edges) if true_num_edges is not None else None,
         "given_edges": int(has_given_edges),
         "given_edge_count": int(given_edge_count),
-        "given_edge_frac": (float(given_edge_frac) if given_edge_frac is not None else None),
-    }
-    summary.update({
+        "given_edge_frac": float(given_edge_frac) if given_edge_frac is not None else None,
         "brier": brier,
         "brier_skeleton": brier_skel,
-    })
+    }
     if brier is not None:
-        print(f"Brier (directed): {brier:.6f}")
+        _log(f"Brier (directed): {brier:.6f}")
     if brier_skel is not None:
-        print(f"Brier (skeleton): {brier_skel:.6f}")
+        _log(f"Brier (skeleton): {brier_skel:.6f}")
 
-    # ---- Variability summaries (unique names) ----
     shd_mean, shd_sd, shd_iqr, shd_ci = _mean_std_iqr_ci(shd_list)
     acc_mean, acc_sd, acc_iqr, acc_ci = _mean_std_iqr_ci(acc_list)
     pre_mean, pre_sd, pre_iqr, pre_ci = _mean_std_iqr_ci([x for x in prec_list if x is not None])
     rec_mean, rec_sd, rec_iqr, rec_ci = _mean_std_iqr_ci([x for x in rec_list if x is not None])
-    f1_mean,  f1_sd,  f1_iqr,  f1_ci  = _mean_std_iqr_ci([x for x in f1_list  if x is not None])
+    f1_mean, f1_sd, f1_iqr, f1_ci = _mean_std_iqr_ci([x for x in f1_list if x is not None])
     edges_mean, edges_sd, edges_iqr, edges_ci = _mean_std_iqr_ci(pred_edges_list)
 
     summary.update({
@@ -1233,54 +1229,35 @@ def main():
         "var_shd_iqr": shd_iqr,
         "var_shd_ci95_low": shd_ci[0],
         "var_shd_ci95_high": shd_ci[1],
-
         "var_accuracy_sd": acc_sd,
         "var_accuracy_iqr": acc_iqr,
         "var_accuracy_ci95_low": acc_ci[0],
         "var_accuracy_ci95_high": acc_ci[1],
-
         "var_precision_sd": pre_sd,
         "var_precision_iqr": pre_iqr,
         "var_precision_ci95_low": pre_ci[0],
         "var_precision_ci95_high": pre_ci[1],
-
         "var_recall_sd": rec_sd,
         "var_recall_iqr": rec_iqr,
         "var_recall_ci95_low": rec_ci[0],
         "var_recall_ci95_high": rec_ci[1],
-
         "var_f1_sd": f1_sd,
         "var_f1_iqr": f1_iqr,
         "var_f1_ci95_low": f1_ci[0],
         "var_f1_ci95_high": f1_ci[1],
-
         "var_num_pred_edges_sd": edges_sd,
         "var_num_pred_edges_iqr": edges_iqr,
         "var_num_pred_edges_ci95_low": edges_ci[0],
         "var_num_pred_edges_ci95_high": edges_ci[1],
     })
 
-    # ---- Consensus summary (unique names; optional) ----
     if P is not None:
-        summary.update({
-            "consensus_tau": float(args.tau),
-            "consensus_K": int(K),
-            "consensus_num_edges": int(consensus_num_edges),
-        })
-        if consensus_metrics is not None:
-            summary.update({
-                "consensus_accuracy": consensus_metrics["accuracy"],
-                "consensus_precision": consensus_metrics["precision"],
-                "consensus_recall": consensus_metrics["recall"],
-                "consensus_f1": consensus_metrics["f1"],
-                "consensus_shd": consensus_metrics["shd"],
-                "consensus_orient_acc": consensus_metrics["orient_acc"],
-            })
-        # Per-row dispersion for NHD and NHD ratio
         nhd_mean, nhd_sd, nhd_iqr, nhd_ci = _mean_std_iqr_ci(nhd_list)
         nhd_ratio_mean, nhd_ratio_sd, nhd_ratio_iqr, nhd_ratio_ci = _mean_std_iqr_ci(nhd_ratio_list)
-
         summary.update({
+            "consensus_tau": float(tau),
+            "consensus_K": int(K),
+            "consensus_num_edges": int(consensus_num_edges),
             "nhd_mean": nhd_mean,
             "nhd_sd": nhd_sd,
             "nhd_iqr": nhd_iqr,
@@ -1291,26 +1268,99 @@ def main():
             "nhd_ratio_iqr": nhd_ratio_iqr,
             "nhd_ratio_ci95_low": nhd_ratio_ci[0],
             "nhd_ratio_ci95_high": nhd_ratio_ci[1],
-        })
-
-
-        # Consensus-level NHD
-        summary.update({
             "nhd_consensus": nhd_consensus,
             "nhd_ratio_consensus": nhd_ratio_consensus,
         })
+        if consensus_metrics is not None:
+            summary.update({
+                "consensus_accuracy": consensus_metrics["accuracy"],
+                "consensus_precision": consensus_metrics["precision"],
+                "consensus_recall": consensus_metrics["recall"],
+                "consensus_f1": consensus_metrics["f1"],
+                "consensus_shd": consensus_metrics["shd"],
+                "consensus_orient_acc": consensus_metrics["orient_acc"],
+            })
 
-    # Print and save summary JSON
-    print("=== Global metrics (averages per row) + consensus ===")
-    for k, v in summary.items():
-        print(f"{k}: {v}")
+    _log("=== Global metrics (averages per row) + consensus ===")
+    if verbose:
+        for k, v in summary.items():
+            print(f"{k}: {v}")
 
-    summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
-    with summary_path.open("w", encoding="utf-8") as f_sum:
-        json.dump(summary, f_sum, indent=2)
-    print(f"Saved summary to: {summary_path}")
+    return {
+        "rows": rows,
+        "orig_fieldnames": orig_fieldnames,
+        "per_row_metrics": per_row_metrics,
+        "summary": summary,
+        "answer_col": resolved_answer_col,
+    }
 
-    # Optional: append a single-row summary table
+
+def main():
+    ap = argparse.ArgumentParser(description="Evaluate predictions, compute stability, and build a consensus graph.")
+    ap.add_argument("--csv", required=True,
+                    help="CSV with columns 'answer' (GT JSON) and 'prediction' (pred adjacency JSON) or 'raw_response'.")
+    ap.add_argument("--answer-col", default=None,
+                    help="Ground-truth JSON column. If not set, will try 'answer' then 'answer_path'.")
+    ap.add_argument("--pred-col", default="prediction", help="Predicted adjacency JSON column.")
+    ap.add_argument("--per-row-out", default=None,
+                    help="If set, write per-row metrics CSV to this path (default: <csv>.per_row.csv).")
+    ap.add_argument(
+        "--inplace",
+        action="store_true",
+        help="If set, append per-row metrics columns to the input CSV (instead of writing <csv>.per_row.csv).",
+    )
+    ap.add_argument(
+        "--summary-csv",
+        default=None,
+        help=(
+            "If set, appends/writes ONE row of summary metrics to this CSV (aggregated over rows in --csv). "
+            "Useful for collecting summaries across many runs."
+        ),
+    )
+    ap.add_argument(
+        "--write-summary-json",
+        action="store_true",
+        help="If set, also write the legacy <csv>.summary.json sidecar.",
+    )
+    ap.add_argument("--tau", type=float, default=0.7,
+                    help="Consensus threshold; include edge if selection prob >= tau.")
+    ap.add_argument("--consensus-json", default=None,
+                    help="Path to save consensus artifact JSON (P, CIs, consensus adjacency). "
+                         "Default: <csv>.consensus_tau{tau}.json")
+    ap.add_argument("--save-edge-table", default=None,
+                    help="Optional CSV with per-edge probabilities and Wilson CIs.")
+    ap.add_argument("--prob-plot", default=None,
+                    help="Path to save the probability-labeled predicted graph vs true. "
+                         "Default: <csv>.probplot.pdf")
+    args = ap.parse_args()
+
+    csv_path = Path(args.csv)
+    try:
+        result = evaluate_response_csv(
+            csv_path,
+            answer_col=args.answer_col,
+            pred_col=args.pred_col,
+            tau=args.tau,
+            consensus_json=(Path(args.consensus_json) if args.consensus_json else None),
+            save_edge_table=(Path(args.save_edge_table) if args.save_edge_table else None),
+            prob_plot=(Path(args.prob_plot) if args.prob_plot else None),
+            write_artifacts=True,
+            verbose=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc))
+
+    rows = result["rows"]
+    orig_fieldnames = result["orig_fieldnames"]
+    per_row_metrics = result["per_row_metrics"]
+    summary = result["summary"]
+
+    if args.write_summary_json:
+        summary_path = csv_path.with_suffix(csv_path.suffix + ".summary.json")
+        with summary_path.open("w", encoding="utf-8") as f_sum:
+            json.dump(summary, f_sum, indent=2)
+        print(f"Saved summary to: {summary_path}")
+
     if args.summary_csv:
         out_path = Path(args.summary_csv)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1325,20 +1375,16 @@ def main():
             df_out = pd.concat([df_prev, pd.DataFrame([row])], ignore_index=True, sort=False)
         else:
             df_out = pd.DataFrame([row])
-        # If the existing summary CSV already contains duplicate column names (can happen after manual edits),
-        # keep the first occurrence to avoid repeated columns accumulating over time.
         if df_out.columns.duplicated().any():
             df_out = df_out.loc[:, ~df_out.columns.duplicated()]
         df_out.to_csv(out_path, index=False)
         print(f"Appended summary row to: {out_path}")
 
-    # ---- Per-row metrics output handling ----
     metric_keys = [
         "format_ok",
-        "n_vars","tp","tn","fp","fn","accuracy","precision","recall","f1",
-        "shd","orient_eval_pairs","orient_tp","orient_fn","orient_acc",
-        "nhd","nhd_ratio", 
-
+        "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1",
+        "shd", "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+        "nhd", "nhd_ratio",
     ]
 
     if args.inplace:

@@ -6,7 +6,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Iterator
 try:
@@ -28,6 +30,10 @@ from query_api import (
     extract_adjacency_matrix,
     count_openai_tokens,
 )
+try:
+    from query_vllm import build_vllm_engine, call_vllm_textgen_batch
+except ImportError:
+    from experiments.query_vllm import build_vllm_engine, call_vllm_textgen_batch
 
 FORMAT_RE = re.compile(r"(?s)^\s*(?:<think>)?.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
@@ -175,6 +181,105 @@ def _normalize_hist_mass_keep_frac(
     if frac <= 100:
         return frac / 100.0
     raise SystemExit(f"{field_name} must be <= 1.0 (fraction) or <= 100 (percent).")
+
+
+def _default_vllm_error_log_path(dataset: str, base_name: str, model: str) -> Path:
+    out_dir = Path(__file__).parent / "logs" / "vllm_errors" / dataset
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_model_tag = _safe_model_tag(model)
+    stem = Path(base_name).stem
+    return out_dir / f"{stem}_{safe_model_tag}_vllm_error.log"
+
+
+def _append_vllm_error_log(
+    *,
+    log_path: Path,
+    dataset: str,
+    base_name: str,
+    model: str,
+    message: str,
+    detail: str | None = None,
+) -> None:
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    lines = [
+        f"[{timestamp}] dataset={dataset} base={base_name} model={model}",
+        message.rstrip(),
+    ]
+    if detail and detail.strip():
+        lines.extend(["", detail.rstrip()])
+    lines.append("\n" + ("=" * 80) + "\n")
+    with log_path.open("a", encoding="utf-8") as fout:
+        fout.write("\n".join(lines))
+    print(f"[vllm:error] saved details to {log_path}", file=sys.stderr, flush=True)
+
+
+class _FdTee:
+    """
+    Tee process stdout/stderr to a log file while preserving terminal output.
+
+    This is started once before vLLM engine initialization so worker-process logs
+    inherited from this process are also captured.
+    """
+
+    def __init__(self, log_path: Path):
+        self.log_path = Path(log_path)
+        self._saved_fds: dict[int, int] = {}
+        self._threads: list[threading.Thread] = []
+        self._log_lock = threading.Lock()
+        self._log_file = None
+        self._active = False
+
+    def _pump(self, read_fd: int, target_fd: int) -> None:
+        try:
+            while True:
+                chunk = os.read(read_fd, 65536)
+                if not chunk:
+                    break
+                try:
+                    os.write(target_fd, chunk)
+                except OSError:
+                    pass
+                try:
+                    with self._log_lock:
+                        if self._log_file is not None:
+                            self._log_file.write(chunk)
+                            self._log_file.flush()
+                except Exception:
+                    pass
+        finally:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+
+    def start(self) -> None:
+        if self._active:
+            return
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Start each process invocation with a fresh vLLM log file.
+        self._log_file = self.log_path.open("wb", buffering=0)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        for fd in (1, 2):
+            saved_fd = os.dup(fd)
+            read_fd, write_fd = os.pipe()
+            os.dup2(write_fd, fd)
+            os.close(write_fd)
+            thread = threading.Thread(
+                target=self._pump,
+                args=(read_fd, saved_fd),
+                daemon=True,
+            )
+            thread.start()
+            self._saved_fds[fd] = saved_fd
+            self._threads.append(thread)
+        self._active = True
+        print(f"[vllm:log] teeing stdout/stderr to {self.log_path}", file=sys.stderr, flush=True)
 
 
 def _maybe_write_example_prompt(
@@ -559,6 +664,10 @@ def _run_model_for_config(
     hf_skip_if_est_kv_exceeds_vram: bool = False,
     hf_kv_vram_fraction: float = 0.85,
     hf_dtype_for_estimate: str = "auto",
+    vllm_engine: Any = None,
+    vllm_max_new_tokens: int = 0,
+    vllm_batch_size: int = 1,
+    vllm_max_model_len: int = 0,
     extra_output_instruction: str = "",
 ) -> None:
     out_path = _default_response_path(responses_root, dataset, base_name + ".csv", model)
@@ -598,7 +707,7 @@ def _run_model_for_config(
         if not isinstance(variables_for_parse, list):
             variables_for_parse = None
 
-        hf_pending: list[dict[str, Any]] = []
+        local_pending: list[dict[str, Any]] = []
         visible_vram_bytes = (
             _visible_vram_bytes()
             if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram)
@@ -608,6 +717,7 @@ def _run_model_for_config(
             hf_prompt_context_limit = int(hf_context_limit) if int(hf_context_limit) > 0 else _hf_prompt_context_limit_tokens(hf_pipe)
         else:
             hf_prompt_context_limit = None
+        vllm_prompt_context_limit = int(vllm_max_model_len) if provider == "vllm" and int(vllm_max_model_len) > 0 else None
         if provider == "hf" and bool(hf_skip_if_est_kv_exceeds_vram):
             print(
                 f"[preflight] hf_visible_vram_bytes={visible_vram_bytes} "
@@ -643,6 +753,8 @@ def _run_model_for_config(
                 max_new_tokens_hint=(
                     int(hf_max_new_tokens)
                     if provider == "hf" and int(hf_max_new_tokens) > 0
+                    else int(vllm_max_new_tokens)
+                    if provider == "vllm" and int(vllm_max_new_tokens) > 0
                     else None
                 ),
             )
@@ -671,66 +783,71 @@ def _run_model_for_config(
                     flush=True,
                 )
 
-        def _flush_hf_batch() -> None:
-            nonlocal hf_pending
-            if not hf_pending:
+        def _flush_local_batch() -> None:
+            nonlocal local_pending
+            if not local_pending:
                 return
-            if hf_pipe is None:
-                raise SystemExit("HF provider requested but no pipeline is initialized.")
-
-            prompts = [x["prompt"] for x in hf_pending]
-            keys = [x["key"] for x in hf_pending]
+            prompts = [x["prompt"] for x in local_pending]
+            keys = [x["key"] for x in local_pending]
             t0 = time.monotonic()
-            if log_calls:
-                print(
-                    f"[call:start] provider=hf model={model} batch_size={len(prompts)} keys={keys}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            try:
+            if provider == "hf":
+                if hf_pipe is None:
+                    raise SystemExit("HF provider requested but no pipeline is initialized.")
+                if log_calls:
+                    print(
+                        f"[call:start] provider=hf model={model} batch_size={len(prompts)} keys={keys}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 responses = call_hf_textgen_batch(
                     hf_pipe,
                     prompts,
                     temperature=temperature,
-                    max_new_tokens=(int(hf_max_new_tokens) if int(hf_max_new_tokens) > 0 else None),
+                    max_new_tokens=int(hf_max_new_tokens),
                     batch_size=max(1, int(hf_batch_size)),
                 )
-            except Exception as e:
-                responses = [f"[ERROR] {type(e).__name__}: {e}"] * len(hf_pending)
+            elif provider == "vllm":
+                if vllm_engine is None:
+                    raise SystemExit("vLLM provider requested but no engine is initialized.")
+                if log_calls:
+                    print(
+                        f"[call:start] provider=vllm model={model} batch_size={len(prompts)} keys={keys}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                responses = call_vllm_textgen_batch(
+                    vllm_engine,
+                    prompts,
+                    temperature=temperature,
+                    max_new_tokens=int(vllm_max_new_tokens),
+                )
+            else:
+                raise SystemExit(f"Batch flushing is not supported for provider: {provider}")
+
             if log_calls:
                 dt = time.monotonic() - t0
                 print(
-                    f"[call:done] provider=hf model={model} batch_size={len(prompts)} seconds={dt:.1f}",
+                    f"[call:done] provider={provider} model={model} batch_size={len(prompts)} seconds={dt:.1f}",
                     file=sys.stderr,
                     flush=True,
                 )
 
             if not isinstance(responses, list):
-                responses = [f"[ERROR] Invalid HF batch response type: {type(responses).__name__}"] * len(hf_pending)
-            if len(responses) != len(hf_pending):
-                fixed = list(responses[: len(hf_pending)])
-                while len(fixed) < len(hf_pending):
-                    fixed.append("[ERROR] Missing HF batch response.")
+                responses = [f"[ERROR] Invalid {provider} batch response type: {type(responses).__name__}"] * len(local_pending)
+            if len(responses) != len(local_pending):
+                fixed = list(responses[: len(local_pending)])
+                while len(fixed) < len(local_pending):
+                    fixed.append(f"[ERROR] Missing {provider} batch response.")
                 responses = fixed
 
-            error_types = [_classify_error_type(str(resp)) for resp in responses]
-            if any(err == "oom" for err in error_types):
-                if log_calls:
-                    print(
-                        f"[hf:recover] provider=hf model={model} batch_size={len(prompts)} action=empty_cache",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                _clear_cuda_cache()
-
-            for item, resp in zip(hf_pending, responses):
+            for item, resp in zip(local_pending, responses):
                 _write_out_row(
                     row=item["row"],
                     key=item["key"],
                     prompt_tokens=item["prompt_tokens"],
                     resp=str(resp),
                 )
-            hf_pending = []
+            local_pending = []
 
         for row in prompt_iter:
             key = (int(row["data_idx"]), int(row["shuffle_idx"]))
@@ -756,6 +873,28 @@ def _run_model_for_config(
                     print(
                         f"[skip] key={key} provider=hf reason=prompt_tokens_exceed_context "
                         f"prompt_tokens={prompt_tokens} context_limit={hf_prompt_context_limit}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
+                continue
+
+            if (
+                provider == "vllm"
+                and vllm_prompt_context_limit is not None
+                and prompt_tokens >= 0
+                and (prompt_tokens + max(int(vllm_max_new_tokens), 0)) > int(vllm_prompt_context_limit)
+            ):
+                resp = (
+                    "[ERROR] Prompt plus generation budget exceeds vLLM max_model_len "
+                    f"(prompt_tokens={prompt_tokens}, max_new_tokens={int(vllm_max_new_tokens)}, "
+                    f"max_model_len={vllm_prompt_context_limit})"
+                )
+                if log_calls:
+                    print(
+                        f"[skip] key={key} provider=vllm reason=prompt_plus_output_exceeds_context "
+                        f"prompt_tokens={prompt_tokens} max_new_tokens={int(vllm_max_new_tokens)} "
+                        f"max_model_len={vllm_prompt_context_limit}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -828,7 +967,7 @@ def _run_model_for_config(
                     dt = time.monotonic() - t0
                     print(f"[call:done] key={key} seconds={dt:.1f}", file=sys.stderr, flush=True)
             elif provider == "hf":
-                hf_pending.append(
+                local_pending.append(
                     {
                         "row": row,
                         "key": key,
@@ -836,16 +975,28 @@ def _run_model_for_config(
                         "prompt_tokens": prompt_tokens,
                     }
                 )
-                if len(hf_pending) >= max(1, int(hf_batch_size)):
-                    _flush_hf_batch()
+                if len(local_pending) >= max(1, int(hf_batch_size)):
+                    _flush_local_batch()
+                continue
+            elif provider == "vllm":
+                local_pending.append(
+                    {
+                        "row": row,
+                        "key": key,
+                        "prompt": prompt,
+                        "prompt_tokens": prompt_tokens,
+                    }
+                )
+                if len(local_pending) >= max(1, int(vllm_batch_size)):
+                    _flush_local_batch()
                 continue
             else:
                 raise SystemExit(f"Unknown provider: {provider}")
 
             _write_out_row(row=row, key=key, prompt_tokens=prompt_tokens, resp=resp)
 
-        if provider == "hf":
-            _flush_hf_batch()
+        if provider in {"hf", "vllm"}:
+            _flush_local_batch()
 
     print(
         f"[summary] wrote={wrote} skipped={skipped} kept_existing={len(existing_rows)} out={out_path.name}",
@@ -876,7 +1027,7 @@ def main() -> None:
 
     ap.add_argument("--model", action="append", default=[])
     ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--provider", default="auto", choices=["auto", "gemini", "openai", "hf"])
+    ap.add_argument("--provider", default="auto", choices=["auto", "gemini", "openai", "hf", "vllm"])
     ap.add_argument(
         "--hf-max-new-tokens",
         type=int,
@@ -924,6 +1075,55 @@ def main() -> None:
         type=float,
         default=0.85,
         help="VRAM budget fraction for KV estimate when --hf-skip-if-est-kv-exceeds-vram is enabled.",
+    )
+    ap.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM (number of GPUs).",
+    )
+    ap.add_argument(
+        "--vllm-dtype",
+        default="auto",
+        help="vLLM dtype string (auto, float16/fp16, bfloat16/bf16, float32/fp32).",
+    )
+    ap.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=0,
+        help="Optional vLLM max_model_len. Set >0 to enforce a total context budget.",
+    )
+    ap.add_argument(
+        "--vllm-gpu-mem-util",
+        type=float,
+        default=0.9,
+        help="vLLM gpu_memory_utilization (0.0-1.0).",
+    )
+    ap.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help="Pass enforce_eager=True to vLLM (useful for debugging).",
+    )
+    ap.add_argument(
+        "--vllm-max-new-tokens",
+        type=int,
+        default=0,
+        help="vLLM generation max_new_tokens. If <=0, reuse --hf-max-new-tokens.",
+    )
+    ap.add_argument(
+        "--vllm-batch-size",
+        type=int,
+        default=0,
+        help="Batch size for vLLM generation calls. If <=0, reuse --hf-batch-size.",
+    )
+    ap.add_argument(
+        "--vllm-error-log-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to append vLLM startup/runtime errors. "
+            "Default: experiments/logs/vllm_errors/<dataset>/<base>_<model>_vllm_error.log"
+        ),
     )
     ap.add_argument(
         "--extra-output-instruction",
@@ -1146,6 +1346,8 @@ def main() -> None:
         ]
 
     hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
+    vllm_engine_cache: dict[tuple[str, int, str, int, float, bool], Any] = {}
+    vllm_log_tee: _FdTee | None = None
     using_explicit_config_file = args.config_file is not None
 
     for (
@@ -1335,6 +1537,13 @@ def main() -> None:
                                     )
                                     provider = _select_provider(model, args.provider)
                                     hf_pipe = None
+                                    vllm_engine = None
+                                    vllm_max_new_tokens = int(args.vllm_max_new_tokens)
+                                    if vllm_max_new_tokens <= 0:
+                                        vllm_max_new_tokens = int(args.hf_max_new_tokens)
+                                    vllm_batch_size = int(args.vllm_batch_size)
+                                    if vllm_batch_size <= 0:
+                                        vllm_batch_size = max(1, int(args.hf_batch_size))
                                     if provider == "hf":
                                         dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
                                         hf_key = (model, dm, str(args.hf_dtype))
@@ -1354,6 +1563,72 @@ def main() -> None:
                                         else:
                                             print(
                                                 f"[hf:init] reusing cached HF pipeline for model={model}",
+                                                file=sys.stderr,
+                                                flush=True,
+                                            )
+                                    elif provider == "vllm":
+                                        if vllm_max_new_tokens <= 0:
+                                            raise SystemExit(
+                                                "vLLM provider requires a positive generation cap. "
+                                                "Set --vllm-max-new-tokens or --hf-max-new-tokens."
+                                            )
+                                        vllm_max_model_len = max(0, int(args.vllm_max_model_len))
+                                        vllm_key = (
+                                            model,
+                                            int(args.vllm_tensor_parallel_size),
+                                            str(args.vllm_dtype),
+                                            vllm_max_model_len,
+                                            float(args.vllm_gpu_mem_util),
+                                            bool(args.vllm_enforce_eager),
+                                        )
+                                        vllm_engine = vllm_engine_cache.get(vllm_key)
+                                        if vllm_engine is None:
+                                            print(
+                                                "[vllm:init] loading vLLM engine once for "
+                                                f"model={model} tp={int(args.vllm_tensor_parallel_size)} "
+                                                f"dtype={args.vllm_dtype} max_model_len={vllm_max_model_len or 'auto'} "
+                                                f"gpu_mem_util={float(args.vllm_gpu_mem_util):.2f}",
+                                                file=sys.stderr,
+                                                flush=True,
+                                            )
+                                            vllm_error_log_path = (
+                                                Path(args.vllm_error_log_file)
+                                                if args.vllm_error_log_file is not None
+                                                else _default_vllm_error_log_path(dataset, base_name, model)
+                                            )
+                                            if vllm_log_tee is None:
+                                                vllm_log_tee = _FdTee(vllm_error_log_path)
+                                                vllm_log_tee.start()
+                                            try:
+                                                vllm_engine = build_vllm_engine(
+                                                    model,
+                                                    tensor_parallel_size=int(args.vllm_tensor_parallel_size),
+                                                    vllm_dtype=str(args.vllm_dtype),
+                                                    max_model_len=(vllm_max_model_len if vllm_max_model_len > 0 else None),
+                                                    gpu_memory_utilization=float(args.vllm_gpu_mem_util),
+                                                    enforce_eager=bool(args.vllm_enforce_eager),
+                                                )
+                                            except Exception:
+                                                _append_vllm_error_log(
+                                                    log_path=vllm_error_log_path,
+                                                    dataset=dataset,
+                                                    base_name=base_name,
+                                                    model=model,
+                                                    message=(
+                                                        "vLLM engine initialization failed "
+                                                        f"(tp={int(args.vllm_tensor_parallel_size)}, "
+                                                        f"dtype={args.vllm_dtype}, "
+                                                        f"max_model_len={vllm_max_model_len or 'auto'}, "
+                                                        f"gpu_mem_util={float(args.vllm_gpu_mem_util):.2f}, "
+                                                        f"enforce_eager={bool(args.vllm_enforce_eager)})"
+                                                    ),
+                                                    detail=traceback.format_exc(),
+                                                )
+                                                raise
+                                            vllm_engine_cache[vllm_key] = vllm_engine
+                                        else:
+                                            print(
+                                                f"[vllm:init] reusing cached vLLM engine for model={model}",
                                                 file=sys.stderr,
                                                 flush=True,
                                             )
@@ -1405,6 +1680,10 @@ def main() -> None:
                                         hf_skip_if_est_kv_exceeds_vram=bool(args.hf_skip_if_est_kv_exceeds_vram),
                                         hf_kv_vram_fraction=float(args.hf_kv_vram_fraction),
                                         hf_dtype_for_estimate=str(args.hf_dtype),
+                                        vllm_engine=vllm_engine,
+                                        vllm_max_new_tokens=vllm_max_new_tokens,
+                                        vllm_batch_size=vllm_batch_size,
+                                        vllm_max_model_len=max(0, int(args.vllm_max_model_len)),
                                         extra_output_instruction=str(args.extra_output_instruction),
                                     )
 
