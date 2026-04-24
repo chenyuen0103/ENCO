@@ -452,14 +452,43 @@ def load_gt_from_cell(
 
     obj = None
 
+    def _iter_json_text_variants(txt: str):
+        seen = set()
+        candidates = [txt]
+        extracted = extract_answer_text(txt).strip()
+        if extracted and extracted != txt:
+            candidates.append(extracted)
+        for cand in candidates:
+            if cand not in seen:
+                seen.add(cand)
+                yield cand
+            normalized = cand.replace('""', '"')
+            if normalized not in seen:
+                seen.add(normalized)
+                yield normalized
+
+    def _looks_like_path_candidate(txt: str) -> bool:
+        if not txt or len(txt) > 512:
+            return False
+        if any(ch in txt for ch in "\r\n\t<>{}[]"):
+            return False
+        return (
+            txt.endswith(".json")
+            or txt.endswith(".jsonl")
+            or "/" in txt
+            or "\\" in txt
+        )
+
     # Try: direct JSON
-    try:
-        obj = json.loads(s)
-    except Exception:
-        obj = None
+    for candidate in _iter_json_text_variants(s):
+        try:
+            obj = json.loads(candidate)
+            break
+        except Exception:
+            obj = None
 
     # If not JSON, try: path to file
-    if not isinstance(obj, (dict, list)):
+    if not isinstance(obj, (dict, list)) and _looks_like_path_candidate(s):
         p = Path(s)
         candidates: List[Path] = []
         if p.is_absolute():
@@ -474,13 +503,18 @@ def load_gt_from_cell(
 
         file_obj = None
         for cand in candidates:
-            if cand.exists():
-                try:
-                    file_obj = json.loads(cand.read_text(encoding="utf-8"))
-                    break
-                except Exception:
-                    file_obj = None
-                    continue
+            try:
+                exists = cand.exists()
+            except OSError:
+                exists = False
+            if not exists:
+                continue
+            try:
+                file_obj = json.loads(cand.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                file_obj = None
+                continue
         if file_obj is not None:
             try:
                 obj = file_obj
@@ -488,7 +522,7 @@ def load_gt_from_cell(
                 obj = None
 
     if obj is None:
-        return None, None
+        return extract_adjacency_matrix(s), None
 
     variables = None
     mat_raw = None
@@ -513,6 +547,8 @@ def load_gt_from_cell(
         mat_raw = obj
 
     A_true = _normalize_matrix_for_gt(mat_raw)
+    if A_true is None:
+        A_true = extract_adjacency_matrix(s, fallback_variables=variables)
     return A_true, variables
 
 
@@ -849,6 +885,11 @@ def main():
         reader = csv.DictReader(f)
         rows: List[Dict[str, Any]] = list(reader)
         orig_fieldnames = list(reader.fieldnames or [])
+    malformed_csv_rows = 0
+    for row in rows:
+        extras = row.pop(None, None)
+        if extras:
+            malformed_csv_rows += 1
 
     # Pick an answer column to use
     if args.answer_col:
@@ -862,6 +903,12 @@ def main():
         else:
             answer_col = "answer_path"  # fall back; will likely yield None later
     print(f"[info] Using answer column: {answer_col}")
+    if malformed_csv_rows > 0:
+        print(
+            f"[warn] Found {malformed_csv_rows} malformed CSV row(s) with extra unnamed fields in {csv_path}. "
+            "Those extra fields were ignored.",
+            file=sys.stderr,
+        )
 
     # When the GT is stored as a relative path (answer_path), resolve it relative to
     # the experiments/ directory (so evaluation works no matter what your CWD is).
@@ -1047,7 +1094,7 @@ def main():
         avg_pred_edges = None
 
     has_given_edges, given_edge_count = scan_given_edges_df(df)
-    true_num_edges = get_true_num_edges_from_answers(df, answer_col=args.answer_col)
+    true_num_edges = get_true_num_edges_from_answers(df, answer_col=answer_col)
     if true_num_edges and true_num_edges > 0 and given_edge_count > 0:
         given_edge_frac = given_edge_count / float(true_num_edges)
     else:

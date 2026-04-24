@@ -54,6 +54,45 @@ def _use_edge_list_output(variables: List[str]) -> bool:
     return len(variables) > LARGE_GRAPH_EDGE_LIST_THRESHOLD
 
 
+def _normalize_hist_mass_keep_frac(
+    value: Any,
+    *,
+    field_name: str = "hist_mass_keep_frac",
+) -> Optional[float]:
+    """
+    Normalize a histogram-mass retention setting.
+
+    Accepts:
+      - None / "" => None
+      - 0 < x <= 1 => fraction
+      - 1 < x <= 100 => percentage, converted to fraction
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        frac = float(value)
+    except Exception as e:
+        raise ValueError(f"{field_name} must be a float in (0, 1] or a percent in (0, 100].") from e
+    if frac <= 0:
+        raise ValueError(f"{field_name} must be > 0.")
+    if frac <= 1:
+        return frac
+    if frac <= 100:
+        return frac / 100.0
+    raise ValueError(f"{field_name} must be <= 1.0 (fraction) or <= 100 (percent).")
+
+
+def _hist_mass_keep_tag(frac: Optional[float]) -> str:
+    if frac is None:
+        return ""
+    pct = int(round(float(frac) * 100.0))
+    return f"histmass{pct}"
+
+
 def _load_graph_file(path: str):  # type: ignore
     from benchmark_builder.graph_io import load_causal_graph  # type: ignore
 
@@ -147,6 +186,7 @@ def iter_prompts_in_memory(
     intervene_vars: str,
     wrapper_mode: Optional[str] = None,
     append_format_hint: Optional[bool] = None,
+    hist_mass_keep_frac: Optional[float] = None,
     prefill_think: Optional[bool] = None,
     prefill_answer: bool = False,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
@@ -164,6 +204,10 @@ def iter_prompts_in_memory(
     resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=wrapper_mode)
     resolved_reasoning_guidance = resolve_reasoning_guidance(reasoning_guidance=reasoning_guidance)
     resolved_append_format_hint = bool(append_format_hint)
+    resolved_hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
+        hist_mass_keep_frac,
+        field_name="hist_mass_keep_frac",
+    )
     require_think_answer_blocks = True
 
     adj_np = np.asarray(graph.adj_matrix)
@@ -241,6 +285,9 @@ def iter_prompts_in_memory(
         tags.append(f"wrap{resolved_wrapper_mode}")
     if resolved_append_format_hint:
         tags.append("fmthint")
+    hist_mass_tag = _hist_mass_keep_tag(resolved_hist_mass_keep_frac) if prompt_style == "summary" else ""
+    if hist_mass_tag:
+        tags.append(hist_mass_tag)
     if prompt_style in {"matrix", "summary"}:
         tags.append(prompt_style)
     if row_order != "random":
@@ -375,6 +422,7 @@ def iter_prompts_in_memory(
                         anonymize=anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
+                        hist_mass_keep_frac=resolved_hist_mass_keep_frac,
                         require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
@@ -1383,6 +1431,7 @@ def format_prompt_summary_full_joint(
     # token budget controls
     max_hist_entries: Optional[int] = None,  # truncate hist per regime (after sorting). None => full
     max_intervention_regimes: Optional[int] = None,
+    hist_mass_keep_frac: Optional[float] = None,
     # anonymization
     anonymize: bool = True,
     # pretty printing controls
@@ -1479,10 +1528,21 @@ def format_prompt_summary_full_joint(
             return sorted(items, key=lambda t: (-float(t[2]), -int(t[1]), t[0]))
         return sorted(items, key=lambda t: (-int(t[1]), t[0]))
 
-    def _maybe_truncate(items: List[List[Any]]) -> List[List[Any]]:
-        if max_hist_entries is None:
-            return items
-        return items[: max(0, int(max_hist_entries))]
+    def _maybe_truncate(items: List[List[Any]], total_count: int) -> List[List[Any]]:
+        kept = items
+        if resolved_hist_mass_keep_frac is not None and total_count > 0 and items:
+            cutoff = float(total_count) * float(resolved_hist_mass_keep_frac)
+            running = 0.0
+            kept_items: List[List[Any]] = []
+            for it in items:
+                kept_items.append(it)
+                running += float(it[1])
+                if running >= cutoff:
+                    break
+            kept = kept_items
+        if max_hist_entries is not None:
+            kept = kept[: max(0, int(max_hist_entries))]
+        return kept
 
     def _marginals_from_items(num_states: List[int], items_full: List[List[Any]], n: int) -> List[List[float]]:
         """
@@ -1566,8 +1626,13 @@ def format_prompt_summary_full_joint(
     # -----------------------------
     # Build prompt
     # -----------------------------
+    resolved_hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
+        hist_mass_keep_frac,
+        field_name="hist_mass_keep_frac",
+    )
     num_states = _infer_num_states()
     state_map = _state_maps()
+    hist_is_truncated = (max_hist_entries is not None) or (resolved_hist_mass_keep_frac is not None)
 
     lines: List[str] = []
     lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
@@ -1595,7 +1660,17 @@ def format_prompt_summary_full_joint(
     num_states_str = _compact_json(num_states)
     hist_shape = "[assignment, count, prob]" if include_probabilities else "[assignment, count]"
     marginals_note = " marginals[j][s]=P(variable_j=s)." if include_marginals else ""
-    omit_note = "Unlisted assignments have P=0." if omitted_are_zero_prob else "Unlisted assignments may be absent due to finite sampling."
+    if hist_is_truncated:
+        omit_note = (
+            "Assignments omitted from hist may still have nonzero empirical count because only a truncated subset "
+            "of each histogram is shown."
+        )
+    else:
+        omit_note = (
+            "Unlisted assignments have P=0."
+            if omitted_are_zero_prob
+            else "Unlisted assignments may be absent due to finite sampling."
+        )
     lines.append("Each payload summarizes empirical samples in the declared variable order.")
     lines.append(
         f"num_states={num_states_str}. hist entries use {hist_shape}; assignments follow the declared variable order."
@@ -1603,6 +1678,16 @@ def format_prompt_summary_full_joint(
     lines.append(
         f"observational_data summarizes samples with no intervention. interventional_data maps each do(X=v) regime to its empirical summary.{marginals_note} {omit_note}"
     )
+    if resolved_hist_mass_keep_frac is not None:
+        kept_pct = round(float(resolved_hist_mass_keep_frac) * 100.0, 1)
+        lines.append(
+            f"Each hist block is sorted by empirical frequency and truncated to keep the most frequent assignments "
+            f"covering at least {kept_pct}% of that regime's samples."
+        )
+    elif max_hist_entries is not None:
+        lines.append(
+            f"Each hist block is truncated after at most {int(max_hist_entries)} assignments."
+        )
 
     if (not anonymize) and include_state_legend and state_map:
         kept_vars: List[str] = []
@@ -1623,10 +1708,10 @@ def format_prompt_summary_full_joint(
     lines.append("\n--- OBSERVATIONAL DATA ---")
     obs_n, obs_items_full = _to_hist_items(obs_rows_num, num_states)
     obs_items_full = _sort_items(obs_items_full)
-    obs_items_out = _maybe_truncate(obs_items_full)
+    obs_items_out = _maybe_truncate(obs_items_full, obs_n)
 
     obs_payload: Dict[str, Any] = {"n": obs_n, "hist": obs_items_out}
-    if include_marginals and (max_hist_entries is None):
+    if include_marginals and ((max_hist_entries is None) or (resolved_hist_mass_keep_frac is not None)):
         obs_payload["marginals"] = _marginals_from_items(num_states, obs_items_full, obs_n)
 
     # hybrid top-level is enough here
@@ -1647,10 +1732,10 @@ def format_prompt_summary_full_joint(
         for (ivar, ival) in keys:
             n_i, items_full = _to_hist_items(int_groups_num[(ivar, ival)], num_states)
             items_full = _sort_items(items_full)
-            items_out = _maybe_truncate(items_full)
+            items_out = _maybe_truncate(items_full, n_i)
 
             payload_i: Dict[str, Any] = {"n": n_i, "hist": items_out}
-            if include_marginals and (max_hist_entries is None):
+            if include_marginals and ((max_hist_entries is None) or (resolved_hist_mass_keep_frac is not None)):
                 payload_i["marginals"] = _marginals_from_items(num_states, items_full, n_i)
 
             label = _format_do_label(str(ivar), str(ival), state_map)
@@ -1941,6 +2026,16 @@ def main():
         default="summary",
     )
     ap.add_argument(
+        "--hist-mass-keep-frac",
+        type=float,
+        default=None,
+        help=(
+            "For summary prompts, keep only the most frequent histogram assignments per regime until the listed "
+            "entries cover this much empirical mass. Accepts a fraction in (0,1] or a percent in (0,100]. "
+            "Default: disabled (no cutoff)."
+        ),
+    )
+    ap.add_argument(
         "--out-dir",
         default=None,
         help="Directory for outputs; defaults to experiments/prompts/<bif basename>",
@@ -1953,6 +2048,10 @@ def main():
     args = ap.parse_args()
     if args.prompt_style in {"summary_join", "summary_joint"}:
         args.prompt_style = "summary"
+    args.hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
+        args.hist_mass_keep_frac,
+        field_name="--hist-mass-keep-frac",
+    )
     resolved_wrapper_mode = resolve_wrapper_mode(wrapper_mode=args.wrapper_mode)
     require_think_answer_blocks = True
     if args.int_per_combo > 0:
@@ -2058,6 +2157,9 @@ def main():
         tags.append(f"wrap{resolved_wrapper_mode}")
     if args.append_format_hint:
         tags.append("fmthint")
+    hist_mass_tag = _hist_mass_keep_tag(args.hist_mass_keep_frac) if args.prompt_style == "summary" else ""
+    if hist_mass_tag:
+        tags.append(hist_mass_tag)
     if hasattr(args, "prompt_style") and args.prompt_style in {"matrix", "summary"}:
         tags.append(args.prompt_style)
     
@@ -2236,6 +2338,7 @@ def main():
                         anonymize=args.anonymize,
                         include_probabilities=False,
                         sort_hist_by="count_desc",
+                        hist_mass_keep_frac=args.hist_mass_keep_frac,
                         require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )

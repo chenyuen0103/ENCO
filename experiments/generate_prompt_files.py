@@ -76,6 +76,16 @@ def main():
             "and 'none' uses only the output contract."
         ),
     )
+    ap.add_argument(
+        "--hist-mass-keep-frac",
+        type=float,
+        default=None,
+        help=(
+            "For summary prompts, keep only the most frequent histogram assignments per regime until the listed "
+            "entries cover this much empirical mass. Accepts a fraction in (0,1] or a percent in (0,100]. "
+            "Default: disabled (no cutoff)."
+        ),
+    )
     args = ap.parse_args()
 
     dataset_name = Path(args.bif_file).stem
@@ -268,6 +278,8 @@ def main():
             cmd.append("--append-format-hint")
         if args.reasoning_guidance != "staged":
             cmd.extend(["--reasoning-guidance", args.reasoning_guidance])
+        if args.hist_mass_keep_frac is not None:
+            cmd.extend(["--hist-mass-keep-frac", str(args.hist_mass_keep_frac)])
         
         if int_n > 0:
             cmd.extend(["--intervene-vars", "all"]) 

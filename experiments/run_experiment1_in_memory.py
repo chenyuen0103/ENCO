@@ -140,36 +140,58 @@ def _default_response_path(responses_root: Path, dataset: str, base_name: str, m
     return responses_dir / f"{base_stem}{base_suffix}"
 
 
-def _default_example_prompt_path(dataset: str, base_name: str, model: str, example_dir: Path | None) -> Path:
+def _default_example_prompt_path(dataset: str, base_name: str, example_dir: Path | None) -> Path:
     """
-    One prompt per configuration, saved for debugging. Prompt text does not depend on the model,
-    but we include it in the filename to avoid collisions when reusing base names across runs.
+    One prompt per configuration, saved for debugging.
+    Example-prompt filenames are config-based rather than model-based because the prompt text
+    itself does not depend on the queried model.
     """
     # Default to experiments/prompts/<dataset>/example_prompts so prompts live next to the graph's prompt assets.
     out_dir = example_dir or (Path(__file__).parent / "prompts" / dataset / "example_prompts")
     out_dir.mkdir(parents=True, exist_ok=True)
-    safe_model_tag = _safe_model_tag(model)
     stem = Path(base_name).stem
-    return out_dir / f"{stem}_{safe_model_tag}_example_prompt.txt"
+    return out_dir / f"{stem}_example_prompt.txt"
+
+
+def _normalize_hist_mass_keep_frac(
+    value: Any,
+    *,
+    field_name: str,
+) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        frac = float(value)
+    except Exception as e:
+        raise SystemExit(f"{field_name} must be a float in (0, 1] or a percent in (0, 100].") from e
+    if frac <= 0:
+        raise SystemExit(f"{field_name} must be > 0.")
+    if frac <= 1:
+        return frac
+    if frac <= 100:
+        return frac / 100.0
+    raise SystemExit(f"{field_name} must be <= 1.0 (fraction) or <= 100 (percent).")
 
 
 def _maybe_write_example_prompt(
     *,
     dataset: str,
     base_name: str,
-    model: str,
     prompt_row: dict[str, Any],
     example_dir: Path | None,
     overwrite: bool,
 ) -> Path:
-    out_path = _default_example_prompt_path(dataset, base_name, model, example_dir)
+    out_path = _default_example_prompt_path(dataset, base_name, example_dir)
     if out_path.exists() and not overwrite:
         return out_path
 
     payload = {
         "dataset": dataset,
         "base_name": base_name,
-        "model": model,
         "data_idx": prompt_row.get("data_idx"),
         "shuffle_idx": prompt_row.get("shuffle_idx"),
     }
@@ -298,7 +320,7 @@ def _load_configs_from_file(
     allowed_styles: set[str],
     allowed_row_orders: set[str],
     allowed_col_orders: set[str],
-) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool, str]]:
+) -> list[tuple[str, bool, int, int, str, str, int, str | None, bool, str, float | None]]:
     try:
         payload = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception as e:
@@ -314,7 +336,7 @@ def _load_configs_from_file(
     if not isinstance(raw_configs, list) or not raw_configs:
         raise SystemExit("--config-file contains no configs.")
 
-    out: list[tuple[str, bool, int, int, str, str, int, str | None, bool, str]] = []
+    out: list[tuple[str, bool, int, int, str, str, int, str | None, bool, str, float | None]] = []
     for i, item in enumerate(raw_configs):
         if not isinstance(item, dict):
             raise SystemExit(f"Config #{i} must be an object, got: {type(item).__name__}")
@@ -392,6 +414,10 @@ def _load_configs_from_file(
                 f"Config #{i}: invalid reasoning_guidance '{item.get('reasoning_guidance')}'. "
                 "Allowed: ['staged', 'concise', 'none']."
             )
+        hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
+            item.get("hist_mass_keep_frac"),
+            field_name=f"Config #{i}: hist_mass_keep_frac",
+        )
 
         out.append(
             (
@@ -405,6 +431,7 @@ def _load_configs_from_file(
                 wrapper_mode,
                 append_format_hint,
                 reasoning_guidance,
+                hist_mass_keep_frac,
             )
         )
 
@@ -472,6 +499,7 @@ def _iter_prompts_for_config(
     wrapper_mode: str | None,
     append_format_hint: bool,
     reasoning_guidance: str,
+    hist_mass_keep_frac: float | None,
 ) -> tuple[str, dict[str, Any], Iterator[dict[str, Any]]]:
     is_names_only = (obs_per_prompt == 0 and int_per_combo == 0)
     if is_names_only:
@@ -505,6 +533,7 @@ def _iter_prompts_for_config(
         wrapper_mode=wrapper_mode,
         append_format_hint=append_format_hint,
         reasoning_guidance=reasoning_guidance,
+        hist_mass_keep_frac=hist_mass_keep_frac,
     )
 
 
@@ -1010,6 +1039,16 @@ def main() -> None:
     )
     ap.add_argument("--obs-per-prompt", type=int, default=0)
     ap.add_argument("--int-per-combo", type=int, default=0)
+    ap.add_argument(
+        "--hist-mass-keep-frac",
+        type=float,
+        default=None,
+        help=(
+            "For summary prompts, keep only the most frequent histogram assignments per regime until the listed "
+            "entries cover this much empirical mass. Accepts a fraction in (0,1] or a percent in (0,100]. "
+            "Default: disabled (no cutoff)."
+        ),
+    )
     ap.add_argument("--row-order", choices=["random", "sorted", "reverse"], default="random")
     ap.add_argument("--col-order", choices=["original", "reverse", "random", "topo", "reverse_topo"], default="original")
     ap.add_argument("--anonymize", action="store_true")
@@ -1017,6 +1056,10 @@ def main() -> None:
     args = ap.parse_args()
     if not args.model:
         args.model = ["gpt-5-mini"]
+    args.hist_mass_keep_frac = _normalize_hist_mass_keep_frac(
+        args.hist_mass_keep_frac,
+        field_name="--hist-mass-keep-frac",
+    )
 
     dataset = Path(args.bif_file).stem
     responses_root = Path(args.responses_root)
@@ -1068,6 +1111,7 @@ def main() -> None:
             cli_wrapper_mode,
             bool(args.append_format_hint),
             "staged",
+            args.hist_mass_keep_frac,
         )]
     elif args.config_file is not None:
         configs = _load_configs_from_file(
@@ -1090,6 +1134,7 @@ def main() -> None:
                 cli_wrapper_mode,
                 bool(args.append_format_hint),
                 "staged",
+                args.hist_mass_keep_frac,
             )
             for style in styles
             for anon in anonymize_opts
@@ -1103,7 +1148,19 @@ def main() -> None:
     hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
     using_explicit_config_file = args.config_file is not None
 
-    for style, anon, obs_n, int_n, row_ord, col_ord, shuf_n, wrapper_mode, append_format_hint, reasoning_guidance in configs:
+    for (
+        style,
+        anon,
+        obs_n,
+        int_n,
+        row_ord,
+        col_ord,
+        shuf_n,
+        wrapper_mode,
+        append_format_hint,
+        reasoning_guidance,
+        hist_mass_keep_frac,
+    ) in configs:
                                 is_names_only = (obs_n == 0 and int_n == 0)
                                 is_payload_without_obs = (style in {"payload", "payload_topk"} and obs_n == 0 and int_n > 0)
                                 if is_payload_without_obs:
@@ -1168,6 +1225,7 @@ def main() -> None:
                                     wrapper_mode=wrapper_mode,
                                     append_format_hint=bool(append_format_hint),
                                     reasoning_guidance=reasoning_guidance,
+                                    hist_mass_keep_frac=hist_mass_keep_frac,
                                 )
 
                                 if args.save_example_prompt:
@@ -1179,7 +1237,6 @@ def main() -> None:
                                     out_p = _maybe_write_example_prompt(
                                         dataset=dataset,
                                         base_name=base_name,
-                                        model=(args.model[0] if args.model else "unknown"),
                                         prompt_row=first,
                                         example_dir=args.example_prompt_dir,
                                         overwrite=bool(args.overwrite_example_prompt),
@@ -1208,6 +1265,7 @@ def main() -> None:
                                                 "wrapper_mode": wrapper_mode or "plain",
                                                 "append_format_hint": bool(append_format_hint),
                                                 "reasoning_guidance": reasoning_guidance,
+                                                "hist_mass_keep_frac": hist_mass_keep_frac,
                                             },
                                             ensure_ascii=False,
                                             indent=2,
@@ -1246,6 +1304,7 @@ def main() -> None:
                                             wrapper_mode=wrapper_mode,
                                             append_format_hint=bool(append_format_hint),
                                             reasoning_guidance=reasoning_guidance,
+                                            hist_mass_keep_frac=hist_mass_keep_frac,
                                         )
                                         n_rows = 0
                                         for tok_row in token_iter:
@@ -1270,7 +1329,7 @@ def main() -> None:
                                     print(
                                         f"[config] style={style} anon={anon} obs={obs_n} int={int_n} "
                                         f"row={row_ord} col={col_ord} shuf={shuf_n} "
-                                        f"reasoning={reasoning_guidance} model={model}",
+                                        f"reasoning={reasoning_guidance} hist_mass_keep_frac={hist_mass_keep_frac} model={model}",
                                         file=sys.stderr,
                                         flush=True,
                                     )
@@ -1323,6 +1382,7 @@ def main() -> None:
                                         wrapper_mode=wrapper_mode,
                                         append_format_hint=bool(append_format_hint),
                                         reasoning_guidance=reasoning_guidance,
+                                        hist_mass_keep_frac=hist_mass_keep_frac,
                                     )
                                     _run_model_for_config(
                                         dataset=dataset,
