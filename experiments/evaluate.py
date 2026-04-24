@@ -914,8 +914,8 @@ def evaluate_response_csv(
         elif "answer_path" in orig_fieldnames:
             resolved_answer_col = "answer_path"
         else:
-            answer_col = "answer_path"  # fall back; will likely yield None later
-    print(f"[info] Using answer column: {answer_col}")
+            resolved_answer_col = "answer_path"  # fall back; will likely yield None later
+    print(f"[info] Using answer column: {resolved_answer_col}")
     if malformed_csv_rows > 0:
         print(
             f"[warn] Found {malformed_csv_rows} malformed CSV row(s) with extra unnamed fields in {csv_path}. "
@@ -1097,7 +1097,7 @@ def evaluate_response_csv(
         avg_pred_edges = None
 
     has_given_edges, given_edge_count = scan_given_edges_df(df)
-    true_num_edges = get_true_num_edges_from_answers(df, answer_col=answer_col)
+    true_num_edges = get_true_num_edges_from_answers(df, answer_col=resolved_answer_col)
     if true_num_edges and true_num_edges > 0 and given_edge_count > 0:
         given_edge_frac = given_edge_count / float(true_num_edges)
     else:
