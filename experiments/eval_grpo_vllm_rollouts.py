@@ -54,8 +54,6 @@ from verifier_cd import (
     score_cd_completion,
     score_cd_descendants_completion,
 )
-
-
 DEFAULT_CSVS = [
     str(_HERE / "data" / "grpo_mix_anon.csv"),
     str(_HERE / "data" / "grpo_mix_named.csv"),
@@ -389,8 +387,11 @@ def _build_reward_funcs(args, tokenizer, task: str) -> list[tuple[str, Any]]:
     return reward_funcs
 
 
-def _make_generation_prompt(record: dict[str, Any]) -> str:
-    return str(record["prompt"])
+def _make_generation_prompt(record: dict[str, Any], args, task: str) -> str:
+    raw_prompt = str(record["prompt"])
+    if task not in {"causal_discovery", "cd_descendants"}:
+        return raw_prompt
+    return raw_prompt
 
 
 def _score_completion(task: str, completion: str, answer: str, args) -> dict[str, Any]:
@@ -531,6 +532,7 @@ def _build_grouped_rollout_records(
         grouped_record: dict[str, Any] = {
             "sample_idx": sample_idx,
             "prompt": record["prompt"],
+            "prompt_model_input": record.get("prompt_model_input", record["prompt"]),
             "answer": record["answer"],
             "num_completions": len(grouped_rollouts),
         }
@@ -888,7 +890,9 @@ def main() -> None:
 
     from vllm import LLM, SamplingParams
 
-    prompts = [_make_generation_prompt(record) for record in sampled_records]
+    prompts = [_make_generation_prompt(record, args, task) for record in sampled_records]
+    for record, prompt_model_input in zip(sampled_records, prompts):
+        record["prompt_model_input"] = prompt_model_input
     if args.vllm_max_model_len is not None:
         resolved_max_model_len = int(args.vllm_max_model_len)
         max_prompt_tokens = max(
@@ -993,6 +997,7 @@ def main() -> None:
             }
             if args.include_prompts:
                 rollout_record["prompt"] = record["prompt"]
+                rollout_record["prompt_model_input"] = record.get("prompt_model_input", record["prompt"])
             rollout_outputs.append(rollout_record)
 
     reward_inputs = _build_reward_inputs(task, sampled_records, rollout_outputs)

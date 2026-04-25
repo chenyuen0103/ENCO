@@ -111,7 +111,7 @@ def main():
     # 1. Data Representation
     # - cases: full sample listing (largest prompts)
     # - matrix: matrix blocks of samples
-    # - summary: joint summary statistics (marginals + intervention effects)
+    # - summary: sparse full-joint histograms for observational and interventional regimes
     # - payload: a single JSON blob with summary stats (machine-parsable)
     # - payload_topk: compact JSON payload (top-K intervention effects)
     style_aliases = {

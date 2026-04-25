@@ -108,7 +108,7 @@
     }
   ],
   "sft_collection": {
-    "script": "experiments/collect_format_sft_data.py",
+    "script": "experiments/generate_reasoning.py",
     "source_csvs": [
       {
         "path": "experiments/data/grpo_mix_anon.csv",

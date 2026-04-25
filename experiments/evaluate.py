@@ -1364,14 +1364,18 @@ def main():
     if args.summary_csv:
         out_path = Path(args.summary_csv)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        response_csv = str(csv_path.resolve())
         row = {
-            "response_csv": str(csv_path.resolve()),
+            "response_csv": response_csv,
             "evaluated": 1,
         }
         row.update(_infer_response_metadata(csv_path))
         row.update(summary)
         if out_path.exists():
             df_prev = pd.read_csv(out_path)
+            if "response_csv" in df_prev.columns:
+                prev_paths = df_prev["response_csv"].astype(str).map(lambda p: str(Path(p).resolve()))
+                df_prev = df_prev.loc[prev_paths != response_csv].copy()
             df_out = pd.concat([df_prev, pd.DataFrame([row])], ignore_index=True, sort=False)
         else:
             df_out = pd.DataFrame([row])

@@ -9,22 +9,12 @@ SYSTEM_PROMPT = (
 )
 
 DEFAULT_FORMAT_HINT_TEXT = (
-    "Reason in three stages inside <think>: "
-    "Stage 1 (Skeleton) - one \"X -- Y\" per line; "
-    "Stage 2 (V-structures) - one \"(parent1, collider, parent2)\" per line; "
-    "Stage 3 (Orientation) - one \"X -> Y\" per line. "
-    "Write \"None\" for any empty stage. "
-    "Then output: <answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "
+    "Output exactly: <think>...</think><answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "
     "where the matrix is N×N with integer entries 0 or 1 in VARIABLES order, "
     "and [i][j]=1 means variable i directly causes variable j."
 )
 
-DEFAULT_FORMAT_HINT_TEXT_CONCISE = (
-    "Reason however you want inside <think>, but keep it concise. "
-    "Then output: <answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "
-    "where the matrix is N×N with integer entries 0 or 1 in VARIABLES order, "
-    "and [i][j]=1 means variable i directly causes variable j."
-)
+DEFAULT_FORMAT_HINT_TEXT_CONCISE = DEFAULT_FORMAT_HINT_TEXT
 
 DEFAULT_FORMAT_HINT_TEXT_NONE = (
     "Output exactly: <think>...</think><answer>{\"adjacency_matrix\": [[0,1,...],[0,0,...],...]}</answer> "

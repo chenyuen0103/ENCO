@@ -421,6 +421,7 @@ def iter_prompts_in_memory(
                         include_def_int=include_def_int,
                         anonymize=anonymize,
                         include_probabilities=False,
+                        include_marginals=False,
                         sort_hist_by="count_desc",
                         hist_mass_keep_frac=resolved_hist_mass_keep_frac,
                         require_think_answer_blocks=require_think_answer_blocks,
@@ -1426,7 +1427,7 @@ def format_prompt_summary_full_joint(
     include_probabilities: bool = True,
     # readability / size controls
     sort_hist_by: str = "prob_desc",  # "prob_desc" | "count_desc" | "lex"
-    include_marginals: bool = True,
+    include_marginals: bool = False,
     include_state_legend: bool = True,  # only used when NOT anonymized and mapping is non-identity
     # token budget controls
     max_hist_entries: Optional[int] = None,  # truncate hist per regime (after sorting). None => full
@@ -1439,7 +1440,7 @@ def format_prompt_summary_full_joint(
     json_indent: int = 2,
     # hybrid formatting (readable dict, compact big arrays)
     compact_array_keys: Tuple[str, ...] = ("hist", "marginals"),
-    # NEW: make interventional payloads compact even when nested
+    # Make interventional payloads compact even when nested.
     compact_interventions: bool = True,
     require_think_answer_blocks: bool = False,
     output_edge_list: bool = False,
@@ -1447,12 +1448,12 @@ def format_prompt_summary_full_joint(
     """
     Full empirical joint prompt (sparse histogram over full assignments), using clearer block names:
 
-      - observational_data: {n, hist, (optional) marginals}
-      - interventional_data: { "do(X=v)": {n, hist, (optional) marginals}, ... }
+      - observational_data: {n, hist}
+      - interventional_data: { "do(X=v)": {n, hist}, ... }
 
     Hybrid formatting:
       - observational_data: normal hybrid (top-level arrays compact)
-      - interventional_data: if compact_interventions=True, each do()-payload is compacted (one-line hist/marginals)
+      - interventional_data: if compact_interventions=True, each do()-payload is compacted
         while keeping the top-level dict pretty (do-keys easy to scan).
     """
     import json
@@ -1604,7 +1605,7 @@ def format_prompt_summary_full_joint(
     def _dumps_interventional_hybrid(interv: Dict[str, Any]) -> str:
         """
         Pretty-print the outer dict, but inject each do()-payload as compact JSON
-        so nested hist/marginals are one-line.
+        so nested arrays are one-line.
         """
         if not pretty_json:
             return _compact_json(interv)
@@ -1616,7 +1617,7 @@ def format_prompt_summary_full_joint(
         for do_k, payload in interv.items():
             token = f"__PAYLOAD_{len(injected)}__"
             outer[do_k] = token
-            injected[token] = _compact_json(payload)  # payload itself compact => hist/marginals one-line
+            injected[token] = _compact_json(payload)
 
         s = json.dumps(outer, indent=int(json_indent), ensure_ascii=False)
         for token, payload_str in injected.items():
@@ -2337,6 +2338,7 @@ def main():
                         include_def_int=include_def_int,
                         anonymize=args.anonymize,
                         include_probabilities=False,
+                        include_marginals=False,
                         sort_hist_by="count_desc",
                         hist_mass_keep_frac=args.hist_mass_keep_frac,
                         require_think_answer_blocks=require_think_answer_blocks,

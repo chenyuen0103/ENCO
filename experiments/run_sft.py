@@ -374,7 +374,7 @@ def _validate_sft_jsonl(path: Path, *, allow_legacy_text: bool = False, sample_l
         raise ValueError(
             f"SFT JSONL is empty: {path}. "
             "Regenerate it before training; for staged CD data use cd_sft/staged_targets.py "
-            "or collect_format_sft_data.py."
+            "or generate_reasoning.py."
         )
 
     total = 0
@@ -484,6 +484,144 @@ def _build_jsonl_metrics_callback(
     return _JsonlMetricsCallback(output_path)
 
 
+def _resolve_sample_completions_path(sft_output_dir: Path, sample_completions_out: Path | None) -> Path:
+    if sample_completions_out is not None:
+        out = Path(sample_completions_out)
+    else:
+        out = Path(sft_output_dir) / "sample_completions.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _build_sample_completions_callback(
+    output_path: Path,
+    *,
+    dataset: Any,
+    tokenizer: Any,
+    sample_k: int,
+    max_new_tokens: int,
+    every_steps: int,
+    log_to_wandb: bool = False,
+):
+    from transformers import TrainerCallback
+
+    class _SampleCompletionsCallback(TrainerCallback):
+        def __init__(self, p: Path):
+            self.output_path = Path(p)
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._last_logged_step: int | None = None
+
+        @staticmethod
+        def _to_text(value: Any) -> str:
+            return str(value or "")
+
+        def on_evaluate(self, args, state, control, **kwargs):  # type: ignore[override]
+            if not state.is_local_process_zero or dataset is None:
+                return
+            step = int(state.global_step or 0)
+            if step <= 0 or int(every_steps) <= 0 or (step % int(every_steps)) != 0:
+                return
+            if self._last_logged_step == step:
+                return
+            self._last_logged_step = step
+
+            model = kwargs.get("model")
+            if model is None:
+                return
+            model_to_use = getattr(model, "module", model)
+
+            try:
+                import torch
+            except Exception:
+                return
+
+            try:
+                device = next(model_to_use.parameters()).device
+            except Exception:
+                device = None
+
+            was_training = bool(getattr(model_to_use, "training", False))
+            records: list[dict[str, Any]] = []
+            try:
+                model_to_use.eval()
+                limit = min(int(sample_k), len(dataset))
+                eos_token_id = getattr(tokenizer, "eos_token_id", None)
+                pad_token_id = getattr(tokenizer, "pad_token_id", None)
+                if pad_token_id is None:
+                    pad_token_id = eos_token_id
+
+                for idx in range(limit):
+                    example = dataset[int(idx)]
+                    prompt = self._to_text(example.get("prompt"))
+                    gold_completion = self._to_text(
+                        example.get("completion") if "completion" in example else example.get("answer")
+                    )
+                    try:
+                        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                        if device is not None:
+                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                        with torch.no_grad():
+                            out = model_to_use.generate(
+                                **inputs,
+                                max_new_tokens=int(max_new_tokens),
+                                do_sample=False,
+                                eos_token_id=eos_token_id,
+                                pad_token_id=pad_token_id,
+                            )
+                        prompt_len = int(inputs["input_ids"].shape[-1])
+                        gen_ids = out[0][prompt_len:]
+                        completion = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                        record = {
+                            "global_step": step,
+                            "epoch": float(state.epoch) if state.epoch is not None else None,
+                            "sample_idx": int(idx),
+                            "prompt": prompt,
+                            "completion": completion,
+                            "gold_completion": gold_completion,
+                        }
+                    except Exception as e:
+                        record = {
+                            "global_step": step,
+                            "epoch": float(state.epoch) if state.epoch is not None else None,
+                            "sample_idx": int(idx),
+                            "prompt": prompt,
+                            "completion": "",
+                            "gold_completion": gold_completion,
+                            "error": str(e),
+                        }
+                    records.append(record)
+
+                with self.output_path.open("a", encoding="utf-8") as f:
+                    for record in records:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                if log_to_wandb:
+                    try:
+                        import wandb  # type: ignore
+
+                        if wandb.run is not None:
+                            preview_lines = []
+                            for rec in records[: min(3, len(records))]:
+                                comp = str(rec.get("completion") or "")
+                                preview_lines.append(
+                                    f"[{rec.get('sample_idx')}] {comp[:240]}"
+                                )
+                            wandb.log(
+                                {
+                                    "samples/num_logged": len(records),
+                                    "samples/preview": "\n\n".join(preview_lines),
+                                },
+                                step=step,
+                            )
+                    except Exception:
+                        pass
+            finally:
+                if was_training:
+                    model_to_use.train()
+
+    return _SampleCompletionsCallback(output_path)
+
+
 def _run_sft_unsloth(
     *,
     base_model: str,
@@ -511,6 +649,12 @@ def _run_sft_unsloth(
     metric_for_best_model: str = "eval_loss",
     greater_is_better: bool = False,
     grpo_base_model: str | None = None,
+    wandb_project: str | None = None,
+    wandb_run_name: str | None = None,
+    sample_completions_every: int = 0,
+    sample_completions_k: int = 3,
+    sample_completions_max_new_tokens: int = 512,
+    sample_completions_out: Path | None = None,
     resume_from_checkpoint: str | None = None,
 ) -> None:
     """Single-GPU SFT via Unsloth — ~2× faster, supports 4-bit to reduce VRAM."""
@@ -661,6 +805,21 @@ def _run_sft_unsloth(
         eval_metrics_jsonl_path = _resolve_eval_log_path(sft_output_dir, eval_log_jsonl)
         print(f"[sft/unsloth] eval metrics path: {eval_metrics_jsonl_path}")
         callbacks.append(_build_jsonl_metrics_callback(eval_metrics_jsonl_path, include_prefixes=("eval_",)))
+    sample_source_ds = eval_ds if eval_ds is not None else train_ds
+    if int(sample_completions_every) > 0 and sample_source_ds is not None:
+        sample_completions_path = _resolve_sample_completions_path(sft_output_dir, sample_completions_out)
+        print(f"[sft/unsloth] sample completions path: {sample_completions_path}")
+        callbacks.append(
+            _build_sample_completions_callback(
+                sample_completions_path,
+                dataset=sample_source_ds,
+                tokenizer=tokenizer,
+                sample_k=int(sample_completions_k),
+                max_new_tokens=int(sample_completions_max_new_tokens),
+                every_steps=int(sample_completions_every),
+                log_to_wandb=bool(wandb_project),
+            )
+        )
     callbacks.extend(extra_callbacks)
     cfg_kwargs = {
         "output_dir": str(sft_output_dir),
@@ -673,7 +832,8 @@ def _run_sft_unsloth(
         "save_steps": int(sft_save_steps),
         "bf16": is_bfloat16_supported(),
         "fp16": not is_bfloat16_supported(),
-        "report_to": "none",
+        "report_to": "wandb" if wandb_project else "none",
+        "run_name": wandb_run_name,
         "remove_unused_columns": False,
         "save_total_limit": sft_save_total_limit,
         "max_seq_length": max_len,
@@ -744,6 +904,10 @@ def run_sft(
     grpo_base_model: str | None = None,
     wandb_project: str | None = None,
     wandb_run_name: str | None = None,
+    sample_completions_every: int = 0,
+    sample_completions_k: int = 3,
+    sample_completions_max_new_tokens: int = 512,
+    sample_completions_out: Path | None = None,
     resume_from_checkpoint: str | None = None,
 ) -> None:
     sft_summary = _validate_sft_jsonl(sft_jsonl)
@@ -785,6 +949,12 @@ def run_sft(
             metric_for_best_model=metric_for_best_model,
             greater_is_better=greater_is_better,
             grpo_base_model=grpo_base_model,
+            wandb_project=wandb_project,
+            wandb_run_name=wandb_run_name,
+            sample_completions_every=sample_completions_every,
+            sample_completions_k=sample_completions_k,
+            sample_completions_max_new_tokens=sample_completions_max_new_tokens,
+            sample_completions_out=sample_completions_out,
             resume_from_checkpoint=resume_from_checkpoint,
         )
         return
@@ -1066,6 +1236,21 @@ def run_sft(
         eval_metrics_jsonl_path = _resolve_eval_log_path(sft_output_dir, eval_log_jsonl)
         print(f"[sft] eval metrics path: {eval_metrics_jsonl_path}")
         callbacks.append(_build_jsonl_metrics_callback(eval_metrics_jsonl_path, include_prefixes=("eval_",)))
+    sample_source_ds = eval_ds if eval_ds is not None else train_ds
+    if int(sample_completions_every) > 0 and sample_source_ds is not None:
+        sample_completions_path = _resolve_sample_completions_path(sft_output_dir, sample_completions_out)
+        print(f"[sft] sample completions path: {sample_completions_path}")
+        callbacks.append(
+            _build_sample_completions_callback(
+                sample_completions_path,
+                dataset=sample_source_ds,
+                tokenizer=tokenizer,
+                sample_k=int(sample_completions_k),
+                max_new_tokens=int(sample_completions_max_new_tokens),
+                every_steps=int(sample_completions_every),
+                log_to_wandb=bool(wandb_project),
+            )
+        )
     callbacks.extend(extra_callbacks)
     trainer = Trainer(
         model=model,
@@ -1806,6 +1991,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Custom W&B run name (defaults to --sft-output-dir basename if --wandb-project is set).",
     )
+    ap.add_argument(
+        "--sample-completions-every",
+        type=int,
+        default=0,
+        help="If >0, generate sample completions every N eval steps and write them to JSONL.",
+    )
+    ap.add_argument(
+        "--sample-completions-k",
+        type=int,
+        default=3,
+        help="Number of prompt examples to sample when logging sample completions.",
+    )
+    ap.add_argument(
+        "--sample-completions-max-new-tokens",
+        type=int,
+        default=512,
+        help="Generation budget for each sample completion.",
+    )
+    ap.add_argument(
+        "--sample-completions-out",
+        type=Path,
+        default=None,
+        help="Optional JSONL path for sample completions. Default: <sft_output_dir>/sample_completions.jsonl",
+    )
 
     ap.add_argument(
         "--grpo-args",
@@ -1984,6 +2193,10 @@ def main() -> None:
                 grpo_base_model=getattr(args, "grpo_base_model", None),
                 wandb_project=args.wandb_project,
                 wandb_run_name=wandb_run_name,
+                sample_completions_every=args.sample_completions_every,
+                sample_completions_k=args.sample_completions_k,
+                sample_completions_max_new_tokens=args.sample_completions_max_new_tokens,
+                sample_completions_out=args.sample_completions_out,
                 resume_from_checkpoint=args.resume_from_checkpoint,
             )
         finally:

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import pandas as pd
+
 
 _DEFAULT_CONTEXT_WINDOWS: dict[str, int] = {
     # Keep a small mapping; adjust/extend as needed.
@@ -471,6 +473,26 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
 
+def _load_evaluated_response_csvs(summary_csv: Path) -> set[Path]:
+    if not summary_csv.exists():
+        return set()
+    try:
+        df = pd.read_csv(summary_csv)
+    except Exception:
+        return set()
+    if "response_csv" not in df.columns:
+        return set()
+    if "evaluated" in df.columns:
+        df = df[df["evaluated"] == 1].copy()
+    out: set[Path] = set()
+    for value in df["response_csv"].dropna():
+        try:
+            out.add(Path(str(value)).resolve())
+        except Exception:
+            continue
+    return out
+
+
 def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
     resp_csvs = _find_response_csvs(experiments_dir, args.dataset)
     if not resp_csvs:
@@ -479,7 +501,12 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
             "Run the model step first."
         )
 
+    evaluated_cache: dict[Path, set[Path]] = {}
     for csv_path in resp_csvs:
+        summary_csv = csv_path.parent / "eval_summary.csv"
+        if summary_csv not in evaluated_cache:
+            evaluated_cache[summary_csv] = _load_evaluated_response_csvs(summary_csv)
+
         per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
         if (
             per_row_path.exists()
@@ -487,8 +514,22 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
             and not args.overwrite_eval
         ):
             continue
-        cmd = [sys.executable, "evaluate.py", "--csv", str(csv_path), "--tau", str(args.tau)]
+        if not args.overwrite_eval and csv_path.resolve() in evaluated_cache[summary_csv]:
+            continue
+
+        cmd = [
+            sys.executable,
+            "evaluate.py",
+            "--csv",
+            str(csv_path),
+            "--tau",
+            str(args.tau),
+            "--summary-csv",
+            str(summary_csv),
+        ]
         _run(cmd, cwd=experiments_dir, dry_run=dry_run)
+        if not dry_run:
+            evaluated_cache[summary_csv].add(csv_path.resolve())
 
 
 def _read_json(path: Path) -> dict[str, Any]:

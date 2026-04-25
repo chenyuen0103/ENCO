@@ -19,13 +19,17 @@ differences are:
 |---|---|---|---|
 | `--wrapper-mode` | `plain` · `chat` | prompt generators, SFT builder | Controls whether prompts are raw text or `system/user/assistant` chat |
 | `--append-format-hint` | flag | prompt generators, in-memory eval runner | Appends the canonical `Formatting requirement:` line; for causal discovery this enables the optional staged reasoning instructions |
-| `--reasoning-target` | `answer_only` · `stages` · `stages_evidence` | `collect_format_sft_data.py` | Controls the supervised completion style |
+| `--reasoning-target` | `answer_only` · `concise_evidence` · `stages` · `stages_evidence` · `teacher_evidence` | `generate_reasoning.py` | Controls the supervised completion style |
 
 ### Training support note
 
-Prompt generation now always uses the `think_answer` contract. `collect_format_sft_data.py`
+Prompt generation now always uses the `think_answer` contract. `generate_reasoning.py`
 and GRPO causal-discovery tasks therefore expect
 `<think>...</think><answer>...</answer>` outputs.
+
+`teacher_evidence` asks a teacher model to write only the supervised
+`<think>` content while the script still appends the verified ground-truth
+adjacency matrix as the `<answer>`.
 
 ## Querying Prompts
 
@@ -357,7 +361,7 @@ training currently supports only `think_answer`.
 ### SFT example, `wrapper-mode=chat`, `reasoning-target=stages`
 
 ```bash
-python experiments/collect_format_sft_data.py \
+python experiments/generate_reasoning.py \
     --graphs cancer \
     --prompt-style summary \
     --anonymize \

@@ -1,10 +1,11 @@
 {
   "metadata": {
-    "description": "Pure GRPO source prompt config for the mixed v4 pool reused by downstream SFT sampling, using concise and none guidance.",
+    "description": "Smaller SFT source prompt config derived from grpo_source_v4_mixed.json, keeping the same prompt distribution with fewer prompts per config.",
+    "derived_from": "experiments/configs/grpo_source_v4_mixed.json",
     "notes": [
-      "This config defines only the prompt distribution.",
-      "Downstream SFT datasets should be sampled from CSVs generated from this GRPO source pool.",
-      "Each graph/config combination is intended to use 8 random column permutations."
+      "This config is intended for building a lighter source CSV for SFT.",
+      "Prompt styles, graph set, and reasoning guidance mix match the GRPO source config.",
+      "Only the dataset generation size is reduced."
     ]
   },
   "dataset_generation": {
@@ -14,7 +15,7 @@
       "asia",
       "sachs"
     ],
-    "num_prompts_per_config": 5,
+    "num_prompts_per_config": 2,
     "seed": 42,
     "reasoning_guidances": [
       "concise",
@@ -26,7 +27,7 @@
     "append_format_hint": true,
     "row_order": "random",
     "col_order": "random",
-    "col_perms": 8,
+    "col_perms": 4,
     "shuffles_per_graph": 1
   },
   "config_product": {

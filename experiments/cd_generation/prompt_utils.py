@@ -209,7 +209,10 @@ def render_prompt_text(
     if append_format_hint is None:
         append_format_hint = (mode == "chat")
     resolved_format_hint_text = (
-        default_format_hint_text(task)
+        default_format_hint_text(
+            task,
+            reasoning_guidance=resolve_reasoning_guidance(reasoning_guidance=reasoning_guidance),
+        )
         if format_hint_text is None
         else str(format_hint_text)
     )

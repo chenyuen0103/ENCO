@@ -23,7 +23,7 @@ GPU selection precedence in the launcher is:
 ## Main Files
 - [run_cd_curriculum.py](/home/yuen_chen/ENCO/experiments/run_cd_curriculum.py): curriculum orchestrator
 - [run_sft_then_grpo.py](/home/yuen_chen/ENCO/experiments/run_sft_then_grpo.py): SFT helper used by the launcher
-- [build_grpo_cd_mix_dataset.py](/home/yuen_chen/ENCO/experiments/build_grpo_cd_mix_dataset.py): builds prompt CSVs from compact config JSONs
+- [generate_prompt_answer_csv.py](/home/yuen_chen/ENCO/experiments/generate_prompt_answer_csv.py): builds prompt CSVs from compact config JSONs
 - [cd_curriculum_debug_cancer.json](/home/yuen_chen/ENCO/experiments/cd_curriculum_debug_cancer.json): small 2-stage cancer debug curriculum
 
 ## What Was Changed
@@ -40,7 +40,7 @@ Use the repo conda env.
 ```bash
 mkdir -p experiments/prompts/cancer_debug
 
-python experiments/build_grpo_cd_mix_dataset.py \
+python experiments/generate_prompt_answer_csv.py \
   --config-file experiments/cancer_summary_joint_matrix_obs100_int10_nonanon.json \
   --graphs-dir causal_graphs/real_data/small_graphs \
   --graph-names cancer \
@@ -48,7 +48,7 @@ python experiments/build_grpo_cd_mix_dataset.py \
   --seed 11 \
   --output-csv experiments/prompts/cancer_debug/cancer_obs100_int10_train.csv
 
-python experiments/build_grpo_cd_mix_dataset.py \
+python experiments/generate_prompt_answer_csv.py \
   --config-file experiments/cancer_summary_joint_matrix_obs500_int20_nonanon.json \
   --graphs-dir causal_graphs/real_data/small_graphs \
   --graph-names cancer \
