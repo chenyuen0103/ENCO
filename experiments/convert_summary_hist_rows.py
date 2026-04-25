@@ -211,6 +211,7 @@ def main() -> None:
             include_causal_rules=include_causal_rules,
             include_give_steps=include_give_steps,
             include_def_int=include_def_int,
+            include_marginals=False,
         )
 
         out_prompt_txt = out_prompt_txt_dir / f"{out_base}_data{data_idx}_shuf{shuf_idx}.txt"

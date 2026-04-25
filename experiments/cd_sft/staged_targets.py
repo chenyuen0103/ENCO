@@ -87,6 +87,7 @@ _INT_BLOCK_RE = re.compile(
     r"---\s*INTERVENTIONAL DATA\s*---\s*\n.*?interventional_data=(\{.*?\})(?=\n(?:---|Output:|Formatting requirement:|assistant\b)|\Z)",
     re.DOTALL,
 )
+_NUM_STATES_RE = re.compile(r"num_states=(\[[^\]\n]+\])")
 _DO_KEY_RE = re.compile(r"do\((.+?)=([^)]+)\)")
 
 
@@ -116,6 +117,82 @@ def _extract_prompt_distribution_blocks(prompt: str) -> Tuple[Optional[dict], Op
     obs_payload = _decode_after_marker(text, "observational_data=")
     int_payload = _decode_after_marker(text, "interventional_data=")
     return obs_payload, int_payload
+
+
+def _extract_num_states(prompt: str, n_vars: int) -> Optional[List[int]]:
+    match = _NUM_STATES_RE.search(str(prompt or ""))
+    if not match:
+        return None
+    try:
+        values = json.loads(match.group(1))
+    except Exception:
+        return None
+    if not isinstance(values, list) or len(values) != n_vars:
+        return None
+    try:
+        return [max(1, int(v)) for v in values]
+    except Exception:
+        return None
+
+
+def _iter_hist_assignments(payload: dict):
+    hist = payload.get("hist")
+    if not isinstance(hist, list):
+        return
+    for item in hist:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        assignment = item[0]
+        if not isinstance(assignment, list):
+            continue
+        try:
+            count = float(item[1])
+        except Exception:
+            continue
+        yield assignment, count
+
+
+def _infer_num_states_from_payloads(payloads: List[dict], n_vars: int) -> List[int]:
+    max_seen = [-1] * n_vars
+    for payload in payloads:
+        for assignment, _count in _iter_hist_assignments(payload):
+            for idx, raw_value in enumerate(assignment[:n_vars]):
+                try:
+                    max_seen[idx] = max(max_seen[idx], int(raw_value))
+                except Exception:
+                    continue
+    return [max(2, value + 1) for value in max_seen]
+
+
+def _payload_marginals(payload: dict, num_states: List[int]) -> Optional[List[List[float]]]:
+    marginals = payload.get("marginals")
+    if isinstance(marginals, list):
+        return marginals
+
+    n_vars = len(num_states)
+    counts = [[0.0 for _ in range(num_states[idx])] for idx in range(n_vars)]
+    total = 0.0
+    for assignment, count in _iter_hist_assignments(payload):
+        if len(assignment) < n_vars:
+            continue
+        total += count
+        for idx, raw_value in enumerate(assignment[:n_vars]):
+            try:
+                state = int(raw_value)
+            except Exception:
+                continue
+            if 0 <= state < num_states[idx]:
+                counts[idx][state] += count
+
+    declared_n = payload.get("n")
+    try:
+        denom = float(declared_n)
+    except Exception:
+        denom = total
+    if denom <= 0:
+        return None
+
+    return [[value / denom for value in row] for row in counts]
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +253,12 @@ def _build_edge_effect_table(
     if not isinstance(obs_payload, dict) or not isinstance(int_payload, dict):
         return {}
 
-    obs_marginals = obs_payload.get("marginals")
+    int_payloads = [payload for payload in int_payload.values() if isinstance(payload, dict)]
+    num_states = _extract_num_states(prompt, len(variables))
+    if num_states is None:
+        num_states = _infer_num_states_from_payloads([obs_payload, *int_payloads], len(variables))
+
+    obs_marginals = _payload_marginals(obs_payload, num_states)
     if not isinstance(obs_marginals, list):
         return {}
 
@@ -195,7 +277,7 @@ def _build_edge_effect_table(
         if cause_idx is None:
             continue
 
-        do_marginals = payload.get("marginals")
+        do_marginals = _payload_marginals(payload, num_states)
         if not isinstance(do_marginals, list):
             continue
 

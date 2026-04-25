@@ -1723,9 +1723,10 @@ def build_length_penalty_reward(
         )["input_ids"]
         rewards: List[float] = []
         for ids in tokenized:
-            # Length regularization (no free threshold): penalize every generated token.
-            # `target_tokens` is kept only for backward CLI compatibility.
-            penalty = float(coef) * float(len(ids))
+            # Penalize only overflow beyond a free token budget so long-but-correct
+            # answers are not dominated by a global length term.
+            overflow_tokens = max(0, int(len(ids)) - int(target_tokens))
+            penalty = float(coef) * float(overflow_tokens)
             reward = -penalty
             if max_abs > 0:
                 reward = max(reward, -float(max_abs))

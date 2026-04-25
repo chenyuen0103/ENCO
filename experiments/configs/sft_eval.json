@@ -1,1 +1,48 @@
-torchrun --standalone --nproc_per_node=2 experiments/run_sft.py   --stage sft   --base-model Qwen/Qwen3-4B-Thinking-2507   --distributed-base-model Qwen/Qwen3-4B-Thinking-2507   --sft-jsonl experiments/data/format_sft_multi_target_v4_mixed.jsonl   --eval-jsonl experiments/data/sft_eval.jsonl   --sft-output-dir experiments/checkpoints/qwen3_4b_sft_format_v4_mixed_2gpu   --sft-epochs 1.0   --sft-lr 2e-5   --sft-batch-size 2   --sft-eval-batch-size 2   --sft-grad-accum 4   --sft-max-seq-length 16384   --validation-split-ratio 0.0   --eval-every 25   --early-stopping-patience 2   --sft-save-steps 50   --sft-logging-steps 5   --merge-after-sft
+{
+  "metadata": {
+    "description": "Compact child-graph eval config for SFT/GRPO, balanced across staged, concise, and none reasoning guidance.",
+    "notes": [
+      "This eval pool is generated directly with generate_prompt_answer_csv.py.",
+      "Prompt guidance is balanced evenly across staged, concise, and none.",
+      "Both summary and matrix prompt styles are included."
+    ]
+  },
+  "dataset_generation": {
+    "graphs_dir": "causal_graphs/real_data/small_graphs",
+    "graph_names": [
+      "child"
+    ],
+    "num_prompts_per_config": 5,
+    "seed": 1337,
+    "reasoning_guidances": [
+      "staged",
+      "concise",
+      "none"
+    ]
+  },
+  "config_defaults": {
+    "wrapper_mode": "chat",
+    "append_format_hint": true,
+    "row_order": "random",
+    "col_order": "original",
+    "shuffles_per_graph": 1
+  },
+  "config_product": {
+    "prompt_style": [
+      "summary",
+      "matrix"
+    ],
+    "obs_per_prompt": [
+      1000,
+      5000
+    ],
+    "int_per_combo": [
+      0,
+      200
+    ],
+    "anonymize": [
+      false,
+      true
+    ]
+  }
+}

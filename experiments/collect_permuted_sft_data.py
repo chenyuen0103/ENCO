@@ -2,11 +2,11 @@
 """
 collect_permuted_sft_data.py  — compatibility shim
 
-This script's functionality has been merged into collect_format_sft_data.py
+This script's functionality has been merged into generate_reasoning.py
 as Mode C (--perm-csv).
 
 Equivalent call:
-    python experiments/collect_format_sft_data.py \\
+    python experiments/generate_reasoning.py \\
         --perm-csv \\
         [--rows-per-source 5] [--max-perms 500] \\
         [--data-dir experiments/data] [--graph-filter cancer earthquake] ...
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from collect_format_sft_data import main
+from generate_reasoning import main
 
 if __name__ == "__main__":
     # Inject --perm-csv if not already present so bare invocations of this

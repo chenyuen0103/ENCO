@@ -11,7 +11,7 @@
     {
       "name": "stages",
       "output_jsonl": "experiments/data/format_sft_stages_v4_mixed.jsonl",
-      "script": "experiments/collect_format_sft_data.py",
+      "script": "experiments/generate_reasoning.py",
       "source_csvs": [
         {
           "path": "experiments/data/grpo_mix_anon.csv",
@@ -33,7 +33,7 @@
     {
       "name": "concise",
       "output_jsonl": "experiments/data/format_sft_concise_v4_mixed.jsonl",
-      "script": "experiments/collect_format_sft_data.py",
+      "script": "experiments/generate_reasoning.py",
       "source_csvs": [
         {
           "path": "experiments/data/grpo_mix_anon.csv",
@@ -55,7 +55,7 @@
     {
       "name": "answer_only",
       "output_jsonl": "experiments/data/format_sft_answer_only_v4_mixed.jsonl",
-      "script": "experiments/collect_format_sft_data.py",
+      "script": "experiments/generate_reasoning.py",
       "source_csvs": [
         {
           "path": "experiments/data/grpo_mix_anon.csv",

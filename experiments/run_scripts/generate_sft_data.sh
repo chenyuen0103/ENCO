@@ -43,7 +43,7 @@ echo "============================================"
 
 cd "${REPO_ROOT}"
 
-python experiments/build_grpo_cd_mix_dataset.py \
+python experiments/generate_prompt_answer_csv.py \
   --config-file "${CONFIG_FILE}" \
   --graphs-dir "$(dirname "${BIF_FILE}")" \
   --graph-names "$(basename "${BIF_FILE}" .bif)" \
@@ -51,7 +51,7 @@ python experiments/build_grpo_cd_mix_dataset.py \
   --seed "${EVAL_SEED}" \
   --output-csv "${EVAL_CSV}"
 
-python experiments/collect_format_sft_data.py \
+python experiments/generate_reasoning.py \
   --output "${TRAIN_JSONL}" \
   --csv "${MIX_ANON_CSV}:grpo_mix_anon" \
   --csv "${MIX_NAMED_CSV}:grpo_mix_named" \
@@ -62,7 +62,7 @@ python experiments/collect_format_sft_data.py \
   --n-per-source "${TRAIN_ROWS_PER_SOURCE}" \
   --seed 42
 
-python experiments/collect_format_sft_data.py \
+python experiments/generate_reasoning.py \
   --output "${EVAL_JSONL}" \
   --csv "${EVAL_CSV}:sft_eval_child" \
   --prompt-col prompt_text \

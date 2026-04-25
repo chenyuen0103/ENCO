@@ -28,7 +28,6 @@ try:
     from cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
-        canonicalize_cd_prompt,
         default_format_hint_text,
         default_short_think_text,
     )
@@ -36,7 +35,6 @@ except ModuleNotFoundError:
     from experiments.cd_generation.format import (
         DEFAULT_FORMAT_HINT_TEXT,
         SYSTEM_PROMPT,
-        canonicalize_cd_prompt,
         default_format_hint_text,
         default_short_think_text,
     )
@@ -1162,24 +1160,25 @@ def build_argparser():
     p.add_argument(
         "--length_penalty_coef",
         type=float,
-        default=0.0000333333,
+        default=0.00002,
         help=(
-            "Per-token penalty coefficient. 0 disables length penalty reward. "
+            "Per-token penalty coefficient applied only to completion tokens beyond "
+            "--length_penalty_target_tokens. 0 disables the length penalty reward. "
             "Reward contribution is negative."
         ),
     )
     p.add_argument(
         "--length_penalty_target_tokens",
         type=int,
-        default=0,
+        default=4096,
         help=(
-            "Deprecated/ignored. Length penalty now regularizes total completion length."
+            "Free completion-token budget before the length penalty starts applying."
         ),
     )
     p.add_argument(
         "--length_penalty_max_abs",
         type=float,
-        default=1.0,
+        default=0.10,
         help=(
             "Max absolute magnitude of length penalty reward per sample. "
             "Set <=0 for uncapped penalty."
@@ -1704,19 +1703,7 @@ def _load_cd_rows_from_prompt_csv(
                 prompt_path = _resolve_existing_path(prompt_path_raw, csv_path=csv_path)
                 prompt_raw = prompt_path.read_text(encoding="utf-8", errors="ignore")
 
-            prompt_text = prompt_raw
-            prompt_text = canonicalize_cd_prompt(
-                prompt_text,
-                task=task,
-                response_format=response_format,
-                wrap_system_prompt=bool(wrap_system_prompt),
-                append_format_hint=bool(append_format_hint),
-                format_hint_text=str(format_hint_text),
-                prefill_think=not bool(prefill_answer),
-                prefill_answer=bool(prefill_answer),
-                think_text=str(think_text),
-                strip_output_instructions=bool(wrap_system_prompt),
-            )
+            prompt_text = prompt_raw.rstrip() + "\n"
 
             answer_raw = (row.get("answer") or "").strip()
             if not answer_raw:
@@ -1737,6 +1724,7 @@ def _load_cd_rows_from_prompt_csv(
                         "int_per_combo": _to_jsonable_config(row.get("int_per_combo")),
                         "anonymize": _to_jsonable_config(row.get("anonymize")),
                         "prompt_style": str(row.get("prompt_style") or ""),
+                        "reasoning_guidance": str(row.get("reasoning_guidance") or ""),
                         "prompt_raw": prompt_raw,
                         "prompt": prompt_text,
                         "answer": answer_raw,
@@ -1939,20 +1927,7 @@ def _dataset_from_cd_config_file(
                         include_def_int=bool(def_int),
                         anonymize=bool(item.get("anonymize", anon)),
                     )
-                    prompt_text = prompt_raw
-                    prompt_text = canonicalize_cd_prompt(
-                        prompt_text,
-                        task=task,
-                        response_format=response_format,
-                        wrap_system_prompt=bool(wrap_system_prompt),
-                        append_format_hint=bool(config_append_format_hint),
-                        format_hint_text=config_format_hint_text,
-                        reasoning_guidance=reasoning_guidance,
-                        prefill_think=not bool(prefill_answer),
-                        prefill_answer=bool(prefill_answer),
-                        think_text=str(think_text),
-                        strip_output_instructions=bool(wrap_system_prompt),
-                    )
+                    prompt_text = prompt_raw.rstrip() + "\n"
                     rows.append(
                         {
                             "prompt_raw": prompt_raw,
@@ -1969,20 +1944,7 @@ def _dataset_from_cd_config_file(
                 continue
 
             prompt_raw = str(item.get("prompt_text", ""))
-            prompt_text = prompt_raw
-            prompt_text = canonicalize_cd_prompt(
-                prompt_text,
-                task=task,
-                response_format=response_format,
-                wrap_system_prompt=bool(wrap_system_prompt),
-                append_format_hint=bool(config_append_format_hint),
-                format_hint_text=config_format_hint_text,
-                reasoning_guidance=reasoning_guidance,
-                prefill_think=not bool(prefill_answer),
-                prefill_answer=bool(prefill_answer),
-                think_text=str(think_text),
-                strip_output_instructions=bool(wrap_system_prompt),
-            )
+            prompt_text = prompt_raw.rstrip() + "\n"
             rows.append(
                 (
                     {
@@ -1991,6 +1953,7 @@ def _dataset_from_cd_config_file(
                         "int_per_combo": int(int_n),
                         "anonymize": bool(item.get("anonymize", anon)),
                         "prompt_style": str(style),
+                        "reasoning_guidance": str(reasoning_guidance),
                         "prompt_raw": prompt_raw,
                         "prompt": prompt_text,
                         "answer": answer_raw,
@@ -3187,6 +3150,7 @@ def run_train(args, argv: list[str] | None = None):
             "int_per_combo",
             "anonymize",
             "prompt_style",
+            "reasoning_guidance",
             "prompt",
             "prompt_raw",
             "answer",
@@ -3594,6 +3558,8 @@ def run_train(args, argv: list[str] | None = None):
         datasets = _extract_batch_values(kwargs, "dataset", len(completions))
         obs_per_prompts = _extract_batch_values(kwargs, "obs_per_prompt", len(completions))
         int_per_combos = _extract_batch_values(kwargs, "int_per_combo", len(completions))
+        prompt_styles = _extract_batch_values(kwargs, "prompt_style", len(completions))
+        reasoning_guidances = _extract_batch_values(kwargs, "reasoning_guidance", len(completions))
         answers = kwargs.get("answer")
         solutions = kwargs.get("solution")
         sampled_indices = decision.get("sampled_indices", set())
@@ -3622,6 +3588,8 @@ def run_train(args, argv: list[str] | None = None):
                     "dataset": _value_at(datasets, i),
                     "obs_per_prompt": _value_at(obs_per_prompts, i),
                     "int_per_combo": _value_at(int_per_combos, i),
+                    "prompt_style": _value_at(prompt_styles, i),
+                    "reasoning_guidance": _value_at(reasoning_guidances, i),
                     "format_ok": (
                         int(bool(FORMAT_RE.match(completion_text)))
                         if args.task == "math"
@@ -3690,6 +3658,8 @@ def run_train(args, argv: list[str] | None = None):
                             "dataset": row.get("dataset"),
                             "obs_per_prompt": row.get("obs_per_prompt"),
                             "int_per_combo": row.get("int_per_combo"),
+                            "prompt_style": row.get("prompt_style"),
+                            "reasoning_guidance": row.get("reasoning_guidance"),
                             "format_ok": row["format_ok"],
                             "format_ok_scored_on_full_completion": row["format_ok_scored_on_full_completion"],
                             "ended_with_answer_tag": row["ended_with_answer_tag"],
@@ -3773,11 +3743,6 @@ def run_train(args, argv: list[str] | None = None):
         raise ValueError("--length_penalty_coef must be >= 0")
     if args.length_penalty_target_tokens < 0:
         raise ValueError("--length_penalty_target_tokens must be >= 0")
-    if args.length_penalty_target_tokens != 0:
-        print(
-            "[warn] --length_penalty_target_tokens is ignored; "
-            "length penalty now applies to total completion length."
-        )
 
     if args.length_penalty_coef > 0.0:
         length_penalty_reward = build_length_penalty_reward(

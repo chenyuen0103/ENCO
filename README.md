@@ -91,7 +91,7 @@ Pick the workflow that matches your goal:
 | Evaluate an API model (GPT, Gemini) end-to-end | `run_experiment1_pipeline.py` |
 | Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `run_external_llm_baselines.py` + `evaluate.py` |
 | Score an existing prediction CSV | `evaluate.py` |
-| Build training data for SFT / GRPO | `build_grpo_cd_mix_dataset.py` → `collect_format_sft_data.py` |
+| Build training data for SFT / GRPO | `generate_prompt_answer_csv.py` → `generate_reasoning.py` |
 | Evaluate a finetuned / local model | `eval_sft_on_jsonl.py` |
 | Generate prompts only (single graph, no querying) | `generate_prompts.py` |
 | Query a prompt CSV without the full pipeline | `query_api.py` |
@@ -231,11 +231,11 @@ and can run with:
 
 ### 5. Build mixed prompt/answer CSV datasets
 
-`build_grpo_cd_mix_dataset.py` generates prompt CSVs with gold adjacency answers
+`generate_prompt_answer_csv.py` generates prompt CSVs with gold adjacency answers
 across multiple graphs and observation/intervention sizes.
 
 ```bash
-python experiments/build_grpo_cd_mix_dataset.py \
+python experiments/generate_prompt_answer_csv.py \
   --output-csv experiments/data/grpo_mix_named.csv \
   --graph-names cancer,earthquake,asia,sachs \
   --prompt-style summary \
@@ -291,11 +291,11 @@ train/eval export stays leak-free across different seeds.
 
 ### 8. Convert prompt CSVs into SFT JSONL
 
-`collect_format_sft_data.py` converts prompt/answer CSV rows into
+`generate_reasoning.py` converts prompt/answer CSV rows into
 chat-formatted SFT records with `<think>...</think><answer>...</answer>`.
 
 ```bash
-python experiments/collect_format_sft_data.py \
+python experiments/generate_reasoning.py \
   --output experiments/data/format_sft_stages_v4_mixed.jsonl \
   --csv experiments/data/grpo_mix_anon.csv:grpo_mix_anon \
   --csv experiments/data/grpo_mix_named.csv:grpo_mix_named \
@@ -310,7 +310,7 @@ python experiments/collect_format_sft_data.py \
 Held-out eval JSONL from the exported Sachs CSV:
 
 ```bash
-python experiments/collect_format_sft_data.py \
+python experiments/generate_reasoning.py \
   --output experiments/data/sft_eval.jsonl \
   --csv experiments/data/sft_eval_child.csv:sft_eval_child \
   --prompt-col prompt_text \
@@ -344,9 +344,9 @@ All scripts live under `experiments/`.
 |--------|---------|
 | `generate_prompts.py` | Prompt CSVs from a single BIF graph (obs + interventional) |
 | `cd_generation/names_only.py` | Names-only prompts with no sampled data |
-| `build_grpo_cd_mix_dataset.py` | Mixed prompt/answer CSVs across multiple graphs and data sizes |
+| `generate_prompt_answer_csv.py` | Mixed prompt/answer CSVs across multiple graphs and data sizes |
 | `export_cd_train_eval_csv.py` | Leak-free train/eval CSV splits from a config file |
-| `collect_format_sft_data.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
+| `generate_reasoning.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
 | `collect_descendant_sft_data.py` | SFT data for the descendant-identification task |
 | `run_scripts/generate_sft_data.sh` | Convenience wrapper to export Sachs eval CSVs and build train/eval causal-discovery SFT JSONL |
 
