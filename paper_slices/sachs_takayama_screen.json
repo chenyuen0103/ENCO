@@ -1,0 +1,173 @@
+{
+  "name": "sachs_takayama_screen",
+  "role": "control",
+  "description": "Screen all nine Takayama SCP variants on Sachs real-name observational cells at obs=1000 and obs=5000, then select the best variant by mean score across the two cells.",
+  "dataset": "sachs",
+  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "models": [
+    {
+      "name": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "enabled": false,
+      "tags": [
+        "placeholder"
+      ]
+    }
+  ],
+  "seed": 42,
+  "num_prompts": 5,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all",
+      "label": "obs1000_real"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all",
+      "label": "obs5000_real"
+    }
+  ],
+  "names_only": {
+    "enabled": false
+  },
+  "baselines": [
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "pc",
+      "takayama_pattern": 1,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama PC pattern 1 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "pc",
+      "takayama_pattern": 2,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama PC pattern 2 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "exact_search",
+      "takayama_pattern": 1,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama Exact Search pattern 1 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "exact_search",
+      "takayama_pattern": 2,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama Exact Search pattern 2 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "direct_lingam",
+      "takayama_pattern": 0,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama DirectLiNGAM pattern 0 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "direct_lingam",
+      "takayama_pattern": 1,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama DirectLiNGAM pattern 1 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "direct_lingam",
+      "takayama_pattern": 2,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama DirectLiNGAM pattern 2 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "direct_lingam",
+      "takayama_pattern": 3,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama DirectLiNGAM pattern 3 screening baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-4.1",
+      "provider": "openai",
+      "temperature": 0.0,
+      "num_samples": 5,
+      "takayama_backend": "direct_lingam",
+      "takayama_pattern": 4,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Takayama DirectLiNGAM pattern 4 screening baseline."
+    }
+  ],
+  "notes": "Sachs-only Takayama variant screen at real-name observational cells (1000,0) and (5000,0). Use the resulting two-cell mean to choose one Takayama variant for the full paper run."
+}

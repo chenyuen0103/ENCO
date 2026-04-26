@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .baselines import build_baseline_adapters
-from .evaluation import EvalScriptEvaluator, contamination_audit, load_summary_json, write_csv
+from .evaluation import EvalScriptEvaluator, contamination_audit, direct_csv_summary, write_csv
 from .graph_io import file_sha256, materialize_graph_source
 from .interfaces import CommandPlan
 from .registry import BenchmarkRegistry
@@ -97,6 +97,10 @@ def _response_name_for_prompt(prompt_csv: Path, model_name: str) -> str:
 
 def _response_name_for_base(base_name: str, model_name: str) -> str:
     return _response_name_for_prompt(Path(base_name).with_suffix(".csv"), model_name)
+
+
+def _per_row_metrics_path(response_csv: Path) -> Path:
+    return Path(str(response_csv) + ".per_row.csv")
 
 
 def _config_hash(spec: BenchmarkSpec) -> str:
@@ -283,7 +287,7 @@ class BenchmarkRunner:
                 if not model.enabled:
                     continue
                 response_csv = self.experiments_dir / "responses" / entry["dataset"] / _response_name_for_prompt(prompt_csv, model.name)
-                summary_path = Path(str(response_csv) + ".summary.json")
+                per_row_path = _per_row_metrics_path(response_csv)
                 query_cmd = [
                     PYTHON_EXE,
                     "query_api.py",
@@ -300,7 +304,7 @@ class BenchmarkRunner:
                     query_cmd.append("--overwrite")
                 if overwrite or not _reuse_existing(response_csv, dry_run=dry_run, label="response"):
                     _run(CommandPlan(label=f"query:{entry['dataset']}:{model.name}:{entry['config_name']}", cmd=query_cmd, cwd=self.experiments_dir), dry_run=dry_run)
-                if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
                     _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(
@@ -431,8 +435,8 @@ class BenchmarkRunner:
                         str(entry["prompt_basename"]),
                         model.name,
                     )
-                    summary_path = Path(str(response_csv) + ".summary.json")
-                    if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                    per_row_path = _per_row_metrics_path(response_csv)
+                    if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
                         _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                     response_entries.append(
                         self._response_record(
@@ -528,8 +532,8 @@ class BenchmarkRunner:
                     spec=self.spec,
                     dry_run=dry_run,
                 )
-                summary_path = Path(str(response_csv) + ".summary.json")
-                if not _reuse_existing(summary_path, dry_run=dry_run, label="summary"):
+                per_row_path = _per_row_metrics_path(response_csv)
+                if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
                     _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(
@@ -537,7 +541,12 @@ class BenchmarkRunner:
                         response_csv=response_csv,
                         system=baseline.name,
                         system_kind="baseline",
-                        extra={"baseline": baseline.name, "library": baseline.library or "internal"},
+                        extra={
+                            "baseline": baseline.name,
+                            "library": baseline.library or "internal",
+                            "takayama_backend": baseline.takayama_backend if baseline.name == "TakayamaSCP" else None,
+                            "takayama_pattern": baseline.takayama_pattern if baseline.name == "TakayamaSCP" else None,
+                        },
                     )
                 )
         if not dry_run:
@@ -574,7 +583,6 @@ class BenchmarkRunner:
         system_kind: str,
         extra: dict[str, Any],
     ) -> dict[str, Any]:
-        summary_path = Path(str(response_csv) + ".summary.json")
         return {
             "schema_version": "run_provenance/v1",
             "config_hash": _config_hash(self.spec),
@@ -596,8 +604,6 @@ class BenchmarkRunner:
             "prompt_csv_sha256": entry.get("prompt_csv_sha256"),
             "response_csv": str(response_csv),
             "response_csv_sha256": file_sha256(response_csv) if response_csv.exists() else None,
-            "summary_json": str(summary_path),
-            "summary_json_sha256": file_sha256(summary_path) if summary_path.exists() else None,
             **extra,
         }
 
@@ -607,10 +613,10 @@ class BenchmarkRunner:
         summary_rows: list[dict[str, Any]] = []
         consensus_rows: list[dict[str, Any]] = []
         for entry in bundle.get("entries", []):
-            summary_path = Path(entry["summary_json"])
-            if not summary_path.exists():
+            response_csv = Path(entry["response_csv"])
+            if not response_csv.exists():
                 continue
-            metrics = load_summary_json(summary_path)
+            metrics = direct_csv_summary(response_csv=response_csv, evaluator=self.spec.evaluator)
             base = {
                 "benchmark": self.spec.name,
                 "dataset": entry["dataset"],
@@ -625,8 +631,9 @@ class BenchmarkRunner:
                 "model": entry.get("model"),
                 "provider": entry.get("provider"),
                 "baseline": entry.get("baseline"),
+                "takayama_backend": entry.get("takayama_backend"),
+                "takayama_pattern": entry.get("takayama_pattern"),
                 "response_csv": entry["response_csv"],
-                "summary_json": entry["summary_json"],
             }
             summary_rows.append({**base, **metrics})
             consensus_rows.append(
