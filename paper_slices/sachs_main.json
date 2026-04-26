@@ -124,7 +124,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 5,
+      "num_samples": 1,
       "takayama_pattern": 2,
       "takayama_bootstrap_samples": 100,
       "notes": "Observational-only combined-information PC-based Takayama baseline for Sachs."

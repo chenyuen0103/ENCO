@@ -25,6 +25,8 @@ from benchmark_builder.graph_io import load_causal_graph
 
 DEFAULT_OUT_DIR = EXPERIMENTS_DIR / "responses"
 TAKAYAMA_BACKENDS = {"pc", "exact_search", "direct_lingam"}
+DEFAULT_FIRST_STAGE_MAX_NEW_TOKENS = 384
+DEFAULT_SECOND_STAGE_MAX_NEW_TOKENS = 8
 
 
 def _progress(message: str) -> None:
@@ -518,6 +520,26 @@ def _extract_yes_no_prob(response: Any) -> tuple[float, float, str]:
     return prob_yes, prob_no, text
 
 
+def _fmt_prob(value: float) -> str:
+    return f"{float(value):.12e}"
+
+
+def _resolve_stage_token_limits(
+    *,
+    shared_max_new_tokens: int | None,
+    max_new_tokens_first: int | None,
+    max_new_tokens_second: int | None,
+) -> tuple[int, int]:
+    if shared_max_new_tokens is not None:
+        first = int(max_new_tokens_first) if max_new_tokens_first is not None else int(shared_max_new_tokens)
+        second = int(max_new_tokens_second) if max_new_tokens_second is not None else int(shared_max_new_tokens)
+        return first, second
+    return (
+        int(max_new_tokens_first) if max_new_tokens_first is not None else DEFAULT_FIRST_STAGE_MAX_NEW_TOKENS,
+        int(max_new_tokens_second) if max_new_tokens_second is not None else DEFAULT_SECOND_STAGE_MAX_NEW_TOKENS,
+    )
+
+
 def _extract_text_from_illinois_payload(payload: Any) -> str:
     if isinstance(payload, dict):
         for key in ("content", "response", "text", "message", "output"):
@@ -556,7 +578,7 @@ def _chat_text_completion(
     temperature: float,
     max_new_tokens: int | None,
     logprobs: bool = False,
-    top_logprobs: int = 5,
+    top_logprobs: int = 20,
 ) -> dict[str, Any]:
     if provider == "openai":
         completion_tokens = max_new_tokens or (1500 if logprobs else 3000)
@@ -649,6 +671,8 @@ def _build_run_signature(
     naming_regime: str,
     temperature: float,
     max_new_tokens: int | None,
+    max_new_tokens_first: int,
+    max_new_tokens_second: int,
     num_samples: int,
     bootstrap_samples: int,
     pattern: int,
@@ -664,6 +688,8 @@ def _build_run_signature(
         "naming_regime": naming_regime,
         "temperature": float(temperature),
         "max_new_tokens": max_new_tokens,
+        "max_new_tokens_first": int(max_new_tokens_first),
+        "max_new_tokens_second": int(max_new_tokens_second),
         "num_samples": int(num_samples),
         "bootstrap_samples": int(bootstrap_samples),
         "takayama_pattern": int(pattern),
@@ -745,7 +771,8 @@ def _llm_probability_matrix(
     primary_prob: Optional[np.ndarray],
     secondary_prob: Optional[np.ndarray],
     temperature: float,
-    max_new_tokens: int | None,
+    max_new_tokens_first: int,
+    max_new_tokens_second: int,
     num_samples: int,
     anonymized: bool,
     checkpoint_path: Path,
@@ -828,7 +855,7 @@ def _llm_probability_matrix(
                         {"role": "user", "content": pair_state["first_prompt"]},
                     ],
                     temperature=temperature,
-                    max_new_tokens=max_new_tokens or 3000,
+                    max_new_tokens=max_new_tokens_first,
                 )
                 pair_state["first_answer"] = first_result["text"] or ""
                 pair_state["second_prompt"] = _build_second_prompt(
@@ -862,9 +889,9 @@ def _llm_probability_matrix(
                         {"role": "user", "content": pair_state["second_prompt"]},
                     ],
                     temperature=temperature,
-                    max_new_tokens=max_new_tokens or 1500,
+                    max_new_tokens=max_new_tokens_second,
                     logprobs=(provider == "openai"),
-                    top_logprobs=5,
+                    top_logprobs=20,
                 )
                 raw_text = second_result["text"] or ""
                 if provider == "openai":
@@ -884,7 +911,7 @@ def _llm_probability_matrix(
                 pair_state["mean_prob_yes"] = float(np.mean(probs)) if probs else 0.0
                 _progress(
                     f"pair {pair_done}/{total_pairs}: sample {trial + 1} done, "
-                    f"prob_yes={prob_yes:.3f}, running_mean={pair_state['mean_prob_yes']:.3f}"
+                    f"prob_yes={_fmt_prob(prob_yes)}, running_mean={_fmt_prob(pair_state['mean_prob_yes'])}"
                 )
                 current_pair = pair_state
                 save_checkpoint(current_pair_state=current_pair)
@@ -904,7 +931,7 @@ def _llm_probability_matrix(
             transcript.append(completed_entry)
             completed_pairs.add((i, j))
             _progress(
-                f"pair {pair_done}/{total_pairs}: completed, mean_prob_yes={mean_matrix[i, j]:.3f}, "
+                f"pair {pair_done}/{total_pairs}: completed, mean_prob_yes={_fmt_prob(mean_matrix[i, j])}, "
                 f"completed_pairs={len(completed_pairs)}/{total_pairs}"
             )
             current_pair = None
@@ -1087,6 +1114,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--max_new_tokens_first", type=int, default=None)
+    parser.add_argument("--max_new_tokens_second", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--bootstrap_samples", type=int, default=100)
     parser.add_argument("--backend", choices=sorted(TAKAYAMA_BACKENDS), default="pc")
@@ -1098,6 +1127,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     backend = _normalize_backend(args.backend)
+    max_new_tokens_first, max_new_tokens_second = _resolve_stage_token_limits(
+        shared_max_new_tokens=args.max_new_tokens,
+        max_new_tokens_first=args.max_new_tokens_first,
+        max_new_tokens_second=args.max_new_tokens_second,
+    )
 
     provider = args.provider
     if provider == "auto":
@@ -1116,7 +1150,8 @@ def main() -> int:
         graph_path = Path(graph_file).resolve()
         _progress(
             f"start graph={graph_path.stem}, backend={backend}, provider={provider}, model={args.model}, "
-            f"obs={args.sample_size_obs}, pattern={args.takayama_pattern}, naming={args.naming_regime}"
+            f"obs={args.sample_size_obs}, pattern={args.takayama_pattern}, naming={args.naming_regime}, "
+            f"max_first={max_new_tokens_first}, max_second={max_new_tokens_second}"
         )
         _progress("loading observational dataframe")
         _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, args.seed)
@@ -1162,6 +1197,8 @@ def main() -> int:
             naming_regime=args.naming_regime,
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
+            max_new_tokens_first=max_new_tokens_first,
+            max_new_tokens_second=max_new_tokens_second,
             num_samples=args.num_samples,
             bootstrap_samples=args.bootstrap_samples,
             pattern=args.takayama_pattern,
@@ -1178,7 +1215,8 @@ def main() -> int:
             primary_prob=(np.asarray(primary_prob) if primary_prob is not None else None),
             secondary_prob=(np.asarray(secondary_prob) if secondary_prob is not None else None),
             temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
+            max_new_tokens_first=max_new_tokens_first,
+            max_new_tokens_second=max_new_tokens_second,
             num_samples=args.num_samples,
             anonymized=args.naming_regime == "anonymized",
             checkpoint_path=checkpoint_path,
