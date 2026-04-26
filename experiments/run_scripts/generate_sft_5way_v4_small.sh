@@ -17,20 +17,24 @@ WRAPPER_MODE="${WRAPPER_MODE:-chat}"
 TEACHER_PROVIDER="${TEACHER_PROVIDER:-openai_compatible}"
 TEACHER_MODEL="${TEACHER_MODEL:-Qwen/Qwen2.5-72B-Instruct-AWQ}"
 TEACHER_BASE_URL="${TEACHER_BASE_URL:-http://127.0.0.1:8001/v1}"
-TEACHER_MAX_TOKENS="${TEACHER_MAX_TOKENS:-768}"
+TEACHER_MAX_TOKENS="${TEACHER_MAX_TOKENS:-1024}"
 TEACHER_MAX_REVISIONS="${TEACHER_MAX_REVISIONS:-1}"
 TEACHER_FALLBACK_TARGET="${TEACHER_FALLBACK_TARGET:-none}"
 TEACHER_REASONING_EFFORT="${TEACHER_REASONING_EFFORT:-}"
-RESUME_TEACHER_SHARDS="${RESUME_TEACHER_SHARDS:-0}"
+TEACHER_RETRY_UNTIL_VALID="${TEACHER_RETRY_UNTIL_VALID:-1}"
+TEACHER_RETRY_SLEEP="${TEACHER_RETRY_SLEEP:-0}"
+RESUME_TEACHER_SHARDS="${RESUME_TEACHER_SHARDS:-1}"
+RUN_REASONING_VALIDATION="${RUN_REASONING_VALIDATION:-1}"
+VALIDATION_MAX_ERRORS="${VALIDATION_MAX_ERRORS:-30}"
 
 mkdir -p "$(dirname "${SOURCE_CSV}")" "${SHARD_DIR}" "$(dirname "${OUT_JSONL}")"
 
-echo "[1/7] Generating source prompt/answer CSV: ${SOURCE_CSV}"
+echo "[1/8] Generating source prompt/answer CSV: ${SOURCE_CSV}"
 python experiments/generate_prompt_answer_csv.py \
   --config-file "${CONFIG_FILE}" \
   --output-csv "${SOURCE_CSV}"
 
-echo "[2/7] none + answer_only"
+echo "[2/8] none + answer_only"
 python experiments/generate_reasoning.py \
   --csv "${SOURCE_CSV}:sft_source_v4_small" \
   --prompt-col prompt_text \
@@ -42,7 +46,7 @@ python experiments/generate_reasoning.py \
   --seed "${BASE_SEED}" \
   --output "${SHARD_DIR}/01_none_answer_only.jsonl"
 
-echo "[3/7] none + concise_evidence"
+echo "[3/8] none + concise_evidence"
 python experiments/generate_reasoning.py \
   --csv "${SOURCE_CSV}:sft_source_v4_small" \
   --prompt-col prompt_text \
@@ -60,6 +64,7 @@ teacher_args=(
   --teacher-max-tokens "${TEACHER_MAX_TOKENS}"
   --teacher-max-revisions "${TEACHER_MAX_REVISIONS}"
   --teacher-fallback-target "${TEACHER_FALLBACK_TARGET}"
+  --teacher-retry-sleep "${TEACHER_RETRY_SLEEP}"
 )
 if [[ -n "${TEACHER_BASE_URL}" ]]; then
   teacher_args+=(--teacher-base-url "${TEACHER_BASE_URL}")
@@ -70,8 +75,11 @@ fi
 if [[ "${RESUME_TEACHER_SHARDS}" == "1" ]]; then
   teacher_args+=(--resume-existing-output)
 fi
+if [[ "${TEACHER_RETRY_UNTIL_VALID}" == "1" ]]; then
+  teacher_args+=(--teacher-retry-until-valid)
+fi
 
-echo "[4/7] none + teacher_evidence (${TEACHER_MODEL})"
+echo "[4/8] none + teacher_evidence (${TEACHER_MODEL})"
 python experiments/generate_reasoning.py \
   --csv "${SOURCE_CSV}:sft_source_v4_small" \
   --prompt-col prompt_text \
@@ -84,7 +92,7 @@ python experiments/generate_reasoning.py \
   --seed "$((BASE_SEED + 2))" \
   --output "${SHARD_DIR}/03_none_teacher.jsonl"
 
-echo "[5/7] concise + concise_evidence"
+echo "[5/8] concise + concise_evidence"
 python experiments/generate_reasoning.py \
   --csv "${SOURCE_CSV}:sft_source_v4_small" \
   --prompt-col prompt_text \
@@ -96,7 +104,7 @@ python experiments/generate_reasoning.py \
   --seed "$((BASE_SEED + 3))" \
   --output "${SHARD_DIR}/04_concise_concise_evidence.jsonl"
 
-echo "[6/7] concise + teacher_evidence (${TEACHER_MODEL})"
+echo "[6/8] concise + teacher_evidence (${TEACHER_MODEL})"
 python experiments/generate_reasoning.py \
   --csv "${SOURCE_CSV}:sft_source_v4_small" \
   --prompt-col prompt_text \
@@ -109,7 +117,7 @@ python experiments/generate_reasoning.py \
   --seed "$((BASE_SEED + 4))" \
   --output "${SHARD_DIR}/05_concise_teacher.jsonl"
 
-echo "[7/7] Merging and shuffling -> ${OUT_JSONL}"
+echo "[7/8] Merging and shuffling -> ${OUT_JSONL}"
 python - "$SHARD_DIR" "$OUT_JSONL" "$BASE_SEED" <<'PY'
 import json
 import random
@@ -144,3 +152,13 @@ print(f"[done] wrote {len(rows)} rows -> {out_path}")
 for name, count in counts.items():
     print(f"  {name}: {count}")
 PY
+
+if [[ "${RUN_REASONING_VALIDATION}" == "1" ]]; then
+  echo "[8/8] Validating reasoning JSONL outputs"
+  python experiments/validate_reasoning_jsonl.py \
+    "${SHARD_DIR}" \
+    "${OUT_JSONL}" \
+    --max-errors "${VALIDATION_MAX_ERRORS}"
+else
+  echo "[8/8] Skipping reasoning validation because RUN_REASONING_VALIDATION=${RUN_REASONING_VALIDATION}"
+fi

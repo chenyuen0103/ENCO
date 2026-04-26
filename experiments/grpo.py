@@ -1206,7 +1206,7 @@ def build_argparser():
         type=str,
         default=None,
         help=(
-            "Optional in-memory causal-discovery config JSON (same schema as run_experiment1_in_memory). "
+            "Optional in-memory causal-discovery config JSON (same schema as eval_cd_configs.py). "
             "When set, prompts are generated in-memory and --cd-train-csv/--cd-test-csv are ignored."
         ),
     )
@@ -1796,13 +1796,13 @@ def _dataset_from_cd_config_file(
     intervene_vars: str = "all",
 ) -> Dataset:
     try:
-        from run_experiment1_in_memory import (  # type: ignore
+        from eval_cd_configs import (  # type: ignore
             _load_configs_from_file as _load_cfgs,
             _iter_prompts_for_config as _iter_cfg_prompts,
         )
     except Exception as e:
         raise RuntimeError(
-            "Failed to import in-memory prompt helpers from run_experiment1_in_memory.py."
+            "Failed to import in-memory prompt helpers from eval_cd_configs.py."
         ) from e
 
     style_aliases = {"summary_join": "summary", "summary_joint": "summary"}

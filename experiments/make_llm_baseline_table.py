@@ -750,7 +750,7 @@ def main() -> int:
                 extra = (
                     " Found matching summary rows, but none have non-null evaluation metrics.\n"
                     "Rebuild the summary table first, e.g.:\n"
-                    "  python experiments/run_experiment1_pipeline.py --dataset sachs --steps analyze"
+                    "  python experiments/pipelines/run_cd_eval_pipeline.py --dataset sachs --steps analyze"
                 )
             raise FileNotFoundError(
                 f"No evaluated rows found in {summary_csv} "

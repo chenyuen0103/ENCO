@@ -88,8 +88,8 @@ Pick the workflow that matches your goal:
 
 | Goal | Entry point |
 |------|-------------|
-| Evaluate an API model (GPT, Gemini) end-to-end | `run_experiment1_pipeline.py` |
-| Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `run_external_llm_baselines.py` + `evaluate.py` |
+| Evaluate an API model (GPT, Gemini) end-to-end | `pipelines/run_cd_eval_pipeline.py` |
+| Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `baselines/run_external_llm.py` + `evaluate.py` |
 | Score an existing prediction CSV | `evaluate.py` |
 | Build training data for SFT / GRPO | `generate_prompt_answer_csv.py` → `generate_reasoning.py` |
 | Evaluate a finetuned / local model | `eval_sft_on_jsonl.py` |
@@ -173,12 +173,12 @@ For a local HF model: `--model Qwen/Qwen3-4B --provider hf --hf-trust-remote-cod
 
 ### 3. Run the end-to-end LLM pipeline
 
-`run_experiment1_pipeline.py` combines prompt generation, querying, evaluation,
+`pipelines/run_cd_eval_pipeline.py` combines prompt generation, querying, evaluation,
 and summary table aggregation in one command. This is the recommended starting
 point for evaluating an API-backed model.
 
 ```bash
-python experiments/run_experiment1_pipeline.py \
+python experiments/pipelines/run_cd_eval_pipeline.py \
   --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
   --dataset cancer \
   --model gpt-4o-mini \
@@ -194,13 +194,57 @@ Outputs:
 `--shuffles-per-graph` controls row-order replicates and is used for
 ordering-bias analysis.
 
+### 3a. Run config-based in-memory evaluation
+
+`eval_cd_configs.py` is the lightweight path when you already have a
+prompt config JSON and want to query a model without first writing prompt CSV
+assets to disk.
+
+OpenAI API example:
+
+```bash
+export OPENAI_API_KEY=...
+
+python experiments/eval_cd_configs.py \
+  --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
+  --config-file ./experiments/configs/eval_configs_obs1000.json \
+  --model gpt-5.2-pro \
+  --provider openai \
+  --temperature 0.0 \
+  --request-timeout-s 600 \
+  --log-calls
+```
+
+Local Hugging Face example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python experiments/eval_cd_configs.py \
+  --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
+  --config-file ./experiments/configs/eval_configs_obs1000.json \
+  --model /scratch/yuen_chen/models/Qwen2.5-72B-Instruct-AWQ \
+  --provider hf \
+  --temperature 0.0 \
+  --hf-dtype bf16 \
+  --hf-device-map auto \
+  --hf-max-new-tokens 4096 \
+  --hf-batch-size 1 \
+  --hf-kv-vram-fraction 0.80 \
+  --hf-context-limit 131072
+```
+
+Notes:
+
+- Use `--provider openai` for Responses API models such as `gpt-5.2-pro`.
+- The OpenAI path does not use local GPUs, so `CUDA_VISIBLE_DEVICES` is not needed.
+- Use `--provider hf` plus the `--hf-*` flags for local checkpoints or Hub models.
+
 ### 4. Run benchmark-native LLM baselines
 
-`run_external_llm_baselines.py` implements structured baselines such as
+`baselines/run_external_llm.py` implements structured baselines such as
 `TakayamaSCP`, `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData`.
 
 ```bash
-python experiments/run_external_llm_baselines.py \
+python experiments/baselines/run_external_llm.py \
   --method CausalLLMData \
   --graph_files causal_graphs/real_data/small_graphs/cancer.bif \
   --sample_size_obs 100 \
@@ -222,7 +266,7 @@ python experiments/evaluate.py \
 distance) to stdout and writes a per-row metrics CSV alongside the input file.
 Pass `--summary-csv path/to/summary.csv` to accumulate results across runs.
 
-`TakayamaSCP` is implemented separately in `experiments/run_takayama_scd.py`.
+`TakayamaSCP` is implemented separately in `experiments/baselines/takayama_scd.py`.
 It is observational-only, supports checkpoint/resume for the pairwise LLM stage,
 and can run with:
 
@@ -354,10 +398,11 @@ All scripts live under `experiments/`.
 
 | Script | Purpose |
 |--------|---------|
-| `run_experiment1_pipeline.py` | End-to-end: generate → query → evaluate → summarize |
-| `run_experiment1_in_memory.py` | Same as above but without writing prompt CSV assets first |
+| `pipelines/run_cd_eval_pipeline.py` | End-to-end: generate → query → evaluate → summarize |
+| `eval_cd_configs.py` | Same as above but without writing prompt CSV assets first |
 | `query_api.py` | Query a prompt CSV against OpenAI, Gemini, or HF backends |
-| `run_external_llm_baselines.py` | Structured LLM baselines (TakayamaSCP, JiralerspongBFS, CausalLLMPrompt, CausalLLMData) |
+| `run_prompt_csv_models.py` | Legacy prompt-CSV batch wrapper for API/HF models |
+| `baselines/run_external_llm.py` | Structured LLM baselines (TakayamaSCP, JiralerspongBFS, CausalLLMPrompt, CausalLLMData) |
 | `evaluate.py` | Score a prediction CSV; outputs precision, recall, F1, SHD |
 | `eval_sft_on_jsonl.py` | Evaluate a finetuned SFT / LoRA model on JSONL or CSV |
 
@@ -365,10 +410,10 @@ All scripts live under `experiments/`.
 
 | Script | Purpose |
 |--------|---------|
-| `run_classical_baselines.py` | Classical baselines: PC, GES, ENCO |
+| `baselines/run_classical.py` | Classical baselines: PC, GES, ENCO |
 | `run_exported_graphs.py` | Original ENCO learner on exported graphs |
 | `run_generated_graphs.py` | ENCO on newly generated synthetic graphs |
-| `run_sft.py` | Supervised finetuning |
+| `train_sft.py` | Supervised finetuning |
 | `grpo.py` | GRPO training / evaluation utilities |
 | `grpo_unsloth.py` | Unsloth-oriented GRPO path |
 
@@ -412,12 +457,12 @@ See also `docs/tutorials/benchmark_authoring.md`.
 
 ## Classical Baselines
 
-`experiments/run_classical_baselines.py` supports `PC`, `GES`, and `ENCO`.
+`experiments/baselines/run_classical.py` supports `PC`, `GES`, and `ENCO`.
 
 ```bash
 cd experiments
 
-python run_classical_baselines.py \
+python baselines/run_classical.py \
   --method PC \
   --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
   --sample_size_obs 5000 \

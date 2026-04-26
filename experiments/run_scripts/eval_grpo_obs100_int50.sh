@@ -32,7 +32,7 @@ BIF="${REPO_ROOT}/causal_graphs/real_data/small_graphs/sachs.bif"
 RESPONSES_ROOT="${EXPERIMENTS_DIR}/responses"
 SUMMARY_CSV="${RESPONSES_ROOT}/sachs/sachs_summary.csv"
 NUM_PROMPTS="${NUM_PROMPTS:-5}"
-RUN_EXPERIMENT_SCRIPT="${EXPERIMENTS_DIR}/run_experiment1_in_memory.py"
+RUN_EXPERIMENT_SCRIPT="${EXPERIMENTS_DIR}/eval_cd_configs.py"
 EVALUATE_SCRIPT="${EXPERIMENTS_DIR}/evaluate.py"
 CONFIG_FILE="${SCRIPT_DIR}/configs/obs100_int50.json"
 MODEL_TAG="${MODEL##*/}"
@@ -98,7 +98,7 @@ eval_only() {
     local found_any=0
     local cot_tag
     for cot_tag in "${LEGACY_WRAPPER_TAGS[@]}"; do
-        # Derive the exact filename that run_experiment1_in_memory.py writes.
+        # Derive the exact filename that eval_cd_configs.py writes.
         local resp_csv="${RESPONSES_ROOT}/sachs/responses_obs${obs}_int${int_n}_shuf1_p${NUM_PROMPTS}_${anon_suffix}thinktags_${cot_tag}summary_joint_${MODEL_TAG}.csv"
         if [[ ! -f "${resp_csv}" ]]; then
             continue

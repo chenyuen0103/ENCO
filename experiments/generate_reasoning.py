@@ -64,7 +64,7 @@ Output JSONL schema (one JSON object per line):
       "graph":   "cancer"
     }
 
-Compatible with run_sft.py --sft-jsonl.
+Compatible with train_sft.py --sft-jsonl.
 """
 from __future__ import annotations
 
@@ -77,6 +77,7 @@ import os
 import random
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -136,6 +137,8 @@ class TeacherConfig:
     fallback_target: str = "concise_evidence"
     reasoning_effort: Optional[str] = None
     max_revisions: int = 1
+    retry_until_valid: bool = False
+    retry_sleep_s: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +643,8 @@ def _build_teacher_evidence_think(
     think = ""
     issues: List[str] = []
 
-    for attempt in range(max(0, int(teacher_config.max_revisions)) + 1):
+    attempt = 0
+    while True:
         raw = _call_teacher(current_prompt, teacher_config)
         think = _strip_teacher_think(raw)
         if think and not think.startswith("[ERROR]"):
@@ -654,7 +658,7 @@ def _build_teacher_evidence_think(
         else:
             issues = [f"teacher returned no usable reasoning: {raw[:200]}"]
 
-        if attempt >= int(teacher_config.max_revisions):
+        if (not teacher_config.retry_until_valid) and attempt >= int(teacher_config.max_revisions):
             break
 
         current_prompt = _build_teacher_revision_prompt(
@@ -664,6 +668,9 @@ def _build_teacher_evidence_think(
             adj=adj,
             variables=variables,
         )
+        attempt += 1
+        if teacher_config.retry_sleep_s > 0:
+            time.sleep(float(teacher_config.retry_sleep_s))
 
     if teacher_config.fallback_target == "none":
         reason = "; ".join(issues) if issues else raw
@@ -970,11 +977,39 @@ def _record_retry_key(rec: dict) -> Optional[Tuple[str, str, int]]:
         return None
 
 
+def _existing_record_issues(rec: dict) -> List[str]:
+    answer = str(rec.get("answer") or "")
+    think = str(rec.get("gold_think") or "")
+    adj = _parse_completion_adj(answer)
+    if adj is None:
+        return ["answer JSON did not parse as an adjacency_matrix payload"]
+
+    issues = _hard_format_issues(
+        think_text=think,
+        completion=answer,
+        adj=adj,
+    )
+
+    if rec.get("reasoning_target") == "teacher_evidence":
+        variables = _extract_variables(str(rec.get("prompt") or ""))
+        if variables is None or len(variables) != len(adj):
+            variables = [f"X{k+1}" for k in range(len(adj))]
+        issues.extend(
+            _edge_consistency_issues(
+                think_text=think,
+                adj=adj,
+                variables=variables,
+            )
+        )
+    return issues
+
+
 def _load_existing_output_records(path: Path) -> Tuple[List[dict], set[Tuple[str, str, int]]]:
     if not path.exists():
         return [], set()
     records: List[dict] = []
     keys: set[Tuple[str, str, int]] = set()
+    dropped_invalid = 0
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -985,10 +1020,20 @@ def _load_existing_output_records(path: Path) -> Tuple[List[dict], set[Tuple[str
                 continue
             if not isinstance(rec, dict):
                 continue
+            issues = _existing_record_issues(rec)
+            if issues:
+                dropped_invalid += 1
+                continue
             records.append(rec)
             key = _record_retry_key(rec)
             if key is not None:
                 keys.add(key)
+    if dropped_invalid:
+        print(
+            f"[resume] ignored {dropped_invalid} invalid existing records from {path}; "
+            "they will be retried if their source rows are still selected.",
+            file=sys.stderr,
+        )
     return records, keys
 
 
@@ -1481,6 +1526,17 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--teacher-retry-until-valid",
+        action="store_true",
+        help="Keep asking the teacher to revise until reasoning validation passes.",
+    )
+    ap.add_argument(
+        "--teacher-retry-sleep",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep between teacher retries when --teacher-retry-until-valid is set.",
+    )
+    ap.add_argument(
         "--teacher-fallback-target",
         choices=["none", "concise_evidence", "stages", "stages_evidence"],
         default="concise_evidence",
@@ -1517,6 +1573,22 @@ def main() -> None:
             "Load existing --output JSONL records and retry only missing CSV source rows "
             "for the requested reasoning target(s). Useful after teacher [ERROR] skips."
         ),
+    )
+    ap.add_argument(
+        "--append-records-as-they-complete",
+        dest="append_records_as_they_complete",
+        action="store_true",
+        default=True,
+        help=(
+            "Write each successful CSV-mode record to --output immediately. "
+            "This is the default so interrupted teacher runs can be resumed."
+        ),
+    )
+    ap.add_argument(
+        "--no-append-records-as-they-complete",
+        dest="append_records_as_they_complete",
+        action="store_false",
+        help="Disable immediate CSV-mode writes and restore final write-at-end behavior.",
     )
 
     # --- Mode C: perm-csv ---
@@ -1559,6 +1631,8 @@ def main() -> None:
             fallback_target=str(args.teacher_fallback_target),
             reasoning_effort=args.teacher_reasoning_effort,
             max_revisions=int(args.teacher_max_revisions),
+            retry_until_valid=bool(args.teacher_retry_until_valid),
+            retry_sleep_s=float(args.teacher_retry_sleep),
         )
     prompt_reasoning_guidance = (
         None
@@ -1569,6 +1643,11 @@ def main() -> None:
     rng = random.Random(args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     all_records: List[dict] = []
+    stream_csv_records = (
+        bool(args.append_records_as_they_complete)
+        and not bool(args.graphs)
+        and not bool(args.perm_csv)
+    )
     existing_retry_keys: set[Tuple[str, str, int]] = set()
     if bool(args.resume_existing_output):
         existing_records, existing_retry_keys = _load_existing_output_records(args.output)
@@ -1577,6 +1656,12 @@ def main() -> None:
             f"[resume] loaded {len(existing_records)} existing records "
             f"({len(existing_retry_keys)} retry keys) from {args.output}"
         )
+        if stream_csv_records:
+            with args.output.open("w", encoding="utf-8") as fout:
+                for rec in existing_records:
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    elif stream_csv_records:
+        args.output.write_text("", encoding="utf-8")
 
     # ------------------------------------------------------------------ #
     # Mode A: in-memory BIF generation                                    #
@@ -1711,6 +1796,7 @@ def main() -> None:
         else:
             print(f"Mode B (csv): {len(sources)} sources, "
                   f"n_per_source={args.n_per_source}, seed={args.seed}\n")
+            stream_fout = args.output.open("a", encoding="utf-8") if stream_csv_records else None
             for csv_path, source_name, graph_name in _progress(
                 sources,
                 desc="sources",
@@ -1747,17 +1833,24 @@ def main() -> None:
                             skipped += 1
                         else:
                             all_records.append(rec)
+                            if stream_fout is not None:
+                                stream_fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                                stream_fout.flush()
                             built += 1
                     if tqdm is not None:
                         pbar.set_postfix(built=built, skipped=skipped)
                 print(f"  {source_name:50s}  built={built:4d}  skipped={skipped}")
+            if stream_fout is not None:
+                stream_fout.close()
 
-    # Final shuffle + write
-    rng.shuffle(all_records)
-
-    with args.output.open("w", encoding="utf-8") as fout:
-        for rec in all_records:
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Final shuffle + write. CSV Mode B streams records by default so long
+    # teacher generations survive interruption; downstream merge scripts do
+    # the final global shuffle.
+    if not stream_csv_records:
+        rng.shuffle(all_records)
+        with args.output.open("w", encoding="utf-8") as fout:
+            for rec in all_records:
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     by_graph: dict[str, int] = {}
     for rec in all_records:
