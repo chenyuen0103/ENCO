@@ -13,14 +13,14 @@ from benchmark_builder.runner import load_runner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Aggregate evaluation outputs for a benchmark manifest.")
-    parser.add_argument("--manifest", required=True, help="Benchmark manifest path or registry name.")
+    parser = argparse.ArgumentParser(description="Aggregate evaluation outputs for a benchmark config.")
+    parser.add_argument("--config", required=True, help="Benchmark config path or registry name.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    outputs = load_runner(args.manifest).summarize()
+    outputs = load_runner(args.config).summarize()
     for name, path in outputs.items():
         print(f"{name}: {path}")
     return 0

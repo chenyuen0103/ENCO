@@ -46,6 +46,8 @@ def _build_cell_config_name(cell: PromptCellSpec) -> str:
     parts.append("anon" if cell.anonymize else "real")
     parts.append(f"obs{cell.obs_per_prompt}")
     parts.append(f"int{cell.int_per_combo}")
+    if cell.reasoning_guidance != "staged":
+        parts.append(f"reason{cell.reasoning_guidance}")
     if cell.row_order != "random":
         parts.append(f"row{cell.row_order}")
     if cell.col_order != "original":
@@ -67,6 +69,8 @@ def _prompt_base_name(*, cell: PromptCellSpec, num_prompts: int, shuffles_per_gr
         tags.append("rules")
     if cell.give_steps:
         tags.append("steps")
+    if cell.reasoning_guidance != "staged":
+        tags.append(f"reason{cell.reasoning_guidance}")
     if cell.style == "summary":
         tags.append("summary")
     elif cell.style == "matrix":
@@ -95,7 +99,7 @@ def _response_name_for_base(base_name: str, model_name: str) -> str:
     return _response_name_for_prompt(Path(base_name).with_suffix(".csv"), model_name)
 
 
-def _manifest_hash(spec: BenchmarkSpec) -> str:
+def _config_hash(spec: BenchmarkSpec) -> str:
     payload = json.dumps(spec.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -127,7 +131,7 @@ class BenchmarkRunner:
 
     def build(self, *, dry_run: bool = False) -> dict[str, Any]:
         prompt_entries: list[dict[str, Any]] = []
-        manifest_hash = _manifest_hash(self.spec)
+        config_hash = _config_hash(self.spec)
         for dataset in self.spec.datasets:
             graph_path = materialize_graph_source(
                 dataset,
@@ -146,7 +150,7 @@ class BenchmarkRunner:
         bundle = {
             "schema_version": "prompt_bundle/v1",
             "benchmark": self.spec.name,
-            "manifest_hash": manifest_hash,
+            "config_hash": config_hash,
             "prompt_storage": self.spec.execution.prompt_storage,
             "prompt_retention": self.spec.execution.prompt_retention,
             "entries": prompt_entries,
@@ -197,6 +201,8 @@ class BenchmarkRunner:
                 cell.col_order,
                 "--intervene-vars",
                 cell.intervene_vars,
+                "--reasoning-guidance",
+                cell.reasoning_guidance,
             ]
             if cell.anonymize:
                 cmd.append("--anonymize")
@@ -214,6 +220,7 @@ class BenchmarkRunner:
             "config_name": config_name,
             "prompt_style": cell.style,
             "naming_regime": cell.naming_regime,
+            "reasoning_guidance": cell.reasoning_guidance,
             "obs_n": cell.obs_per_prompt,
             "int_n": cell.int_per_combo,
             "graph_file": str(graph_path),
@@ -350,6 +357,7 @@ class BenchmarkRunner:
                             "anonymize": False,
                             "obs_per_prompt": 0,
                             "int_per_combo": 0,
+                            "reasoning_guidance": "staged",
                             "row_order": "random",
                             "col_order": self.spec.names_only.col_order,
                             "shuffles_per_graph": 1,
@@ -362,6 +370,7 @@ class BenchmarkRunner:
                         "anonymize": entry["naming_regime"] == "anonymized",
                         "obs_per_prompt": entry["obs_n"],
                         "int_per_combo": entry["int_n"],
+                        "reasoning_guidance": entry.get("reasoning_guidance", "staged"),
                         "row_order": next(
                             cell.row_order
                             for cell in self.spec.prompt_cells
@@ -369,6 +378,7 @@ class BenchmarkRunner:
                             and cell.obs_per_prompt == entry["obs_n"]
                             and cell.int_per_combo == entry["int_n"]
                             and cell.naming_regime == entry["naming_regime"]
+                            and cell.reasoning_guidance == entry.get("reasoning_guidance", "staged")
                         ),
                         "col_order": next(
                             cell.col_order
@@ -377,6 +387,7 @@ class BenchmarkRunner:
                             and cell.obs_per_prompt == entry["obs_n"]
                             and cell.int_per_combo == entry["int_n"]
                             and cell.naming_regime == entry["naming_regime"]
+                            and cell.reasoning_guidance == entry.get("reasoning_guidance", "staged")
                         ),
                         "shuffles_per_graph": self.spec.shuffles_per_graph,
                     }
@@ -466,7 +477,7 @@ class BenchmarkRunner:
             adapter = adapters.get(baseline.name)
             if adapter is None:
                 raise RuntimeError(
-                    f"Baseline `{baseline.name}` is enabled in manifest `{self.spec.name}` but no adapter is registered."
+                    f"Baseline `{baseline.name}` is enabled in config `{self.spec.name}` but no adapter is registered."
                 )
 
             ordered_entries = sorted(
@@ -495,6 +506,7 @@ class BenchmarkRunner:
                         and cell.obs_per_prompt == entry["obs_n"]
                         and cell.int_per_combo == entry["int_n"]
                         and cell.naming_regime == entry["naming_regime"]
+                        and cell.reasoning_guidance == entry.get("reasoning_guidance", "staged")
                     )
                 if not adapter.applies_to(baseline, cell):
                     continue
@@ -565,7 +577,7 @@ class BenchmarkRunner:
         summary_path = Path(str(response_csv) + ".summary.json")
         return {
             "schema_version": "run_provenance/v1",
-            "manifest_hash": _manifest_hash(self.spec),
+            "config_hash": _config_hash(self.spec),
             "parser_version": self.spec.provenance.parser_version,
             "evaluator_version": self.spec.provenance.evaluator_version,
             "benchmark": self.spec.name,
@@ -573,6 +585,7 @@ class BenchmarkRunner:
             "config_name": entry["config_name"],
             "prompt_style": entry["prompt_style"],
             "naming_regime": entry["naming_regime"],
+            "reasoning_guidance": entry.get("reasoning_guidance", "staged"),
             "obs_n": entry["obs_n"],
             "int_n": entry["int_n"],
             "system": system,
@@ -604,6 +617,7 @@ class BenchmarkRunner:
                 "config_name": entry["config_name"],
                 "prompt_style": entry["prompt_style"],
                 "naming_regime": entry["naming_regime"],
+                "reasoning_guidance": entry.get("reasoning_guidance", "staged"),
                 "obs_n": entry["obs_n"],
                 "int_n": entry["int_n"],
                 "system": entry["system"],

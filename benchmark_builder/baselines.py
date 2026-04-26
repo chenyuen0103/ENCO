@@ -76,7 +76,7 @@ class ClassicalBaselineAdapter(BaselineAdapter):
         )
         cmd = [
             PYTHON_EXE,
-            "run_classical_baselines.py",
+            "scripts/run_classical.py",
             "--method",
             self.method_name,
             "--graph_files",
@@ -86,7 +86,7 @@ class ClassicalBaselineAdapter(BaselineAdapter):
             "--seed",
             str(baseline.seed if baseline.seed is not None else spec.seed),
             "--out_dir",
-            "responses",
+            str(self.repo_root / "experiments" / "responses"),
         ]
         if self.method_name == "PC":
             cmd.extend(
@@ -111,7 +111,7 @@ class ClassicalBaselineAdapter(BaselineAdapter):
                 ]
             )
         if not _reuse_if_exists(out_csv, dry_run=dry_run):
-            _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+            _run(cmd, cwd=self.repo_root, dry_run=dry_run)
         return out_csv
 
 
@@ -236,7 +236,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         if self.method_name == "TakayamaSCP":
             cmd = [
                 PYTHON_EXE,
-                "run_takayama_scd.py",
+                "scripts/takayama_scd.py",
                 "--graph_files",
                 str(graph_path),
                 "--sample_size_obs",
@@ -244,7 +244,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 "--seed",
                 str(baseline.seed if baseline.seed is not None else spec.seed),
                 "--out_dir",
-                "responses",
+                str(self.repo_root / "experiments" / "responses"),
                 "--model",
                 model_name,
                 "--provider",
@@ -265,7 +265,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         else:
             cmd = [
                 PYTHON_EXE,
-                "run_external_llm_baselines.py",
+                "scripts/run_external_llm.py",
                 "--method",
                 self.method_name,
                 "--graph_files",
@@ -277,7 +277,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 "--seed",
                 str(baseline.seed if baseline.seed is not None else spec.seed),
                 "--out_dir",
-                "responses",
+                str(self.repo_root / "experiments" / "responses"),
                 "--model",
                 model_name,
                 "--provider",
@@ -296,7 +296,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             if baseline.max_new_tokens is not None:
                 cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
         if not _reuse_if_exists(out_csv, dry_run=dry_run):
-            _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
+            _run(cmd, cwd=self.repo_root, dry_run=dry_run)
         return out_csv
 
 

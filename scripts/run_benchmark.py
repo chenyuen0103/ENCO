@@ -13,8 +13,8 @@ from benchmark_builder.runner import load_runner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a manifest-driven LLM causal-discovery benchmark.")
-    parser.add_argument("--manifest", required=True, help="Benchmark manifest path or registry name.")
+    parser = argparse.ArgumentParser(description="Run a config-driven LLM causal-discovery benchmark.")
+    parser.add_argument("--config", required=True, help="Benchmark config path or registry name.")
     parser.add_argument(
         "--steps",
         default="build,models,baselines,summarize",
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     steps = {part.strip() for part in args.steps.split(",") if part.strip()}
-    runner = load_runner(args.manifest)
+    runner = load_runner(args.config)
     if "build" in steps:
         runner.build(dry_run=args.dry_run)
     if "models" in steps:

@@ -2,7 +2,7 @@
 
 This directory freezes the benchmark slices used by the NeurIPS artifact paper.
 
-`paper_slices/` is now a compatibility layer over the general manifest-driven benchmark framework in
+`paper_slices/` is now a compatibility layer over the general config-driven benchmark framework in
 `benchmark_specs/`.
 
 Each JSON file defines one tightly scoped benchmark slice. A slice is small on purpose:
@@ -17,7 +17,7 @@ Each JSON file defines one tightly scoped benchmark slice. A slice is small on p
 Use the runner:
 
 ```bash
-python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json
+python scripts/run_paper_slice.py --config paper_slices/sachs_main.json
 ```
 
 The current `sachs_main.json` slice is intentionally small and benchmark-native:
@@ -40,7 +40,7 @@ only `summary_joint` observational/interventional cells at `obs=1000` plus
 For new benchmark definitions, prefer:
 
 ```bash
-scripts/run-benchmark --manifest benchmark_specs/reference_suite.json
+scripts/run-benchmark --config benchmark_specs/reference_suite.json
 ```
 
 After each run, the runner updates:

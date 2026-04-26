@@ -253,10 +253,10 @@ def _build_stage_rows(
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Create descendant-prediction task CSVs and a curriculum manifest from a causal graph."
+        description="Create descendant-prediction task CSVs and a curriculum config from a causal graph."
     )
     p.add_argument("--bif-file", type=str, required=True, help="Path to the source BIF graph.")
-    p.add_argument("--out-dir", type=str, required=True, help="Output directory for stage CSVs and manifest.")
+    p.add_argument("--out-dir", type=str, required=True, help="Output directory for stage CSVs and config.")
     p.add_argument(
         "--curriculum-file",
         type=str,
@@ -297,7 +297,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     curriculum = _load_curriculum(Path(args.curriculum_file).resolve() if args.curriculum_file else None)
 
-    manifest: Dict[str, Any] = {
+    config: Dict[str, Any] = {
         "task": "cd_descendants",
         "bif_file": str(bif_path),
         "out_dir": str(out_dir),
@@ -339,7 +339,7 @@ def main() -> None:
             example_path = out_dir / f"{stage_name}_example_prompt.txt"
             example_path.write_text(rows[0]["prompt_text"] + "\n", encoding="utf-8")
 
-        manifest["stages"].append(
+        config["stages"].append(
             {
                 "name": stage_name,
                 "csv_path": str(stage_csv),
@@ -356,10 +356,10 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(combined_rows)
 
-    manifest["combined_csv"] = str(combined_csv)
-    manifest_path = out_dir / "curriculum_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"[done] wrote manifest -> {manifest_path}")
+    config["combined_csv"] = str(combined_csv)
+    config_path = out_dir / "curriculum_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"[done] wrote config -> {config_path}")
 
 
 if __name__ == "__main__":

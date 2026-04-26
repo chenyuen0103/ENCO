@@ -7,7 +7,8 @@ causal-discovery baselines.
 The codebase includes:
 
 - prompt and dataset generation under `experiments/`
-- benchmark manifests and run orchestration under `benchmark_specs/` and `scripts/`
+- benchmark specs/cards/runs under `benchmark_specs/`, `benchmark_cards/`, and `benchmark_runs/`
+- benchmark orchestration CLIs under `scripts/`
 - finetuning / evaluation utilities for causal-discovery reasoning
 - the original ENCO structure-learning code under `causal_discovery/` and `causal_graphs/`
 
@@ -26,13 +27,14 @@ LLM causal-discovery benchmark and training repo.
 
 ## Repo Layout
 
-- `experiments/`: prompt generation, dataset building, querying, evaluation, training
-- `benchmark_specs/`: benchmark manifests
+- `experiments/`: prompt/data generation, SFT/GRPO training, reward eval, query/eval helpers
+- `benchmark_specs/`: benchmark configs
 - `benchmark_cards/`: benchmark descriptions and claims
 - `benchmark_runs/`: generated benchmark artifacts and summaries
+- `benchmark_builder/`: reusable benchmark schema, adapters, orchestration, evaluation
 - `causal_graphs/`: graph definitions, BIF assets, ENCO-derived data utilities
 - `causal_discovery/`: original ENCO learner
-- `scripts/`: benchmark-builder CLIs
+- `scripts/`: benchmark, paper-slice, baseline, and config-eval CLIs
 
 ## Setup
 
@@ -88,33 +90,33 @@ Pick the workflow that matches your goal:
 
 | Goal | Entry point |
 |------|-------------|
-| Evaluate an API model (GPT, Gemini) end-to-end | `pipelines/run_cd_eval_pipeline.py` |
-| Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `baselines/run_external_llm.py` + `evaluate.py` |
-| Score an existing prediction CSV | `evaluate.py` |
-| Build training data for SFT / GRPO | `generate_prompt_answer_csv.py` → `generate_reasoning.py` |
-| Evaluate a finetuned / local model | `eval_sft_on_jsonl.py` |
-| Generate prompts only (single graph, no querying) | `generate_prompts.py` |
-| Query a prompt CSV without the full pipeline | `query_api.py` |
+| Evaluate an API model (GPT, Gemini) end-to-end | `scripts/run_cd_eval_pipeline.py` |
+| Evaluate a specific baseline method (TakayamaSCP, CausalLLMData, …) | `scripts/run_external_llm.py` + `experiments/evaluate.py` |
+| Score an existing prediction CSV | `experiments/evaluate.py` |
+| Build training data for SFT / GRPO | `experiments/generate_prompt_answer_csv.py` → `experiments/generate_reasoning.py` |
+| Evaluate a finetuned / local model | `experiments/eval_sft_on_jsonl.py` |
+| Generate prompts only (single graph, no querying) | `experiments/generate_prompts.py` |
+| Query a prompt CSV without the full pipeline | `experiments/query_api.py` |
 
 ## Recommended Start for New Researchers
 
-If you are new to the repo, start with the manifest-driven workflow rather than
+If you are new to the repo, start with the config-driven workflow rather than
 the older script-by-script pipeline.
 
 1. Set up the environment.
 2. Run the focused Sachs paper slice:
 
 ```bash
-python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json
+python scripts/run_paper_slice.py --config paper_slices/sachs_main.json
 ```
 
 3. Inspect the reusable benchmark suite before running it:
 
 ```bash
-python scripts/run_benchmark.py --manifest benchmark_specs/reference_suite.json --dry-run
+python scripts/run_benchmark.py --config benchmark_specs/reference_suite.json --dry-run
 ```
 
-4. Run the small validation suite before editing manifests or adapters:
+4. Run the small validation suite before editing configs or adapters:
 
 ```bash
 python -m unittest \
@@ -127,7 +129,7 @@ python -m unittest \
 This is the shortest path to the current architecture:
 
 - `benchmark_specs/`: reusable benchmark definitions
-- `paper_slices/`: frozen paper-facing manifests
+- `paper_slices/`: frozen paper-facing configs
 - `benchmark_builder/`: schema, adapters, orchestration, evaluation
 - `scripts/run_benchmark.py`: reusable entrypoint
 - `scripts/run_paper_slice.py`: paper-facing compatibility wrapper
@@ -136,7 +138,7 @@ This is the shortest path to the current architecture:
 
 ### 1. Generate prompts for a single graph
 
-`generate_prompts.py` writes prompt CSVs for one BIF graph. Use this when you
+`experiments/generate_prompts.py` writes prompt CSVs for one BIF graph. Use this when you
 want raw prompt files without immediately querying a model.
 
 ```bash
@@ -155,7 +157,7 @@ Output goes to `experiments/prompts/<graph>/` by default.
 
 ### 2. Query a prompt CSV directly
 
-`query_api.py` queries a CSV of prompts against OpenAI, Gemini, or HF backends
+`experiments/query_api.py` queries a CSV of prompts against OpenAI, Gemini, or HF backends
 and writes a response CSV. Use this when you already have a prompt CSV and want
 to skip the full pipeline.
 
@@ -173,12 +175,12 @@ For a local HF model: `--model Qwen/Qwen3-4B --provider hf --hf-trust-remote-cod
 
 ### 3. Run the end-to-end LLM pipeline
 
-`pipelines/run_cd_eval_pipeline.py` combines prompt generation, querying, evaluation,
+`scripts/run_cd_eval_pipeline.py` combines prompt generation, querying, evaluation,
 and summary table aggregation in one command. This is the recommended starting
 point for evaluating an API-backed model.
 
 ```bash
-python experiments/pipelines/run_cd_eval_pipeline.py \
+python scripts/run_cd_eval_pipeline.py \
   --bif-file causal_graphs/real_data/small_graphs/cancer.bif \
   --dataset cancer \
   --model gpt-4o-mini \
@@ -196,7 +198,7 @@ ordering-bias analysis.
 
 ### 3a. Run config-based in-memory evaluation
 
-`eval_cd_configs.py` is the lightweight path when you already have a
+`scripts/eval_cd_configs.py` is the lightweight path when you already have a
 prompt config JSON and want to query a model without first writing prompt CSV
 assets to disk.
 
@@ -205,7 +207,7 @@ OpenAI API example:
 ```bash
 export OPENAI_API_KEY=...
 
-python experiments/eval_cd_configs.py \
+python scripts/eval_cd_configs.py \
   --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
   --config-file ./experiments/configs/eval_configs_obs1000.json \
   --model gpt-5.2-pro \
@@ -218,7 +220,7 @@ python experiments/eval_cd_configs.py \
 Local Hugging Face example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python experiments/eval_cd_configs.py \
+CUDA_VISIBLE_DEVICES=0,1 python scripts/eval_cd_configs.py \
   --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
   --config-file ./experiments/configs/eval_configs_obs1000.json \
   --model /scratch/yuen_chen/models/Qwen2.5-72B-Instruct-AWQ \
@@ -240,11 +242,11 @@ Notes:
 
 ### 4. Run benchmark-native LLM baselines
 
-`baselines/run_external_llm.py` implements structured baselines such as
+`scripts/run_external_llm.py` implements structured baselines such as
 `TakayamaSCP`, `JiralerspongBFS`, `CausalLLMPrompt`, and `CausalLLMData`.
 
 ```bash
-python experiments/baselines/run_external_llm.py \
+python scripts/run_external_llm.py \
   --method CausalLLMData \
   --graph_files causal_graphs/real_data/small_graphs/cancer.bif \
   --sample_size_obs 100 \
@@ -262,11 +264,11 @@ python experiments/evaluate.py \
   --csv experiments/responses/cancer/predictions_obs100_int10_CausalLLMData.csv
 ```
 
-`evaluate.py` prints mean precision, recall, F1, and SHD (structural Hamming
+`experiments/evaluate.py` prints mean precision, recall, F1, and SHD (structural Hamming
 distance) to stdout and writes a per-row metrics CSV alongside the input file.
 Pass `--summary-csv path/to/summary.csv` to accumulate results across runs.
 
-`TakayamaSCP` is implemented separately in `experiments/baselines/takayama_scd.py`.
+`TakayamaSCP` is implemented separately in `scripts/takayama_scd.py`.
 It is observational-only, supports checkpoint/resume for the pairwise LLM stage,
 and can run with:
 
@@ -275,7 +277,7 @@ and can run with:
 
 ### 5. Build mixed prompt/answer CSV datasets
 
-`generate_prompt_answer_csv.py` generates prompt CSVs with gold adjacency answers
+`experiments/generate_prompt_answer_csv.py` generates prompt CSVs with gold adjacency answers
 across multiple graphs and observation/intervention sizes.
 
 ```bash
@@ -290,6 +292,56 @@ python experiments/generate_prompt_answer_csv.py \
 ```
 
 For anonymized prompts add `--anonymize`.
+
+#### Current GRPO source pool
+
+The current GRPO source config is:
+
+```text
+experiments/configs/grpo_source_v4_mixed.json
+```
+
+It uses canonical prompt styles (`summary`, `matrix`) and only the current GRPO
+reasoning-guidance mix (`concise`, `none`). Regenerate the CSV from that config
+when `experiments/data/grpo_source_v4_mixed_train.csv` is stale:
+
+```bash
+mv experiments/data/grpo_source_v4_mixed_train.csv \
+   experiments/data/grpo_source_v4_mixed_train.stale_with_staged.csv
+
+python experiments/generate_prompt_answer_csv.py \
+  --config-file experiments/configs/grpo_source_v4_mixed.json \
+  --output-csv experiments/data/grpo_source_v4_mixed_train.csv
+```
+
+Expected quick check:
+
+```bash
+python - <<'PY'
+import csv
+from collections import Counter
+p = "experiments/data/grpo_source_v4_mixed_train.csv"
+c = Counter()
+rows = 0
+with open(p, newline="", encoding="utf-8") as f:
+    for r in csv.DictReader(f):
+        rows += 1
+        c[r["reasoning_guidance"]] += 1
+print("rows:", rows)
+print("reasoning_guidance:", dict(c))
+PY
+```
+
+Expected output:
+
+```text
+rows: 3840
+reasoning_guidance: {'concise': 1920, 'none': 1920}
+```
+
+Older files such as `grpo_mix_anon*.csv` and `grpo_mix_named*.csv` may still
+contain legacy `summary_joint` prompts and should be treated as historical
+artifacts unless a run explicitly depends on them.
 
 ### 6. Export train/eval CSV splits from a config file
 
@@ -309,7 +361,7 @@ python experiments/export_cd_train_eval_csv.py \
 
 ### 7. Generate SFT train/eval data in one command
 
-`run_scripts/generate_sft_data.sh` wraps the full Sachs eval export plus JSONL
+`experiments/run_scripts/generate_sft_data.sh` wraps the full Sachs eval export plus JSONL
 conversion pipeline. By default it writes:
 
 - `experiments/data/grpo_sachs_train.csv`
@@ -335,7 +387,7 @@ train/eval export stays leak-free across different seeds.
 
 ### 8. Convert prompt CSVs into SFT JSONL
 
-`generate_reasoning.py` converts prompt/answer CSV rows into
+`experiments/generate_reasoning.py` converts prompt/answer CSV rows into
 chat-formatted SFT records with `<think>...</think><answer>...</answer>`.
 
 ```bash
@@ -367,7 +419,7 @@ python experiments/generate_reasoning.py \
 
 ### 9. Evaluate a finetuned SFT / LoRA model
 
-`eval_sft_on_jsonl.py` evaluates a local adapter or HF model on a JSONL or CSV
+`experiments/eval_sft_on_jsonl.py` evaluates a local adapter or HF model on a JSONL or CSV
 eval set.
 
 ```bash
@@ -380,42 +432,46 @@ python experiments/eval_sft_on_jsonl.py \
 
 ## Script Reference
 
-All scripts live under `experiments/`.
+The repo now separates workflow scripts by responsibility:
+
+- `experiments/` holds prompt/data generation, SFT/GRPO training, reward eval, and lower-level query/eval helpers.
+- `scripts/` holds benchmark, config-eval, paper-slice, and baseline entry points.
+- `benchmark_builder/`, `benchmark_specs/`, and `benchmark_cards/` hold the reusable benchmark framework, benchmark definitions, and benchmark documentation.
 
 ### Prompt and dataset generation
 
 | Script | Purpose |
 |--------|---------|
-| `generate_prompts.py` | Prompt CSVs from a single BIF graph (obs + interventional) |
-| `cd_generation/names_only.py` | Names-only prompts with no sampled data |
-| `generate_prompt_answer_csv.py` | Mixed prompt/answer CSVs across multiple graphs and data sizes |
-| `export_cd_train_eval_csv.py` | Leak-free train/eval CSV splits from a config file |
-| `generate_reasoning.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
-| `collect_descendant_sft_data.py` | SFT data for the descendant-identification task |
-| `run_scripts/generate_sft_data.sh` | Convenience wrapper to export Sachs eval CSVs and build train/eval causal-discovery SFT JSONL |
+| `experiments/generate_prompts.py` | Prompt CSVs from a single BIF graph (obs + interventional) |
+| `experiments/cd_generation/names_only.py` | Names-only prompts with no sampled data |
+| `experiments/generate_prompt_answer_csv.py` | Mixed prompt/answer CSVs across multiple graphs and data sizes |
+| `experiments/export_cd_train_eval_csv.py` | Leak-free train/eval CSV splits from a config file |
+| `experiments/generate_reasoning.py` | Converts prompt CSVs to SFT JSONL with `<think>…</think><answer>…</answer>` |
+| `experiments/collect_descendant_sft_data.py` | SFT data for the descendant-identification task |
+| `experiments/run_scripts/generate_sft_data.sh` | Convenience wrapper to export Sachs eval CSVs and build train/eval causal-discovery SFT JSONL |
 
 ### Querying and evaluation
 
 | Script | Purpose |
 |--------|---------|
-| `pipelines/run_cd_eval_pipeline.py` | End-to-end: generate → query → evaluate → summarize |
-| `eval_cd_configs.py` | Same as above but without writing prompt CSV assets first |
-| `query_api.py` | Query a prompt CSV against OpenAI, Gemini, or HF backends |
-| `run_prompt_csv_models.py` | Legacy prompt-CSV batch wrapper for API/HF models |
-| `baselines/run_external_llm.py` | Structured LLM baselines (TakayamaSCP, JiralerspongBFS, CausalLLMPrompt, CausalLLMData) |
-| `evaluate.py` | Score a prediction CSV; outputs precision, recall, F1, SHD |
-| `eval_sft_on_jsonl.py` | Evaluate a finetuned SFT / LoRA model on JSONL or CSV |
+| `scripts/run_cd_eval_pipeline.py` | End-to-end: generate → query → evaluate → summarize |
+| `scripts/eval_cd_configs.py` | Same as above but without writing prompt CSV assets first |
+| `experiments/query_api.py` | Query a prompt CSV against OpenAI, Gemini, or HF backends |
+| `scripts/run_prompt_csv_models.py` | Legacy prompt-CSV batch wrapper for API/HF models |
+| `scripts/run_external_llm.py` | Structured LLM baselines (TakayamaSCP, JiralerspongBFS, CausalLLMPrompt, CausalLLMData) |
+| `experiments/evaluate.py` | Score a prediction CSV; outputs precision, recall, F1, SHD |
+| `experiments/eval_sft_on_jsonl.py` | Evaluate a finetuned SFT / LoRA model on JSONL or CSV |
+| `experiments/eval_grpo_vllm_rollouts.py` | Fast vLLM rollout sampling and reward scoring for merged/full models |
 
 ### Baselines and training
 
 | Script | Purpose |
 |--------|---------|
-| `baselines/run_classical.py` | Classical baselines: PC, GES, ENCO |
-| `run_exported_graphs.py` | Original ENCO learner on exported graphs |
-| `run_generated_graphs.py` | ENCO on newly generated synthetic graphs |
-| `train_sft.py` | Supervised finetuning |
-| `grpo.py` | GRPO training / evaluation utilities |
-| `grpo_unsloth.py` | Unsloth-oriented GRPO path |
+| `scripts/run_classical.py` | Classical baselines: PC, GES, ENCO |
+| `experiments/run_exported_graphs.py` | Original ENCO learner on exported graphs |
+| `experiments/run_generated_graphs.py` | ENCO on newly generated synthetic graphs |
+| `experiments/train_sft.py` | Supervised finetuning |
+| `experiments/grpo.py` | GRPO training / evaluation utilities |
 
 ## Prompt Variants
 
@@ -428,10 +484,11 @@ including:
 
 ## Benchmark Builder
 
-This repo also includes a manifest-driven benchmark builder.
+This repo also includes a config-driven benchmark builder.
 
 Core directories:
 
+- `benchmark_builder/`
 - `benchmark_specs/`
 - `benchmark_cards/`
 - `benchmark_runs/`
@@ -440,31 +497,33 @@ Core directories:
 Main CLIs:
 
 ```bash
-scripts/build-benchmark --manifest benchmark_specs/reference_suite.json
-scripts/run-benchmark --manifest benchmark_specs/reference_suite.json
-scripts/summarize-benchmark --manifest benchmark_specs/reference_suite.json
-scripts/clean-benchmark-prompts --manifest benchmark_specs/reference_suite.json --yes
+scripts/build-benchmark --config benchmark_specs/reference_suite.json
+scripts/run-benchmark --config benchmark_specs/reference_suite.json
+scripts/summarize-benchmark --config benchmark_specs/reference_suite.json
+scripts/clean-benchmark-prompts --config benchmark_specs/reference_suite.json --yes
 ```
 
-Useful manifests:
+Useful configs:
 
 - `benchmark_specs/reference_suite.json`
+- `benchmark_specs/sachs_child_eval_configs.json`
 - `benchmark_specs/smoke_suite.json`
 - `benchmark_specs/synthetic_ladder.json`
 - `benchmark_specs/authoring_demo.json`
 
 See also `docs/tutorials/benchmark_authoring.md`.
 
+Compatibility shims remain at several older `experiments/run_*` paths, but new
+benchmark and baseline commands should use `scripts/`.
+
 ## Classical Baselines
 
-`experiments/baselines/run_classical.py` supports `PC`, `GES`, and `ENCO`.
+`scripts/run_classical.py` supports `PC`, `GES`, and `ENCO`.
 
 ```bash
-cd experiments
-
-python baselines/run_classical.py \
+python scripts/run_classical.py \
   --method PC \
-  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+  --graph_files causal_graphs/real_data/small_graphs/cancer.bif \
   --sample_size_obs 5000 \
   --seed 42
 ```
@@ -472,10 +531,8 @@ python baselines/run_classical.py \
 The original ENCO learner is also still available:
 
 ```bash
-cd experiments
-
-python run_exported_graphs.py \
-  --graph_files ../causal_graphs/real_data/small_graphs/cancer.bif \
+python experiments/run_exported_graphs.py \
+  --graph_files causal_graphs/real_data/small_graphs/cancer.bif \
   --sample_size_obs 5000 \
   --sample_size_inters 200 \
   --max_inters -1 \

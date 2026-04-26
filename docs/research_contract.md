@@ -84,7 +84,7 @@ The paper is centered on a benchmark artifact, not a new causal-discovery algori
 The paper's job is to formalize this repository as a benchmark artifact:
 
 1. define one canonical Sachs-centered benchmark family that the repo can generate and evaluate reproducibly
-2. standardize benchmark slices, manifests, and output conventions
+2. standardize benchmark slices, configs, and output conventions
 3. compare a compact primary LLM set against ENCO on matched settings
 4. show which benchmark choices change the qualitative conclusion
 5. release the artifact in a form other researchers can reuse directly
@@ -123,7 +123,7 @@ The paper's job is to formalize this repository as a benchmark artifact:
 The benchmark release should make the following first-class:
 
 - benchmark definition document and canonical slice list
-- generation commands or manifests for each canonical Sachs slice
+- generation commands or configs for each canonical Sachs slice
 - generated prompt CSVs / prompt text files
 - response CSV schema and evaluation schema
 - aggregate summary tables under `experiments/out/experiment1/`
@@ -154,7 +154,7 @@ The benchmark release should make the following first-class:
 | Sachs artifacts | partial | repo-local Sachs responses and curriculum scaffolding exist, but not yet as a canonical main-paper table |
 | cancer smoke path | useful but non-evidentiary | keep only for end-to-end validation and debugging |
 | benchmark story | now tighter | the first decisive slice is `sachs` + `summary_joint` / `matrix` + real names + `obs100/int50` + `gpt-5-mini` + `ENCO`; supporting controls stay on Sachs; `cancer` is debug-only |
-| release packaging | incomplete | needs canonical slice manifests, output docs, and artifact-facing README cleanup |
+| release packaging | incomplete | needs canonical slice configs, output docs, and artifact-facing README cleanup |
 | curriculum extensibility | partial | keep out of the main paper body unless needed later |
 
 ## Key Decisions
@@ -181,7 +181,7 @@ The benchmark release should make the following first-class:
 - [x] First decisive Sachs benchmark slice specified
 - [x] Cancer demoted to smoke-test/debug-only status
 - [x] Missing release/documentation components identified
-- [ ] Canonical Sachs benchmark manifests added
+- [ ] Canonical Sachs benchmark configs added
 - [ ] Supporting Sachs controls frozen after the first slice is run
 - [ ] Main tables complete
 - [ ] Narrative report drafted

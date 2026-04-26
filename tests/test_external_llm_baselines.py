@@ -52,7 +52,7 @@ class TestExternalLLMBaselines(unittest.TestCase):
         self.assertIn("observational evidence summary", roots)
         self.assertIn("OBS", children)
 
-    def test_run_jiralerspong_bfs_uses_summary_joint_context(self) -> None:
+    def test_run_jiralerspong_bfs_uses_summary_context(self) -> None:
         with mock.patch.object(
             external,
             "_build_data_prompt",
@@ -69,7 +69,7 @@ class TestExternalLLMBaselines(unittest.TestCase):
                 graph_path=Path("/tmp/sachs.bif"),
                 sample_size_obs=100,
                 sample_size_inters=0,
-                prompt_mode="summary_joint",
+                prompt_mode="summary",
                 model_name="gpt-5-mini",
                 provider="openai",
                 temperature=0.0,

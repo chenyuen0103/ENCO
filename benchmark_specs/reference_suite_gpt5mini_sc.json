@@ -34,64 +34,74 @@
   "shuffles_per_graph": 1,
   "prompt_cells": [
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 100,
       "int_per_combo": 0,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
       "style": "matrix",
       "obs_per_prompt": 100,
       "int_per_combo": 0,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 100,
       "int_per_combo": 10,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
       "style": "matrix",
       "obs_per_prompt": 100,
       "int_per_combo": 10,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 100,
       "int_per_combo": 50,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
       "style": "matrix",
       "obs_per_prompt": 100,
       "int_per_combo": 50,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 1000,
       "int_per_combo": 50,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
       "style": "matrix",
       "obs_per_prompt": 1000,
       "int_per_combo": 50,
-      "anonymize": false
+      "anonymize": false,
+      "reasoning_guidance": "concise"
     },
     {
-      "style": "summary_joint",
+      "style": "summary",
       "obs_per_prompt": 100,
       "int_per_combo": 50,
-      "anonymize": true
+      "anonymize": true,
+      "reasoning_guidance": "concise"
     },
     {
       "style": "matrix",
       "obs_per_prompt": 100,
       "int_per_combo": 50,
-      "anonymize": true
+      "anonymize": true,
+      "reasoning_guidance": "concise"
     }
   ],
   "names_only": {

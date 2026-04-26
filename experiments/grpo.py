@@ -3849,11 +3849,12 @@ def run_train(args, argv: list[str] | None = None):
     if args.resume:
         resume_from_checkpoint = get_last_checkpoint(args.output_dir)
         if resume_from_checkpoint is None:
-            raise ValueError(
-                f"--resume was set but no checkpoint was found in {args.output_dir!r}. "
-                "Run without --resume to start a fresh training run."
-            )
-        if int(os.environ.get("RANK", "0")) == 0:
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    f"[train] --resume was set, but no checkpoint was found in "
+                    f"{args.output_dir!r}; starting a fresh training run."
+                )
+        elif int(os.environ.get("RANK", "0")) == 0:
             print(f"[train] resuming from checkpoint: {resume_from_checkpoint}")
 
     # Write launch command to output_dir immediately so it's saved even if training crashes.
