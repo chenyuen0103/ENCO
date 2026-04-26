@@ -1,0 +1,70 @@
+{
+  "name": "mv_six_graph_semantic_floor",
+  "role": "control",
+  "description": "Minimum-viable six-graph semantic-floor slice for the MICAD paper: gpt-5-mini names-only on Cancer, Earthquake, Asia, Sachs, Child, and Alarm.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "cancer",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/cancer.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "5_vars"]
+    },
+    {
+      "name": "earthquake",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/earthquake.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "5_vars"]
+    },
+    {
+      "name": "asia",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/asia.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "8_vars"]
+    },
+    {
+      "name": "sachs",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/sachs.bif",
+      "role": "control",
+      "tags": ["real_graph", "interventional", "semantic_floor", "11_vars"]
+    },
+    {
+      "name": "child",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/child.bif",
+      "role": "control",
+      "tags": ["real_graph", "interventional", "semantic_floor", "20_vars"]
+    },
+    {
+      "name": "alarm",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/alarm.bif",
+      "role": "control",
+      "tags": ["real_graph", "interventional", "semantic_floor", "37_vars"]
+    }
+  ],
+  "prompt_cells": [],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "models": [
+    {
+      "name": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "enabled": true,
+      "backend_version": "api"
+    }
+  ],
+  "baselines": [],
+  "num_prompts": 5,
+  "shuffles_per_graph": 1,
+  "seed": 42,
+  "output_root": "benchmark_runs",
+  "notes": "Paper-facing appendix breadth slice for the minimum-viable six-graph semantic-floor table. Runs gpt-5-mini names_only only; no prompt-cell budgets and no classical baselines."
+}
