@@ -76,9 +76,11 @@ def _load_adj(answer_raw: str) -> Optional[List[List[int]]]:
 # ---------------------------------------------------------------------------
 
 _VAR_BLOCK_RE = re.compile(
-    r"---\s*VARIABLES\s*---\s*\n(.*?)(?=\n---|\Z)", re.DOTALL
+    r"---\s*VARIABLE(?:S| ORDER(?: \(ORDER MATTERS\))?)\s*---\s*\n"
+    r"(.*?)(?=\n(?:---|Output:|Formatting requirement:|assistant\b)|\Z)",
+    re.DOTALL,
 )
-_VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(\S+)", re.MULTILINE)
+_VAR_LINE_RE = re.compile(r"^\s*\d+\s*:\s*(.+?)\s*$", re.MULTILINE)
 _OBS_BLOCK_RE = re.compile(
     r"---\s*OBSERVATIONAL DATA\s*---\s*\n.*?observational_data=(\{.*?\})(?=\n(?:---|Output:|Formatting requirement:|assistant\b)|\Z)",
     re.DOTALL,
@@ -92,11 +94,11 @@ _DO_KEY_RE = re.compile(r"do\((.+?)=([^)]+)\)")
 
 
 def _extract_variables(prompt: str) -> Optional[List[str]]:
-    """Extract ordered variable names from the VARIABLES block in the prompt."""
+    """Extract ordered variable names from the prompt's variable-order block."""
     m = _VAR_BLOCK_RE.search(prompt or "")
     if not m:
         return None
-    names = _VAR_LINE_RE.findall(m.group(1))
+    names = [name.strip() for name in _VAR_LINE_RE.findall(m.group(1))]
     return names if names else None
 
 

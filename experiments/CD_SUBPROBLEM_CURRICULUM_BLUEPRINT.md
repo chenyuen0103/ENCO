@@ -17,7 +17,7 @@ The goal is not to replace the existing `causal_discovery` task immediately. The
 
 The current code already supports:
 
-- staged curricula via `experiments/run_cd_curriculum.py`
+- staged curricula via `experiments/pipelines/run_cd_curriculum.py`
 - one subproblem task via `cd_descendants`
 - causal-discovery prompts based on the same summary/matrix evidence later used for full graph prediction
 - GRPO reward plumbing by task
@@ -328,7 +328,7 @@ These are the minimal code changes to support the above.
 
 File:
 
-- `experiments/run_cd_curriculum.py`
+- `experiments/pipelines/run_cd_curriculum.py`
 
 Change:
 
@@ -503,4 +503,3 @@ Why:
 - strong transfer to graph recovery
 - much denser and less ambiguous supervision than full-DAG prediction
 - easy reward function
-
