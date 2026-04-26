@@ -1,0 +1,278 @@
+{
+  "name": "paper_eval",
+  "role": "main",
+  "description": "Unified benchmark-spec manifest for the MICAD paper. This encodes the paper's required Sachs evaluation cells together with the six-graph names-only floor. Because benchmark_specs apply prompt_cells globally across datasets, this manifest is a conservative superset of the paper's minimum run plan.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "cancer",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/cancer.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "5_vars"]
+    },
+    {
+      "name": "earthquake",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/earthquake.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "5_vars"]
+    },
+    {
+      "name": "asia",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/asia.bif",
+      "role": "control",
+      "tags": ["real_graph", "small_graph", "semantic_floor", "8_vars"]
+    },
+    {
+      "name": "sachs",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/sachs.bif",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "paper_anchor", "11_vars"]
+    },
+    {
+      "name": "child",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/child.bif",
+      "role": "control",
+      "tags": ["real_graph", "interventional", "semantic_floor", "20_vars"]
+    },
+    {
+      "name": "alarm",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/alarm.bif",
+      "role": "control",
+      "tags": ["real_graph", "interventional", "semantic_floor", "37_vars"]
+    }
+  ],
+  "num_prompts": 5,
+  "seed": 42,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 200,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 200,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 50,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "matrix",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 200,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "models": [
+    {
+      "name": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "enabled": true,
+      "backend_version": "api"
+    }
+  ],
+  "baselines": [
+    {
+      "name": "PC",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "seed": 42,
+      "pc_variant": "stable",
+      "pc_ci_test": "chi_square",
+      "pc_significance_level": 0.01,
+      "pc_max_cond_vars": 5
+    },
+    {
+      "name": "GES",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "seed": 42,
+      "ges_scoring_method": "bic-d",
+      "ges_min_improvement": 1e-6
+    },
+    {
+      "name": "ENCO",
+      "enabled": true,
+      "scope": "interventional",
+      "library": "internal",
+      "max_inters": -1,
+      "seed": 42,
+      "checkpoint_dir": "experiments/checkpoints/benchmarks/paper_eval/ENCO"
+    }
+  ],
+  "evaluator": {
+    "tau": 0.7,
+    "pred_col": "prediction"
+  },
+  "provenance": {
+    "schema_version": "benchmark_spec/v1",
+    "parser_version": "query_api.extract_adjacency",
+    "evaluator_version": "evaluate.py",
+    "tags": ["micad", "paper_eval", "neurips_db"]
+  },
+  "notes": "Single-manifest paper evaluation superset. Encodes the Sachs main/body cells, Sachs budget controls, and the six-graph names_only appendix requirement. Because prompt cells are global in benchmark_specs, this will run more than the paper's minimum-required non-Sachs slice set; for minimal execution, use the narrower paper_slices plus the six-graph names_only manifest."
+}
