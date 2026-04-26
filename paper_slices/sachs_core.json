@@ -132,7 +132,7 @@
       "name": "CausalLLMPrompt",
       "enabled": true,
       "scope": "all",
-      "model": "gpt-4.1-mini",
+      "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
       "num_samples": 1
@@ -141,7 +141,7 @@
       "name": "JiralerspongBFS",
       "enabled": true,
       "scope": "observational",
-      "model": "gpt-4.1-mini",
+      "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
       "num_samples": 1
@@ -150,7 +150,7 @@
       "name": "TakayamaSCP",
       "enabled": true,
       "scope": "observational",
-      "model": "gpt-4.1-mini",
+      "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
       "num_samples": 5,
