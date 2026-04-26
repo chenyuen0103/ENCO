@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +32,18 @@ class EvalScriptEvaluator(Evaluator):
         return CommandPlan(label=f"evaluate:{response_csv.name}", cmd=cmd, cwd=self.repo_root / "experiments")
 
 
-def load_summary_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def direct_csv_summary(*, response_csv: Path, evaluator: EvaluatorSpec) -> dict[str, Any]:
+    from experiments.evaluate import evaluate_response_csv
 
-
+    result = evaluate_response_csv(
+        response_csv,
+        answer_col=evaluator.answer_col,
+        pred_col=evaluator.pred_col,
+        tau=evaluator.tau,
+        write_artifacts=False,
+        verbose=False,
+    )
+    return dict(result["summary"])
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:

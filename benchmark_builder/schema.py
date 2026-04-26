@@ -85,6 +85,7 @@ class BaselineSpec:
     max_new_tokens: int | None = None
     num_samples: int = 5
     edge_threshold: float = 0.5
+    takayama_backend: str = "pc"
     takayama_pattern: int = 2
     takayama_bootstrap_samples: int = 100
     notes: str = ""
@@ -302,6 +303,7 @@ def _build_baseline(item: dict[str, Any]) -> BaselineSpec:
         max_new_tokens=item.get("max_new_tokens"),
         num_samples=int(item.get("num_samples", 5)),
         edge_threshold=float(item.get("edge_threshold", 0.5)),
+        takayama_backend=str(item.get("takayama_backend", "pc")).strip().lower(),
         takayama_pattern=int(item.get("takayama_pattern", 2)),
         takayama_bootstrap_samples=int(item.get("takayama_bootstrap_samples", 100)),
         notes=item.get("notes", ""),

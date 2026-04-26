@@ -32,6 +32,32 @@ def _is_names_only_cell(cell: PromptCellSpec) -> bool:
     return cell.style == "names_only" or (cell.obs_per_prompt == 0 and cell.int_per_combo == 0)
 
 
+def _takayama_backend_slug(raw: str | None) -> str:
+    backend = (raw or "pc").strip().lower()
+    aliases = {
+        "pc": "pc",
+        "exact": "exact_search",
+        "exactsearch": "exact_search",
+        "exact_search": "exact_search",
+        "es": "exact_search",
+        "lingam": "direct_lingam",
+        "directlingam": "direct_lingam",
+        "direct_lingam": "direct_lingam",
+    }
+    return aliases.get(backend, backend)
+
+
+def _takayama_backend_suffix(raw: str | None) -> str:
+    backend = _takayama_backend_slug(raw)
+    if backend == "pc":
+        return ""
+    if backend == "exact_search":
+        return "_ExactSearch"
+    if backend == "direct_lingam":
+        return "_DirectLiNGAM"
+    return f"_{backend}"
+
+
 @dataclass
 class ClassicalBaselineAdapter(BaselineAdapter):
     repo_root: Path
@@ -206,7 +232,13 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
     ) -> tuple[Any, ...]:
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
         if self.method_name in {"TakayamaSCP", "JiralerspongBFS"}:
-            return (baseline.name, dataset.name, sample_size_obs, entry["naming_regime"])
+            extra = ()
+            if self.method_name == "TakayamaSCP":
+                extra = (
+                    _takayama_backend_slug(baseline.takayama_backend),
+                    int(baseline.takayama_pattern),
+                )
+            return (baseline.name, dataset.name, sample_size_obs, entry["naming_regime"], *extra)
         if self.method_name == "CausalLLMPrompt":
             return (baseline.name, dataset.name, "names_only")
         return (baseline.name, dataset.name, entry["config_name"])
@@ -229,8 +261,11 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             naming_suffix = "_anon"
         elif naming_regime == "names_only":
             naming_suffix = "_names_only"
+        takayama_suffix = ""
+        if self.method_name == "TakayamaSCP":
+            takayama_suffix = f"{_takayama_backend_suffix(baseline.takayama_backend)}_p{int(baseline.takayama_pattern)}"
         out_csv = self.repo_root / "experiments" / "responses" / dataset.name / (
-            f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{naming_suffix}.csv"
+            f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{takayama_suffix}{naming_suffix}.csv"
         )
         model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
         if self.method_name == "TakayamaSCP":
@@ -253,6 +288,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 str(baseline.temperature),
                 "--num_samples",
                 str(baseline.num_samples),
+                "--backend",
+                _takayama_backend_slug(baseline.takayama_backend),
                 "--takayama_pattern",
                 str(baseline.takayama_pattern),
                 "--bootstrap_samples",

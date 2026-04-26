@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import pandas as pd
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,10 +24,39 @@ for _path in (REPO_ROOT, EXPERIMENTS_DIR):
 from benchmark_builder.graph_io import load_causal_graph
 
 DEFAULT_OUT_DIR = EXPERIMENTS_DIR / "responses"
+TAKAYAMA_BACKENDS = {"pc", "exact_search", "direct_lingam"}
 
 
 def _progress(message: str) -> None:
     print(f"[TakayamaSCP {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def _normalize_backend(raw: str) -> str:
+    backend = (raw or "pc").strip().lower()
+    aliases = {
+        "pc": "pc",
+        "exact": "exact_search",
+        "exactsearch": "exact_search",
+        "exact_search": "exact_search",
+        "es": "exact_search",
+        "lingam": "direct_lingam",
+        "directlingam": "direct_lingam",
+        "direct_lingam": "direct_lingam",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in TAKAYAMA_BACKENDS:
+        raise SystemExit(f"Unsupported Takayama backend: {raw}")
+    return backend
+
+
+def _backend_suffix(backend: str) -> str:
+    if backend == "pc":
+        return ""
+    if backend == "exact_search":
+        return "_ExactSearch"
+    if backend == "direct_lingam":
+        return "_DirectLiNGAM"
+    return f"_{backend}"
 
 
 def _require_openai():
@@ -53,22 +83,34 @@ def _require_illinois():
 
 def _require_causallearn():
     try:
-        from causallearn.graph.GraphNode import GraphNode  # noqa: F401
         from causallearn.search.ConstraintBased.PC import pc
+        from causallearn.search.ScoreBased.ExactSearch import bic_exact_search
         from causallearn.utils.PCUtils.BackgroundKnowledge import BackgroundKnowledge
     except Exception as exc:
         raise SystemExit(
             "TakayamaSCP requires `causal-learn`. Install it with `pip install causal-learn`."
         ) from exc
-    return pc, BackgroundKnowledge
+    return pc, bic_exact_search, BackgroundKnowledge
 
 
-def _load_observational_dataframe(graph_path: Path, sample_size_obs: int, seed: int):
+def _require_lingam():
+    try:
+        import lingam  # type: ignore
+    except Exception as exc:
+        raise SystemExit("TakayamaSCP DirectLiNGAM backend requires `lingam`.") from exc
+    return lingam
+
+
+def _load_observational_frames(
+    graph_path: Path,
+    sample_size_obs: int,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], np.ndarray]:
     if sample_size_obs <= 0:
         raise SystemExit("TakayamaSCP requires --sample_size_obs > 0.")
+
     graph = load_causal_graph(graph_path)
     var_names = [str(v.name) for v in graph.variables]
-
     if hasattr(graph, "data_obs"):
         arr = np.asarray(graph.data_obs)
         if arr.shape[0] < sample_size_obs:
@@ -83,14 +125,15 @@ def _load_observational_dataframe(graph_path: Path, sample_size_obs: int, seed: 
         raise SystemExit("Graph object does not expose observational data or sampling for TakayamaSCP.")
 
     from sklearn.preprocessing import StandardScaler
-    import pandas as pd
 
+    raw_df = pd.DataFrame(arr, columns=var_names)
     scaler = StandardScaler()
     x = scaler.fit_transform(arr)
-    df = pd.DataFrame(x, columns=var_names)
+    std_df = pd.DataFrame(x, columns=var_names)
+
     answer = np.asarray(graph.adj_matrix).astype(int)
     np.fill_diagonal(answer, 0)
-    return df, var_names, answer
+    return raw_df, std_df, var_names, answer
 
 
 def _pc_signed_adjacency(cg: Any) -> np.ndarray:
@@ -99,18 +142,18 @@ def _pc_signed_adjacency(cg: Any) -> np.ndarray:
     for i in range(num_nodes):
         for j in range(num_nodes):
             if cg.G.graph[i][j] == 1 and cg.G.graph[j][i] == -1:
-                adj_matrix[i, j] = 1  # j -> i
+                adj_matrix[i, j] = 1
             elif cg.G.graph[i][j] == -1 and cg.G.graph[j][i] == -1:
-                adj_matrix[i, j] = -1  # undirected
+                adj_matrix[i, j] = -1
             elif cg.G.graph[i][j] == 1 and cg.G.graph[j][i] == 1:
-                adj_matrix[i, j] = 2  # bidirected
+                adj_matrix[i, j] = 2
     return adj_matrix
 
 
-def _bootstrap_pc_probabilities(df: Any, n_sampling: int) -> tuple[np.ndarray, np.ndarray]:
+def _bootstrap_pc_probabilities(df: pd.DataFrame, n_sampling: int) -> tuple[np.ndarray, np.ndarray]:
     from sklearn.utils import resample
 
-    pc, _BackgroundKnowledge = _require_causallearn()
+    pc, _bic_exact_search, _BackgroundKnowledge = _require_causallearn()
     num_nodes = df.shape[1]
     directed = np.zeros((num_nodes, num_nodes), dtype=float)
     undirected = np.zeros((num_nodes, num_nodes), dtype=float)
@@ -133,11 +176,57 @@ def _bootstrap_pc_probabilities(df: Any, n_sampling: int) -> tuple[np.ndarray, n
     return directed, undirected
 
 
+def _run_exact_search(df: pd.DataFrame, *, super_graph: Optional[np.ndarray] = None) -> np.ndarray:
+    _pc, bic_exact_search, _BackgroundKnowledge = _require_causallearn()
+    dag_est, _search_stats = bic_exact_search(df.to_numpy(), super_graph=super_graph, verbose=False)
+    return np.asarray(dag_est)
+
+
+def _bootstrap_exact_search_probabilities(df: pd.DataFrame, n_sampling: int) -> np.ndarray:
+    from sklearn.utils import resample
+
+    num_nodes = df.shape[1]
+    directed = np.zeros((num_nodes, num_nodes), dtype=float)
+    _progress(f"bootstrap Exact Search start: samples={n_sampling}, vars={num_nodes}")
+    report_every = max(1, n_sampling // 5)
+    for idx in range(n_sampling):
+        boot = resample(df)
+        dag_est = _run_exact_search(boot, super_graph=None)
+        directed += (np.asarray(dag_est) != 0).astype(float)
+        done = idx + 1
+        if done == 1 or done == n_sampling or done % report_every == 0:
+            _progress(f"bootstrap Exact Search progress: {done}/{n_sampling}")
+    directed /= float(n_sampling)
+    _progress("bootstrap Exact Search done")
+    return directed
+
+
+def _run_direct_lingam(df: pd.DataFrame, *, prior_knowledge: Optional[np.ndarray] = None) -> np.ndarray:
+    lingam = _require_lingam()
+    model = lingam.DirectLiNGAM(prior_knowledge=prior_knowledge)
+    model.fit(df)
+    return np.asarray(model.adjacency_matrix_)
+
+
+def _bootstrap_direct_lingam_probabilities(df: pd.DataFrame, n_sampling: int) -> np.ndarray:
+    lingam = _require_lingam()
+    _progress(f"bootstrap DirectLiNGAM start: samples={n_sampling}, vars={df.shape[1]}")
+    model = lingam.DirectLiNGAM(prior_knowledge=None)
+    model.fit(df)
+    bootstrap = model.bootstrap(df, n_sampling=n_sampling)
+    probs = np.asarray(bootstrap.get_probabilities(min_causal_effect=0.01), dtype=float)
+    _progress("bootstrap DirectLiNGAM done")
+    return probs
+
+
 def _system_intro(dataset_name: str, labels: list[str], *, anonymized: bool) -> str:
     variables = ", ".join(labels[:-1]) + f", and {labels[-1]}" if len(labels) > 1 else labels[0]
-    if anonymized:
-        return f"We want to carry out causal inference in an anonymized system, considering {variables} as variables."
-    return f"We want to carry out causal inference in the system called '{dataset_name}', considering {variables} as variables."
+    context = "in an anonymized system" if anonymized else f"in the system called '{dataset_name}'"
+    return f"We want to carry out causal inference {context}, considering {variables} as variables."
+
+
+def _dataset_explanation(dataset_name: str, *, anonymized: bool) -> str:
+    return "an anonymized dataset" if anonymized else f"the {dataset_name} dataset"
 
 
 def _first_template_text(src: str, dst: str) -> str:
@@ -150,49 +239,149 @@ def _first_template_text(src: str, dst: str) -> str:
     )
 
 
-def _all_edges_pattern1_pc(adj_matrix: np.ndarray, labels: list[str]) -> str:
-    lines = ["All of the directed edges suggested by the statistic causal discovery are below:", "-----"]
-    n = adj_matrix.shape[0]
+def _q1_2_text(backend: str, dataset_name: str, *, anonymized: bool) -> str:
+    explanation = _dataset_explanation(dataset_name, anonymized=anonymized)
+    if backend == "pc":
+        return "First, we have conducted the statistical causal discovery with PC(Peter-Clerk) algorithm, using a fully standardized dataset."
+    if backend == "exact_search":
+        return f"First, we have conducted the statistical causal discovery with Exact Search algorithm, using a fully standardized dataset on {explanation}."
+    if backend == "direct_lingam":
+        return f"First, we have conducted the statistical causal discovery with LiNGAM(Linear Non-Gaussian Acyclic Model) algorithm, using a fully standardized dataset on {explanation}."
+    raise SystemExit(f"Unsupported backend in q1_2_text: {backend}")
+
+
+def _all_edges_pattern1(adjacency_matrix: np.ndarray, labels: list[str]) -> str:
+    lines = ["All of the edges suggested by the statistical causal discovery are below:", "-----"]
+    n = adjacency_matrix.shape[0]
     for i in range(n):
         for j in range(n):
-            if j != i and adj_matrix[i, j] == 1:
+            if j == i or adjacency_matrix[i, j] == 0:
+                continue
+            lines.append(f"{labels[j]} → {labels[i]}")
+    lines.extend(["-----"])
+    return "\n".join(lines)
+
+
+def _causal_text_pattern1(adjacency_matrix: np.ndarray, i: int, j: int, labels: list[str]) -> str:
+    if adjacency_matrix[i, j] == 0:
+        return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
+    return f"there may be a direct impact of a change in {labels[j]} on {labels[i]}."
+
+
+def _all_edges_pattern2(boot_prob: np.ndarray, labels: list[str]) -> str:
+    lines = ["All of the edges with non-zero bootstrap probabilities suggested by the statistical causal discovery are below:", "-----"]
+    n = boot_prob.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if j == i or boot_prob[i, j] == 0:
+                continue
+            lines.append(f"{labels[j]} → {labels[i]} (bootstrap probability = {boot_prob[i, j]})")
+    lines.extend(["-----"])
+    return "\n".join(lines)
+
+
+def _causal_text_pattern2(boot_prob: np.ndarray, i: int, j: int, labels: list[str]) -> str:
+    if boot_prob[i, j] == 0:
+        return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
+    return f"there may be a direct impact of a change in {labels[j]} on {labels[i]} with a bootstrap probability of {boot_prob[i, j]}."
+
+
+def _all_edges_pattern3(adjacency_matrix: np.ndarray, labels: list[str]) -> str:
+    lines = ["All of the edges and their coefficients of the structural causal model suggested by the statistical causal discovery are below:", "-----"]
+    n = adjacency_matrix.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if j == i or adjacency_matrix[i, j] == 0:
+                continue
+            lines.append(f"{labels[j]} → {labels[i]} (coefficient = {adjacency_matrix[i, j]})")
+    lines.extend(["-----"])
+    return "\n".join(lines)
+
+
+def _causal_text_pattern3(adjacency_matrix: np.ndarray, i: int, j: int, labels: list[str]) -> str:
+    if adjacency_matrix[i, j] == 0:
+        return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
+    return f"there may be a direct impact of a change in {labels[j]} on {labels[i]} with a causal coefficient of {adjacency_matrix[i, j]}."
+
+
+def _all_edges_pattern4(adjacency_matrix: np.ndarray, boot_prob: np.ndarray, labels: list[str]) -> str:
+    lines = ["All of the edges with non-zero bootstrap probabilities and their coefficients of the structural causal model suggested by the statistical causal discovery are below:", "-----"]
+    n = boot_prob.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if j == i or boot_prob[i, j] == 0:
+                continue
+            lines.append(
+                f"{labels[j]} → {labels[i]} (coefficient = {adjacency_matrix[i, j]}, bootstrap probability = {boot_prob[i, j]})"
+            )
+    lines.extend(["-----"])
+    return "\n".join(lines)
+
+
+def _causal_text_pattern4(adjacency_matrix: np.ndarray, boot_prob: np.ndarray, i: int, j: int, labels: list[str]) -> str:
+    if boot_prob[i, j] == 0:
+        return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
+    if adjacency_matrix[i, j] == 0:
+        return (
+            f"there may be a direct impact of a change in {labels[j]} on {labels[i]} "
+            f"with a bootstrap probability of {boot_prob[i, j]}, but the coefficient is likely to be {adjacency_matrix[i, j]}."
+        )
+    return (
+        f"there may be a direct impact of a change in {labels[j]} on {labels[i]} "
+        f"with a bootstrap probability of {boot_prob[i, j]}, and the coefficient is likely to be {adjacency_matrix[i, j]}."
+    )
+
+
+def _all_edges_pattern1_pc(adjacency_matrix: np.ndarray, labels: list[str]) -> str:
+    lines = ["All of the directed edges suggested by the statistic causal discovery are below:", "-----"]
+    n = adjacency_matrix.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if j != i and adjacency_matrix[i, j] == 1:
                 lines.append(f"{labels[j]} → {labels[i]}")
     lines.extend(["-----", "In additon to the directed edges above, all of the undirected edges suggested by the statistic causal discovery are below:", "-----"])
     for i in range(n):
         for j in range(i + 1, n):
-            if adj_matrix[i, j] == -1:
+            if adjacency_matrix[i, j] == -1:
                 lines.append(f"{labels[j]} － {labels[i]}")
     lines.extend(["-----"])
     return "\n".join(lines)
 
 
-def _all_edges_pattern2_pc(directed: np.ndarray, undirected: np.ndarray, labels: list[str]) -> str:
+def _causal_text_pattern1_pc(adjacency_matrix: np.ndarray, i: int, j: int, labels: list[str]) -> str:
+    if adjacency_matrix[i, j] == 1:
+        return f"there may be a direct impact of a change in {labels[j]} on {labels[i]}."
+    if adjacency_matrix[i, j] == -1 or adjacency_matrix[j, i] == -1:
+        return f"there may be a direct causal relationship between {labels[j]} and {labels[i]}, although the direction has not been determined."
+    return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
+
+
+def _all_edges_pattern2_pc(boot_prob_directed: np.ndarray, boot_prob_undirected: np.ndarray, labels: list[str]) -> str:
     lines = ["All of the directed edges with non-zero bootstrap probabilities suggested by the statistic causal discovery are below:", "-----"]
-    n = directed.shape[0]
+    n = boot_prob_directed.shape[0]
     for i in range(n):
         for j in range(n):
-            if j != i and directed[i, j] != 0:
-                lines.append(f"{labels[j]} → {labels[i]} (bootstrap probability = {directed[i, j]})")
+            if j == i or boot_prob_directed[i, j] == 0:
+                continue
+            lines.append(f"{labels[j]} → {labels[i]} (bootstrap probability = {boot_prob_directed[i, j]})")
     lines.extend(["-----", "In additon to the directed edges above, all of the undirected edges suggested by the statistic causal discovery are below:", "-----"])
     for i in range(n):
         for j in range(i + 1, n):
-            if undirected[i, j] != 0:
-                lines.append(f"{labels[j]} ― {labels[i]} (bootstrap probability = {undirected[i, j]})")
+            if boot_prob_undirected[i, j] != 0:
+                lines.append(f"{labels[j]} ― {labels[i]} (bootstrap probability = {boot_prob_undirected[i, j]})")
     lines.extend(["-----"])
     return "\n".join(lines)
 
 
-def _causal_text_pattern1_pc(adj_matrix: np.ndarray, i: int, j: int, labels: list[str]) -> str:
-    if adj_matrix[i, j] == 0:
-        return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
-    if adj_matrix[i, j] == 1:
-        return f"there may be a direct impact of a change in {labels[j]} on {labels[i]}."
-    return f"there may be a direct causal relationship between {labels[j]} and {labels[i]}, although the direction has not been determined."
-
-
-def _causal_text_pattern2_pc(directed: np.ndarray, undirected: np.ndarray, i: int, j: int, labels: list[str]) -> str:
-    d = float(directed[i, j])
-    u = float(undirected[i, j])
+def _causal_text_pattern2_pc(
+    boot_prob_directed: np.ndarray,
+    boot_prob_undirected: np.ndarray,
+    i: int,
+    j: int,
+    labels: list[str],
+) -> str:
+    d = float(boot_prob_directed[i, j])
+    u = float(boot_prob_undirected[i, j])
     if d == 0 and u == 0:
         return f"there may be no direct impact of a change in {labels[j]} on {labels[i]}."
     if d != 0 and u == 0:
@@ -211,29 +400,79 @@ def _causal_text_pattern2_pc(directed: np.ndarray, undirected: np.ndarray, i: in
 
 def _build_first_prompt(
     *,
+    backend: str,
+    pattern: int,
     dataset_name: str,
     labels: list[str],
     i: int,
     j: int,
-    pattern: int,
-    pc_adj_signed: np.ndarray,
-    pc_directed_prob: np.ndarray,
-    pc_undirected_prob: np.ndarray,
+    adjacency_matrix: np.ndarray,
+    primary_prob: Optional[np.ndarray],
+    secondary_prob: Optional[np.ndarray],
     anonymized: bool,
 ) -> str:
     q1_1 = _system_intro(dataset_name, labels, anonymized=anonymized)
-    q1_2 = "First, we have conducted the statistical causal discovery with PC(Peter-Clerk) algorithm, using a fully standardized dataset."
+    q1_2 = _q1_2_text(backend, dataset_name, anonymized=anonymized)
     q1_3 = "According to the results shown above, it has been determined that"
-    if pattern == 1:
-        all_edges = _all_edges_pattern1_pc(pc_adj_signed, labels)
-        causal_text = _causal_text_pattern1_pc(pc_adj_signed, i, j, labels)
-    elif pattern == 2:
-        all_edges = _all_edges_pattern2_pc(pc_directed_prob, pc_undirected_prob, labels)
-        causal_text = _causal_text_pattern2_pc(pc_directed_prob, pc_undirected_prob, i, j, labels)
-    else:
-        raise SystemExit(f"Unsupported Takayama PC pattern: {pattern}. Use 1 or 2.")
     template = _first_template_text(labels[j], labels[i])
-    return f"{q1_1}\n{q1_2}\n{all_edges}\n{q1_3} {causal_text}\n{template}"
+
+    if backend == "pc":
+        if pattern == 1:
+            all_edges = _all_edges_pattern1_pc(adjacency_matrix, labels)
+            causal_text = _causal_text_pattern1_pc(adjacency_matrix, i, j, labels)
+        elif pattern == 2:
+            if primary_prob is None or secondary_prob is None:
+                raise SystemExit("Takayama PC pattern 2 requires directed and undirected bootstrap probabilities.")
+            all_edges = _all_edges_pattern2_pc(primary_prob, secondary_prob, labels)
+            causal_text = _causal_text_pattern2_pc(primary_prob, secondary_prob, i, j, labels)
+        else:
+            raise SystemExit("Takayama PC backend supports patterns 1 and 2.")
+        return f"{q1_1}\n{q1_2}\n{all_edges}\n{q1_3} {causal_text}\n{template}"
+
+    if backend == "exact_search":
+        if pattern == 1:
+            all_edges = _all_edges_pattern1(adjacency_matrix, labels)
+            causal_text = _causal_text_pattern1(adjacency_matrix, i, j, labels)
+        elif pattern == 2:
+            if primary_prob is None:
+                raise SystemExit("Takayama Exact Search pattern 2 requires bootstrap probabilities.")
+            # Mirror the upstream notebook's pattern-2 template selection.
+            all_edges = _all_edges_pattern3(primary_prob, labels)
+            causal_text = _causal_text_pattern2(primary_prob, i, j, labels)
+        else:
+            raise SystemExit("Takayama Exact Search backend supports patterns 1 and 2.")
+        return f"{q1_1}\n{q1_2}\n{all_edges}\n{q1_3} {causal_text}\n{template}"
+
+    if backend == "direct_lingam":
+        if pattern == 0:
+            return (
+                f"{q1_1}\n"
+                f"If {labels[j]} is modified, will it have a direct impact on {labels[i]}?\n"
+                f"Please provide an explanation that leverages your expert knowledge on the causal relationship between {labels[j]} and {labels[i]}.\n"
+                "Your response should consider the relevant factors and provide a reasoned explanation based on your understanding of the domain."
+            )
+        if pattern == 1:
+            all_edges = _all_edges_pattern1(adjacency_matrix, labels)
+            causal_text = _causal_text_pattern1(adjacency_matrix, i, j, labels)
+        elif pattern == 2:
+            if primary_prob is None:
+                raise SystemExit("Takayama DirectLiNGAM pattern 2 requires bootstrap probabilities.")
+            # Mirror the upstream notebook's pattern-2 template selection.
+            all_edges = _all_edges_pattern3(primary_prob, labels)
+            causal_text = _causal_text_pattern3(primary_prob, i, j, labels)
+        elif pattern == 3:
+            all_edges = _all_edges_pattern2(adjacency_matrix, labels)
+            causal_text = _causal_text_pattern2(adjacency_matrix, i, j, labels)
+        elif pattern == 4:
+            if primary_prob is None:
+                raise SystemExit("Takayama DirectLiNGAM pattern 4 requires bootstrap probabilities.")
+            all_edges = _all_edges_pattern4(adjacency_matrix, primary_prob, labels)
+            causal_text = _causal_text_pattern4(adjacency_matrix, primary_prob, i, j, labels)
+        else:
+            raise SystemExit("Takayama DirectLiNGAM backend supports patterns 0, 1, 2, 3, and 4.")
+        return f"{q1_1}\n{q1_2}\n{all_edges}\n{q1_3} {causal_text}\n{template}"
+
+    raise SystemExit(f"Unsupported backend in first prompt builder: {backend}")
 
 
 def _build_second_prompt(first_prompt: str, first_answer: str, *, src: str, dst: str) -> str:
@@ -328,7 +567,6 @@ def _chat_text_completion(
             "logprobs": logprobs if logprobs else None,
             "top_logprobs": top_logprobs if logprobs else None,
         }
-        # GPT-5 family endpoints reject max_tokens in favor of max_completion_tokens.
         if "gpt-5" in model_name.lower():
             kwargs["max_completion_tokens"] = completion_tokens
         else:
@@ -403,6 +641,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 def _build_run_signature(
     *,
     graph_path: Path,
+    backend: str,
     model_name: str,
     provider: str,
     labels: list[str],
@@ -417,6 +656,7 @@ def _build_run_signature(
     return {
         "graph_file": str(graph_path),
         "graph_stem": graph_path.stem,
+        "backend": backend,
         "model": model_name,
         "provider": provider,
         "labels": list(labels),
@@ -497,12 +737,13 @@ def _llm_probability_matrix(
     provider: str,
     client: Any,
     model_name: str,
+    backend: str,
     labels: list[str],
     dataset_name: str,
     pattern: int,
-    pc_adj_signed: np.ndarray,
-    pc_directed_prob: np.ndarray,
-    pc_undirected_prob: np.ndarray,
+    adjacency_matrix: np.ndarray,
+    primary_prob: Optional[np.ndarray],
+    secondary_prob: Optional[np.ndarray],
     temperature: float,
     max_new_tokens: int | None,
     num_samples: int,
@@ -523,7 +764,7 @@ def _llm_probability_matrix(
             )
         print(f"[TakayamaSCP] resuming from {checkpoint_path} completed_pairs={len(completed_pairs)}{current_desc}")
     _progress(
-        f"LLM pairwise phase start: dataset={dataset_name}, vars={n}, total_pairs={total_pairs}, "
+        f"LLM pairwise phase start: backend={backend}, dataset={dataset_name}, vars={n}, total_pairs={total_pairs}, "
         f"completed_pairs={len(completed_pairs)}, samples_per_pair={max(1, num_samples)}"
     )
 
@@ -539,9 +780,7 @@ def _llm_probability_matrix(
 
     for i in range(n):
         for j in range(n):
-            if i == j:
-                continue
-            if (i, j) in completed_pairs:
+            if i == j or (i, j) in completed_pairs:
                 continue
             pair_done = len(completed_pairs) + 1
             _progress(
@@ -549,14 +788,15 @@ def _llm_probability_matrix(
                 f"(indices {j}->{i})"
             )
             first_prompt = _build_first_prompt(
+                backend=backend,
+                pattern=pattern,
                 dataset_name=dataset_name,
                 labels=labels,
                 i=i,
                 j=j,
-                pattern=pattern,
-                pc_adj_signed=pc_adj_signed,
-                pc_directed_prob=pc_directed_prob,
-                pc_undirected_prob=pc_undirected_prob,
+                adjacency_matrix=adjacency_matrix,
+                primary_prob=primary_prob,
+                secondary_prob=secondary_prob,
                 anonymized=anonymized,
             )
             if current_pair is not None and int(current_pair.get("effect_idx", -1)) == i and int(current_pair.get("cause_idx", -1)) == j:
@@ -612,9 +852,7 @@ def _llm_probability_matrix(
             sample_logs = [dict(sample) for sample in pair_state.get("samples", [])]
             probs = [float(sample.get("prob_yes", 0.0)) for sample in sample_logs]
             for trial in range(len(sample_logs), max(1, num_samples)):
-                _progress(
-                    f"pair {pair_done}/{total_pairs}: second-stage sample {trial + 1}/{max(1, num_samples)}"
-                )
+                _progress(f"pair {pair_done}/{total_pairs}: second-stage sample {trial + 1}/{max(1, num_samples)}")
                 second_result = _chat_text_completion(
                     provider=provider,
                     client=client,
@@ -682,18 +920,31 @@ def _probability_to_pk(probability: np.ndarray) -> np.ndarray:
         for j in range(n):
             if i == j:
                 pk[i, j] = -1
+            elif probability[i, j] < 0.05:
+                pk[i, j] = 0
+            elif probability[i, j] > 0.95:
+                pk[i, j] = 1
             else:
-                if probability[i, j] < 0.05:
-                    pk[i, j] = 0
-                elif probability[i, j] > 0.95:
-                    pk[i, j] = 1
-                else:
-                    pk[i, j] = -1
+                pk[i, j] = -1
     return pk
 
 
-def _pk_to_background_knowledge(pk_matrix: np.ndarray, df: Any) -> Any:
-    pc, BackgroundKnowledge = _require_causallearn()
+def _probability_to_super_structure(probability: np.ndarray) -> np.ndarray:
+    super_graph = np.empty(probability.shape, dtype=int)
+    n = probability.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                super_graph[i, j] = 0
+            elif probability[i, j] < 0.05:
+                super_graph[i, j] = 0
+            else:
+                super_graph[i, j] = 1
+    return super_graph
+
+
+def _pk_to_background_knowledge(pk_matrix: np.ndarray, df: pd.DataFrame) -> Any:
+    pc, _bic_exact_search, BackgroundKnowledge = _require_causallearn()
     cg = pc(df.to_numpy(), independence_test_method="fisherz", verbose=False, show_progress=False)
     nodes = cg.G.get_nodes()
     bk = BackgroundKnowledge()
@@ -707,8 +958,8 @@ def _pk_to_background_knowledge(pk_matrix: np.ndarray, df: Any) -> Any:
     return bk
 
 
-def _run_pc_with_background_knowledge(df: Any, pk_matrix: Optional[np.ndarray]) -> np.ndarray:
-    pc, _BackgroundKnowledge = _require_causallearn()
+def _run_pc_with_background_knowledge(df: pd.DataFrame, pk_matrix: Optional[np.ndarray]) -> np.ndarray:
+    pc, _bic_exact_search, _BackgroundKnowledge = _require_causallearn()
     kwargs: dict[str, Any] = {
         "independence_test_method": "fisherz",
         "verbose": False,
@@ -720,13 +971,55 @@ def _run_pc_with_background_knowledge(df: Any, pk_matrix: Optional[np.ndarray]) 
     return _pc_signed_adjacency(cg)
 
 
+def _binary_prediction_from_effect_by_cause(effect_by_cause: np.ndarray) -> np.ndarray:
+    return (np.asarray(effect_by_cause) != 0).astype(int).T
+
+
 def _directed_prediction_from_pc_signed(pc_signed: np.ndarray) -> np.ndarray:
-    return (pc_signed == 1).astype(int).T
+    return (np.asarray(pc_signed) == 1).astype(int).T
+
+
+def _run_backend_with_prior(
+    *,
+    backend: str,
+    pattern: int,
+    std_df: pd.DataFrame,
+    probability_matrix: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if backend == "pc":
+        pk_matrix = _probability_to_pk(probability_matrix)
+        constrained_pc_signed = _run_pc_with_background_knowledge(std_df, pk_matrix=pk_matrix)
+        prediction = _directed_prediction_from_pc_signed(constrained_pc_signed)
+        return prediction, pk_matrix
+
+    if backend == "exact_search":
+        super_graph = _probability_to_super_structure(probability_matrix)
+        dag_est = _run_exact_search(std_df, super_graph=super_graph)
+        prediction = _binary_prediction_from_effect_by_cause(dag_est)
+        return prediction, super_graph
+
+    if backend == "direct_lingam":
+        pk_matrix = _probability_to_pk(probability_matrix)
+        prior_knowledge = probability_matrix if pattern == 4 else pk_matrix
+        try:
+            adjacency = _run_direct_lingam(std_df, prior_knowledge=prior_knowledge)
+        except Exception:
+            if pattern != 4:
+                raise
+            _progress("DirectLiNGAM rejected raw pattern-4 prior matrix; falling back to thresholded prior knowledge")
+            adjacency = _run_direct_lingam(std_df, prior_knowledge=pk_matrix)
+            prior_knowledge = pk_matrix
+        prediction = _binary_prediction_from_effect_by_cause(adjacency)
+        return prediction, np.asarray(prior_knowledge)
+
+    raise SystemExit(f"Unsupported backend in constrained run: {backend}")
 
 
 def _write_prediction_csv(
     *,
     out_csv: Path,
+    backend: str,
+    pattern: int,
     model_name: str,
     provider: str,
     naming_regime: str,
@@ -735,7 +1028,7 @@ def _write_prediction_csv(
     prediction: np.ndarray,
     transcript: list[dict[str, Any]],
     probability_matrix: np.ndarray,
-    pk_matrix: np.ndarray,
+    prior_matrix: np.ndarray,
 ) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
@@ -743,6 +1036,8 @@ def _write_prediction_csv(
             handle,
             fieldnames=[
                 "method",
+                "backend",
+                "pattern",
                 "model",
                 "provider",
                 "naming_regime",
@@ -758,6 +1053,8 @@ def _write_prediction_csv(
         writer.writerow(
             {
                 "method": "TakayamaSCP",
+                "backend": backend,
+                "pattern": pattern,
                 "model": model_name,
                 "provider": provider,
                 "naming_regime": naming_regime,
@@ -765,8 +1062,10 @@ def _write_prediction_csv(
                 "int_n": 0,
                 "raw_response": json.dumps(
                     {
+                        "backend": backend,
+                        "pattern": pattern,
                         "probability_matrix_effect_by_cause": probability_matrix.tolist(),
-                        "pk_matrix_effect_by_cause": pk_matrix.tolist(),
+                        "prior_matrix_effect_by_cause": np.asarray(prior_matrix).tolist(),
                         "transcript": transcript,
                     },
                     ensure_ascii=False,
@@ -778,21 +1077,27 @@ def _write_prediction_csv(
         )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Faithful PC-based Takayama SCP baseline runner.")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Takayama SCP runner with PC, Exact Search, and DirectLiNGAM backends.")
     parser.add_argument("--graph_files", type=str, nargs="+", required=True)
     parser.add_argument("--sample_size_obs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--model", type=str, default="gpt-4.1-mini")
+    parser.add_argument("--model", type=str, default="gpt-5-mini")
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--bootstrap_samples", type=int, default=100)
+    parser.add_argument("--backend", choices=sorted(TAKAYAMA_BACKENDS), default="pc")
     parser.add_argument("--takayama_pattern", type=int, default=2)
     parser.add_argument("--naming_regime", choices=["real", "anonymized"], default="real")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    backend = _normalize_backend(args.backend)
 
     provider = args.provider
     if provider == "auto":
@@ -810,16 +1115,32 @@ def main() -> int:
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
         _progress(
-            f"start graph={graph_path.stem}, provider={provider}, model={args.model}, "
+            f"start graph={graph_path.stem}, backend={backend}, provider={provider}, model={args.model}, "
             f"obs={args.sample_size_obs}, pattern={args.takayama_pattern}, naming={args.naming_regime}"
         )
         _progress("loading observational dataframe")
-        df, var_names, answer = _load_observational_dataframe(graph_path, args.sample_size_obs, args.seed)
-        _progress(f"loaded dataframe: rows={df.shape[0]}, cols={df.shape[1]}")
-        _progress("running unconstrained PC")
-        pc_signed = _run_pc_with_background_knowledge(df, pk_matrix=None)
-        _progress("unconstrained PC done")
-        directed_prob, undirected_prob = _bootstrap_pc_probabilities(df, args.bootstrap_samples)
+        _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, args.seed)
+        _progress(f"loaded dataframe: rows={std_df.shape[0]}, cols={std_df.shape[1]}")
+
+        if backend == "pc":
+            _progress("running unconstrained PC")
+            adjacency_matrix = _run_pc_with_background_knowledge(std_df, pk_matrix=None)
+            _progress("unconstrained PC done")
+            primary_prob, secondary_prob = _bootstrap_pc_probabilities(std_df, args.bootstrap_samples)
+        elif backend == "exact_search":
+            _progress("running unconstrained Exact Search")
+            adjacency_matrix = _run_exact_search(std_df, super_graph=None)
+            _progress("unconstrained Exact Search done")
+            primary_prob = _bootstrap_exact_search_probabilities(std_df, args.bootstrap_samples)
+            secondary_prob = None
+        elif backend == "direct_lingam":
+            _progress("running unconstrained DirectLiNGAM")
+            adjacency_matrix = _run_direct_lingam(std_df, prior_knowledge=None)
+            _progress("unconstrained DirectLiNGAM done")
+            primary_prob = _bootstrap_direct_lingam_probabilities(std_df, args.bootstrap_samples)
+            secondary_prob = None
+        else:
+            raise SystemExit(f"Unsupported backend: {backend}")
 
         if args.naming_regime == "anonymized":
             labels = [f"X{i+1}" for i in range(len(var_names))]
@@ -828,11 +1149,12 @@ def main() -> int:
 
         naming_suffix = "_anon" if args.naming_regime == "anonymized" else ""
         out_csv = Path(args.out_dir) / graph_path.stem / (
-            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{naming_suffix}.csv"
+            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{_backend_suffix(backend)}_p{int(args.takayama_pattern)}{naming_suffix}.csv"
         )
         checkpoint_path = _checkpoint_path_for_output(out_csv)
         run_signature = _build_run_signature(
             graph_path=graph_path,
+            backend=backend,
             model_name=args.model,
             provider=provider,
             labels=labels,
@@ -848,12 +1170,13 @@ def main() -> int:
             provider=provider,
             client=client,
             model_name=args.model,
+            backend=backend,
             labels=labels,
             dataset_name=graph_path.stem,
             pattern=args.takayama_pattern,
-            pc_adj_signed=pc_signed,
-            pc_directed_prob=directed_prob,
-            pc_undirected_prob=undirected_prob,
+            adjacency_matrix=np.asarray(adjacency_matrix),
+            primary_prob=(np.asarray(primary_prob) if primary_prob is not None else None),
+            secondary_prob=(np.asarray(secondary_prob) if secondary_prob is not None else None),
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
             num_samples=args.num_samples,
@@ -861,15 +1184,18 @@ def main() -> int:
             checkpoint_path=checkpoint_path,
             run_signature=run_signature,
         )
-        _progress("converting probabilities to prior-knowledge matrix")
-        pk_matrix = _probability_to_pk(probability_matrix)
-        _progress("running constrained PC with prior knowledge")
-        constrained_pc_signed = _run_pc_with_background_knowledge(df, pk_matrix=pk_matrix)
-        prediction = _directed_prediction_from_pc_signed(constrained_pc_signed)
-        _progress("constrained PC done; writing output csv")
-
+        _progress("running constrained backend with derived prior")
+        prediction, prior_matrix = _run_backend_with_prior(
+            backend=backend,
+            pattern=args.takayama_pattern,
+            std_df=std_df,
+            probability_matrix=probability_matrix,
+        )
+        _progress("constrained backend done; writing output csv")
         _write_prediction_csv(
             out_csv=out_csv,
+            backend=backend,
+            pattern=args.takayama_pattern,
             model_name=args.model,
             provider=provider,
             naming_regime=args.naming_regime,
@@ -878,7 +1204,7 @@ def main() -> int:
             prediction=prediction,
             transcript=transcript,
             probability_matrix=probability_matrix,
-            pk_matrix=pk_matrix,
+            prior_matrix=prior_matrix,
         )
         checkpoint_path.unlink(missing_ok=True)
         _progress(f"wrote {out_csv.resolve()}")
