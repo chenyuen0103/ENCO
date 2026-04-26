@@ -70,7 +70,7 @@ Next:
   python -m unittest tests.test_benchmark_spec tests.test_paper_slices
 
   # Recommended first benchmark run:
-  python scripts/run_paper_slice.py --manifest paper_slices/sachs_main.json --dry-run
+  python scripts/run_paper_slice.py --config paper_slices/sachs_main.json --dry-run
 
   # Legacy experiment pipeline (still supported):
   python experiments/run_experiment1_pipeline.py --dry-run \\

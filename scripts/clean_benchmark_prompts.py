@@ -14,8 +14,8 @@ from benchmark_builder.runner import load_runner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Delete prompt files produced for a benchmark manifest.")
-    parser.add_argument("--manifest", required=True, help="Benchmark manifest path or registry name.")
+    parser = argparse.ArgumentParser(description="Delete prompt files produced for a benchmark config.")
+    parser.add_argument("--config", required=True, help="Benchmark config path or registry name.")
     parser.add_argument(
         "--example-prompts",
         action="store_true",
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    runner = load_runner(args.manifest)
+    runner = load_runner(args.config)
     targets = collect_prompt_cleanup_targets(
         spec=runner.spec,
         repo_root=runner.repo_root,

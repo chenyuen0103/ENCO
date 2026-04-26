@@ -1,7 +1,7 @@
 # Reference Suite Card
 
 ## Intended Claims
-- The framework can express a reusable causal-discovery benchmark family over multiple real graphs with one manifest.
+- The framework can express a reusable causal-discovery benchmark family over multiple real graphs with one config.
 - Prompt representation, naming regime, and intervention budget can change empirical conclusions.
 - Matched classical baselines and LLM runs can be audited under one evaluator and provenance contract.
 

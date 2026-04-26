@@ -1,17 +1,17 @@
 # Benchmark Authoring Tutorial
 
-This repository now treats benchmark authoring as a manifest-driven workflow.
+This repository now treats benchmark authoring as a config-driven workflow.
 
 ## Goal
 
 Define a new LLM causal-discovery benchmark without editing evaluator or model code.
 
-## Example Manifest
+## Example Config
 
 Use [`benchmark_specs/authoring_demo.json`](../../benchmark_specs/authoring_demo.json) as the reference example. It mixes:
 
 - one public real graph: `asia`
-- one synthetic graph materialized from manifest parameters
+- one synthetic graph materialized from config parameters
 - two prompt families: `summary_joint` and `matrix`
 - both observational and intervention-bearing benchmark cells
 - one contamination control: anonymization
@@ -23,25 +23,25 @@ Use [`benchmark_specs/authoring_demo.json`](../../benchmark_specs/authoring_demo
 Build only:
 
 ```bash
-scripts/build-benchmark --manifest benchmark_specs/authoring_demo.json
+scripts/build-benchmark --config benchmark_specs/authoring_demo.json
 ```
 
 Run the full workflow:
 
 ```bash
-scripts/run-benchmark --manifest benchmark_specs/authoring_demo.json
+scripts/run-benchmark --config benchmark_specs/authoring_demo.json
 ```
 
 Summarize completed runs:
 
 ```bash
-scripts/summarize-benchmark --manifest benchmark_specs/authoring_demo.json
+scripts/summarize-benchmark --config benchmark_specs/authoring_demo.json
 ```
 
 Clean up prompt files after a run:
 
 ```bash
-scripts/clean-benchmark-prompts --manifest benchmark_specs/authoring_demo.json --yes
+scripts/clean-benchmark-prompts --config benchmark_specs/authoring_demo.json --yes
 ```
 
 If you also kept one example prompt per configuration in in-memory mode, add `--example-prompts`.
@@ -54,13 +54,13 @@ If you also kept one example prompt per configuration in in-memory mode, add `--
 - `benchmark_runs/authoring_demo/consensus_summary.csv`
 - `benchmark_runs/authoring_demo/contamination_audit.csv`
 
-Because this manifest uses in-memory prompting, the full prompt CSVs are not written to disk. Instead:
+Because this config uses in-memory prompting, the full prompt CSVs are not written to disk. Instead:
 
 - prompts are generated lazily, sent to the model, and discarded
 - one example prompt per configuration is kept for debugging
 - response CSVs remain the stable evaluation artifact
 
-## Required Manifest Fields
+## Required Config Fields
 
 - benchmark identity: `name`, `role`, `description`, `task_family`
 - dataset definitions: `datasets[]`
@@ -89,7 +89,7 @@ Because this manifest uses in-memory prompting, the full prompt CSVs are not wri
 
 ## Execution Policy
 
-Set this in the manifest:
+Set this in the config:
 
 ```json
 "execution": {

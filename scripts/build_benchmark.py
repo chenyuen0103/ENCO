@@ -13,15 +13,15 @@ from benchmark_builder.runner import load_runner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build prompts and prompt-bundle metadata for a benchmark manifest.")
-    parser.add_argument("--manifest", required=True, help="Benchmark manifest path or registry name.")
+    parser = argparse.ArgumentParser(description="Build prompts and prompt-bundle metadata for a benchmark config.")
+    parser.add_argument("--config", required=True, help="Benchmark config path or registry name.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    runner = load_runner(args.manifest)
+    runner = load_runner(args.config)
     runner.build(dry_run=args.dry_run)
     return 0
 

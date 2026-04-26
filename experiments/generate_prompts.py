@@ -2154,6 +2154,8 @@ def main():
     if args.anonymize: tags.append("anon")
     if getattr(args, "causal_rules", False): tags.append("rules")
     if getattr(args, "give_steps", False): tags.append("steps")
+    if args.reasoning_guidance != "staged":
+        tags.append(f"reason{args.reasoning_guidance}")
     if resolved_wrapper_mode != "plain":
         tags.append(f"wrap{resolved_wrapper_mode}")
     if args.append_format_hint:

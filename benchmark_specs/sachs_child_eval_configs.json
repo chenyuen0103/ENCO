@@ -1,0 +1,69 @@
+{
+  "name": "sachs_child_eval_configs",
+  "role": "eval",
+  "description": "Sachs and Child benchmark using the current eval_configs.json prompt combinations.",
+  "task_family": "llm_causal_discovery",
+  "datasets": [
+    {
+      "name": "sachs",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/sachs.bif",
+      "benchmark_card": "benchmark_cards/sachs_reference.md",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "11_vars"]
+    },
+    {
+      "name": "child",
+      "graph_source": "bif",
+      "graph_path": "causal_graphs/real_data/small_graphs/child.bif",
+      "benchmark_card": "benchmark_cards/child_reference.md",
+      "role": "main",
+      "tags": ["real_graph", "interventional", "20_vars"]
+    }
+  ],
+  "num_prompts": 5,
+  "seed": 42,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {"style": "summary", "obs_per_prompt": 0, "int_per_combo": 0, "row_order": "random", "col_order": "random", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 5000, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 5000, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 5000, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 5000, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 5000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 5000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 5000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 5000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 0, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 0, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 0, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 0, "int_per_combo": 200, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 1000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "summary", "obs_per_prompt": 1000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 1000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": false, "reasoning_guidance": "concise"},
+    {"style": "matrix", "obs_per_prompt": 1000, "int_per_combo": 0, "row_order": "random", "col_order": "original", "anonymize": true, "reasoning_guidance": "concise"}
+  ],
+  "names_only": {
+    "enabled": false
+  },
+  "models": [
+    {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api", "enabled": true}
+  ],
+  "baselines": [
+    {"name": "PC", "enabled": true, "scope": "observational", "library": "pgmpy", "pc_variant": "stable", "pc_ci_test": "chi_square", "pc_significance_level": 0.01, "pc_max_cond_vars": 5},
+    {"name": "GES", "enabled": true, "scope": "observational", "library": "pgmpy", "ges_scoring_method": "bic-d", "ges_min_improvement": 1e-6},
+    {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
+  ],
+  "evaluator": {
+    "tau": 0.7,
+    "pred_col": "prediction"
+  },
+  "provenance": {
+    "schema_version": "benchmark_spec/v1",
+    "parser_version": "query_api.extract_adjacency",
+    "evaluator_version": "evaluate.py",
+    "tags": ["sachs_child", "eval_configs", "concise_guidance"]
+  },
+  "benchmark_card": "benchmark_cards/reference_suite.md",
+  "notes": "Prompt cells were copied from experiments/configs/eval_configs.json and translated from prompt_style to benchmark spec style."
+}

@@ -34,7 +34,7 @@ class TestBenchmarkSpec(unittest.TestCase):
             ["PC", "GES", "ENCO", "CausalLLMPrompt", "JiralerspongBFS", "TakayamaSCP"],
         )
 
-    def test_registry_resolves_named_manifest(self) -> None:
+    def test_registry_resolves_named_config(self) -> None:
         registry = BenchmarkRegistry()
         path = registry.resolve("authoring_demo")
         self.assertTrue(str(path).endswith("benchmark_specs/authoring_demo.json"))
@@ -56,7 +56,7 @@ class TestBenchmarkSpec(unittest.TestCase):
         )
         self.assertEqual(
             _prompt_base_name(cell=cell, num_prompts=spec.num_prompts, shuffles_per_graph=spec.shuffles_per_graph),
-            "prompts_obs100_int0_shuf1_p5_summary",
+            "prompts_obs100_int0_shuf1_p5_reasonconcise_summary",
         )
 
     def test_external_llm_adapters_bind_to_expected_configs(self) -> None:

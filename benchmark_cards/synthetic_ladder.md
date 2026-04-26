@@ -1,7 +1,7 @@
 # Synthetic Ladder Card
 
 ## Intended Claims
-- The framework can materialize new graphs from manifests rather than only consuming fixed BIF files.
+- The framework can materialize new graphs from configs rather than only consuming fixed BIF files.
 - Synthetic scale and density can be controlled systematically for appendix studies.
 
 ## Unsupported Claims

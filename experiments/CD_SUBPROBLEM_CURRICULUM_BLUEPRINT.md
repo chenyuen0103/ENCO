@@ -17,7 +17,7 @@ The goal is not to replace the existing `causal_discovery` task immediately. The
 
 The current code already supports:
 
-- staged curricula via `experiments/pipelines/run_cd_curriculum.py`
+- staged curricula via `scripts/run_cd_curriculum.py`
 - one subproblem task via `cd_descendants`
 - causal-discovery prompts based on the same summary/matrix evidence later used for full graph prediction
 - GRPO reward plumbing by task
@@ -328,7 +328,7 @@ These are the minimal code changes to support the above.
 
 File:
 
-- `experiments/pipelines/run_cd_curriculum.py`
+- `scripts/run_cd_curriculum.py`
 
 Change:
 
@@ -401,7 +401,7 @@ Do these in this order.
 2. `cd_edge_exists`
 3. `cd_edge_orientation`
 4. `cd_vstructures`
-5. mixed curriculum manifest
+5. mixed curriculum config
 
 Reason:
 
@@ -414,7 +414,7 @@ Reason:
 With current code, the usable transfer curriculum is:
 
 1. existing `cd_descendants` stages from `experiments/cd_descendants_sachs_train.json`
-2. hand off the promoted checkpoint into a `causal_discovery` manifest using the existing summary-joint DAG data
+2. hand off the promoted checkpoint into a `causal_discovery` config using the existing summary-joint DAG data
 
 That is weaker than the full plan above, but it already moves training from:
 
@@ -425,9 +425,9 @@ to:
 - intervention semantics first
 - full graph second
 
-## Example Future Manifest Shape
+## Example Future Config Shape
 
-This is the manifest shape to use once the new tasks are implemented.
+This is the config shape to use once the new tasks are implemented.
 
 ```json
 {

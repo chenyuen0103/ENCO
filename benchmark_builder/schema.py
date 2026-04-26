@@ -10,7 +10,7 @@ SCHEMA_VERSION = "benchmark_spec/v1"
 
 
 class BenchmarkSpecError(ValueError):
-    """Raised when a benchmark manifest is invalid."""
+    """Raised when a benchmark config is invalid."""
 
 
 @dataclass
@@ -31,6 +31,7 @@ class PromptCellSpec:
     obs_per_prompt: int
     int_per_combo: int
     anonymize: bool = False
+    reasoning_guidance: str = "staged"
     row_order: str = "random"
     col_order: str = "original"
     causal_rules: bool = False
@@ -152,7 +153,7 @@ def _normalize_dataset_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
     dataset_name = raw.get("dataset")
     bif_file = raw.get("bif_file")
     graph_file = raw.get("graph_file") or bif_file
-    _expect(bool(dataset_name) and bool(graph_file), "Legacy manifests require `dataset` and `bif_file`.")
+    _expect(bool(dataset_name) and bool(graph_file), "Legacy configs require `dataset` and `bif_file`.")
     return [
         {
             "name": dataset_name,
@@ -243,11 +244,17 @@ def _build_prompt_cell(item: dict[str, Any]) -> PromptCellSpec:
     if style in {"summary_joint", "summary_join"}:
         style = "summary"
     _expect(style in {"summary", "matrix"}, "Supported prompt styles are `summary` and `matrix`.")
+    reasoning_guidance = item.get("reasoning_guidance", "staged")
+    _expect(
+        reasoning_guidance in {"staged", "concise", "none"},
+        "Supported reasoning guidance values are `staged`, `concise`, and `none`.",
+    )
     return PromptCellSpec(
         style=style,
         obs_per_prompt=int(item["obs_per_prompt"]),
         int_per_combo=int(item["int_per_combo"]),
         anonymize=bool(item.get("anonymize", False)),
+        reasoning_guidance=reasoning_guidance,
         row_order=item.get("row_order", "random"),
         col_order=item.get("col_order", "original"),
         causal_rules=bool(item.get("causal_rules", False)),
@@ -302,8 +309,8 @@ def _build_baseline(item: dict[str, Any]) -> BaselineSpec:
 
 
 def load_benchmark_spec(path: str | Path) -> BenchmarkSpec:
-    manifest_path = Path(path)
-    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    config_path = Path(path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
     datasets = [_build_dataset(item) for item in _normalize_dataset_items(raw)]
     prompt_cells = [_build_prompt_cell(item) for item in _normalize_prompt_cells(raw)]
     models = [_build_model(item) for item in _normalize_models(raw)]
@@ -312,11 +319,11 @@ def load_benchmark_spec(path: str | Path) -> BenchmarkSpec:
     evaluator_raw = raw.get("evaluator", {})
     provenance_raw = raw.get("provenance", {})
 
-    _expect(bool(raw.get("name")), "Manifest requires `name`.")
-    _expect(bool(raw.get("role")), "Manifest requires `role`.")
-    _expect(bool(datasets), "Manifest must define at least one dataset.")
-    _expect(bool(prompt_cells) or names_only.enabled, "Manifest must define prompt cells or enable names-only.")
-    _expect(bool(models), "Manifest must define at least one model.")
+    _expect(bool(raw.get("name")), "Config requires `name`.")
+    _expect(bool(raw.get("role")), "Config requires `role`.")
+    _expect(bool(datasets), "Config must define at least one dataset.")
+    _expect(bool(prompt_cells) or names_only.enabled, "Config must define prompt cells or enable names-only.")
+    _expect(bool(models), "Config must define at least one model.")
 
     spec = BenchmarkSpec(
         name=raw["name"],

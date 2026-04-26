@@ -62,8 +62,8 @@ class ResponseMeta:
 
 
 def _repo_paths() -> tuple[Path, Path]:
-    experiments_dir = Path(__file__).resolve().parents[1]
-    repo_root = experiments_dir.parent
+    repo_root = Path(__file__).resolve().parents[1]
+    experiments_dir = repo_root / "experiments"
     return repo_root, experiments_dir
 
 
@@ -435,7 +435,7 @@ def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any
 def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
     cmd = [
         sys.executable,
-        "eval_cd_configs.py",
+        str(experiments_dir.parent / "scripts" / "eval_cd_configs.py"),
         "--bif-file",
         args.bif_file,
         "--num-prompts",
@@ -924,7 +924,7 @@ def main() -> None:
     ap.add_argument(
         "--example-prompt-dir",
         default=None,
-        help="(In in-memory mode) Directory to write example prompts (passed to eval_cd_configs.py).",
+        help="(In in-memory mode) Directory to write example prompts (passed to scripts/eval_cd_configs.py).",
     )
     ap.add_argument(
         "--overwrite-example-prompt",
@@ -937,7 +937,7 @@ def main() -> None:
         default="run,evaluate,analyze",
         help=(
             "Comma-separated subset of steps to execute: run,evaluate,analyze. "
-            "The 'run' step generates prompts and queries models in-memory via eval_cd_configs.py. "
+            "The 'run' step generates prompts and queries models in-memory via scripts/eval_cd_configs.py. "
             "The deprecated alias 'generate' is treated as 'run' for backward compatibility."
         ),
     )

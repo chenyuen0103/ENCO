@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate frozen paper slice manifests."""
+"""Validate frozen paper slice configs."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ SLICES_DIR = REPO_ROOT / "paper_slices"
 
 
 class TestPaperSlices(unittest.TestCase):
-    def test_manifests_load(self) -> None:
-        manifests = sorted(SLICES_DIR.glob("*.json"))
-        self.assertGreaterEqual(len(manifests), 3)
-        for path in manifests:
+    def test_configs_load(self) -> None:
+        configs = sorted(SLICES_DIR.glob("*.json"))
+        self.assertGreaterEqual(len(configs), 3)
+        for path in configs:
             spec = load_benchmark_spec(path)
             self.assertTrue(spec.name)
             self.assertEqual(len(spec.datasets), 1)
@@ -47,7 +47,7 @@ class TestPaperSlices(unittest.TestCase):
         self.assertEqual(scope_by_name["ENCO"], "interventional")
         self.assertEqual(scope_by_name["TakayamaSCP"], "observational")
 
-    def test_cancer_manifests_are_smoke_only(self) -> None:
+    def test_cancer_configs_are_smoke_only(self) -> None:
         for name in ["cancer_smoke_summary.json", "cancer_smoke_names_only.json"]:
             spec = load_benchmark_spec(SLICES_DIR / name)
             self.assertEqual(spec.datasets[0].name, "cancer")

@@ -19,18 +19,18 @@ REFINE_LOGS = REPO_ROOT / "refine-logs"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one frozen paper slice via the benchmark runner.")
-    parser.add_argument("--manifest", required=True, help="Path to a paper_slices/*.json file.")
+    parser.add_argument("--config", required=True, help="Path to a paper_slices/*.json file.")
     parser.add_argument("--overwrite", action="store_true", help="Re-query model outputs if they already exist.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     return parser.parse_args()
 
 
-def _write_handoff(manifest: str, outputs: dict[str, Path]) -> None:
+def _write_handoff(config: str, outputs: dict[str, Path]) -> None:
     REFINE_LOGS.mkdir(parents=True, exist_ok=True)
     summary_lines = [
-        f"# Latest Slice Summary: {manifest}",
+        f"# Latest Slice Summary: {config}",
         "",
-        "This slice was executed through the manifest-driven benchmark runner.",
+        "This slice was executed through the config-driven benchmark runner.",
         "",
         "## Produced Artifacts",
     ]
@@ -56,13 +56,13 @@ def _write_handoff(manifest: str, outputs: dict[str, Path]) -> None:
 
 def main() -> int:
     args = parse_args()
-    runner = load_runner(args.manifest)
+    runner = load_runner(args.config)
     runner.build(dry_run=args.dry_run)
     runner.run_models(dry_run=args.dry_run, overwrite=args.overwrite)
     runner.run_baselines(dry_run=args.dry_run)
     if not args.dry_run:
         outputs = runner.summarize()
-        _write_handoff(args.manifest, outputs)
+        _write_handoff(args.config, outputs)
         print(f"Wrote handoff files to {REFINE_LOGS / 'latest_slice_summary.md'} and {REFINE_LOGS / 'NEXT_SLICE.md'}")
     return 0
 

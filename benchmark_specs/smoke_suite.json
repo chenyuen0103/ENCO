@@ -30,24 +30,42 @@
   "seed": 42,
   "shuffles_per_graph": 1,
   "prompt_cells": [
-    {"style": "summary_joint", "obs_per_prompt": 100, "int_per_combo": 10, "anonymize": false}
+    {
+      "style": "summary",
+      "obs_per_prompt": 100,
+      "int_per_combo": 10,
+      "anonymize": false,
+      "reasoning_guidance": "concise"
+    }
   ],
   "names_only": {
     "enabled": true,
     "col_order": "original"
   },
   "models": [
-    {"name": "gpt-5-mini", "provider": "auto", "temperature": 0.0, "backend_version": "api"}
+    {
+      "name": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "backend_version": "api"
+    }
   ],
   "baselines": [
-    {"name": "ENCO", "enabled": true, "scope": "interventional", "library": "internal"}
+    {
+      "name": "ENCO",
+      "enabled": true,
+      "scope": "interventional",
+      "library": "internal"
+    }
   ],
   "evaluator": {
     "tau": 0.7
   },
   "provenance": {
     "schema_version": "benchmark_spec/v1",
-    "tags": ["smoke"]
+    "tags": [
+      "smoke"
+    ]
   },
   "benchmark_card": "benchmark_cards/smoke_suite.md",
   "notes": "Smoke-only suite. Do not cite as primary evidence."

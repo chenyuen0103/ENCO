@@ -14,7 +14,7 @@ from typing import Any, Optional
 import numpy as np
 import requests
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS_DIR = REPO_ROOT / "experiments"
 for _path in (REPO_ROOT, EXPERIMENTS_DIR):
     if str(_path) not in sys.path:
