@@ -1,7 +1,7 @@
 {
   "name": "sachs_takayama_screen",
   "role": "control",
-  "description": "Screen all nine Takayama SCP variants on Sachs real-name observational cells at obs=1000 and obs=5000, then select the best variant by mean score across the two cells.",
+  "description": "Canonical Sachs Takayama observational control at obs=1000 and obs=5000 using the paper-default PC pattern-2 setting.",
   "dataset": "sachs",
   "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
   "models": [
@@ -58,116 +58,12 @@
       "model": "gpt-4.1",
       "provider": "openai",
       "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "pc",
-      "takayama_pattern": 1,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama PC pattern 1 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
+      "num_samples": 1,
       "takayama_backend": "pc",
       "takayama_pattern": 2,
       "takayama_bootstrap_samples": 100,
-      "notes": "Takayama PC pattern 2 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "exact_search",
-      "takayama_pattern": 1,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama Exact Search pattern 1 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "exact_search",
-      "takayama_pattern": 2,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama Exact Search pattern 2 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "direct_lingam",
-      "takayama_pattern": 0,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama DirectLiNGAM pattern 0 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "direct_lingam",
-      "takayama_pattern": 1,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama DirectLiNGAM pattern 1 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "direct_lingam",
-      "takayama_pattern": 2,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama DirectLiNGAM pattern 2 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "direct_lingam",
-      "takayama_pattern": 3,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama DirectLiNGAM pattern 3 screening baseline."
-    },
-    {
-      "name": "TakayamaSCP",
-      "enabled": true,
-      "scope": "observational",
-      "model": "gpt-4.1",
-      "provider": "openai",
-      "temperature": 0.0,
-      "num_samples": 5,
-      "takayama_backend": "direct_lingam",
-      "takayama_pattern": 4,
-      "takayama_bootstrap_samples": 100,
-      "notes": "Takayama DirectLiNGAM pattern 4 screening baseline."
+      "notes": "Canonical observational-only combined-information PC-based Takayama baseline for Sachs."
     }
   ],
-  "notes": "Sachs-only Takayama variant screen at real-name observational cells (1000,0) and (5000,0). Use the resulting two-cell mean to choose one Takayama variant for the full paper run."
+  "notes": "Legacy screening slice path retained for convenience, but the slice now runs only the canonical Takayama PC pattern-2 configuration at Sachs observational cells (1000,0) and (5000,0)."
 }
