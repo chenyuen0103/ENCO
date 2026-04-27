@@ -312,6 +312,7 @@ def _call_model_messages(
             return f"[ERROR] ImportError: {exc}"
         try:
             client = OpenAI()
+            use_max_completion_tokens = "gpt-5" in model_name.lower()
             req: dict[str, Any] = {
                 "model": model_name,
                 "messages": messages,
@@ -321,7 +322,8 @@ def _call_model_messages(
                 "presence_penalty": 0,
             }
             if max_new_tokens is not None:
-                req["max_tokens"] = max_new_tokens
+                token_arg = "max_completion_tokens" if use_max_completion_tokens else "max_tokens"
+                req[token_arg] = max_new_tokens
             resp = client.chat.completions.create(**req)
             msg = getattr(resp.choices[0], "message", None)
             content = getattr(msg, "content", "") or ""
