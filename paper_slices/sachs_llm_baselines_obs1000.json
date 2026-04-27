@@ -1,0 +1,97 @@
+{
+  "name": "sachs_llm_baselines_obs1000",
+  "role": "control",
+  "description": "Minimal Sachs slice for the five LLM baseline families at obs=1000: one observational summary cell plus names_only, with legacy reuse enabled for CausalLLMData and CausalLLMPrompt.",
+  "dataset": "sachs",
+  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "models": [
+    {
+      "name": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "enabled": false,
+      "tags": [
+        "placeholder"
+      ]
+    }
+  ],
+  "seed": 42,
+  "num_prompts": 5,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all",
+      "label": "obs1000_real"
+    }
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "baselines": [
+    {
+      "name": "CausalLLMPrompt",
+      "enabled": true,
+      "scope": "all",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Semantic-only names-only one-shot full-DAG baseline."
+    },
+    {
+      "name": "CausalLLMData",
+      "enabled": true,
+      "scope": "all",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "One-shot summary-conditioned full-DAG baseline. Reuses matching legacy summary outputs when available."
+    },
+    {
+      "name": "JiralerspongBFS",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Observational-summary BFS-style querying baseline."
+    },
+    {
+      "name": "JiralerspongPairwise",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "notes": "Observational-summary pairwise edge-querying baseline."
+    },
+    {
+      "name": "TakayamaSCP",
+      "enabled": true,
+      "scope": "observational",
+      "model": "gpt-5-mini",
+      "provider": "auto",
+      "temperature": 0.0,
+      "num_samples": 1,
+      "takayama_backend": "pc",
+      "takayama_pattern": 2,
+      "takayama_bootstrap_samples": 100,
+      "notes": "Canonical observational-only PC-based Takayama baseline."
+    }
+  ],
+  "notes": "Minimal Sachs obs=1000 slice for the five LLM baseline families: names_only for CausalLLMPrompt, summary real (1000,0) for CausalLLMData/JiralerspongBFS/JiralerspongPairwise/TakayamaSCP. Skip logic reuses existing predictions_*.csv files and legacy responses_*.csv files for CausalLLMData/CausalLLMPrompt when available."
+}

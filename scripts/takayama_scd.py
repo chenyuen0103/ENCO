@@ -490,7 +490,30 @@ def _build_second_prompt(first_prompt: str, first_answer: str, *, src: str, dst:
     )
 
 
+def _yes_no_label_from_text(text: str) -> Optional[str]:
+    normalized = (text or "").strip().lower()
+    normalized = normalized.removeprefix("<").strip()
+    normalized = normalized.removesuffix(">").strip()
+    normalized = normalized.strip(" .,:;!?\"'")
+    if normalized.startswith("yes"):
+        return "yes"
+    if normalized.startswith("no"):
+        return "no"
+    return None
+
+
 def _extract_yes_no_prob(response: Any) -> tuple[float, float, str]:
+    text = ""
+    try:
+        text = response.choices[0].message.content or ""
+    except Exception:
+        pass
+    text_label = _yes_no_label_from_text(text)
+    if text_label == "yes":
+        return 1.0, 0.0, text
+    if text_label == "no":
+        return 0.0, 1.0, text
+
     try:
         content_items = response.choices[0].logprobs.content
     except Exception:
@@ -501,22 +524,12 @@ def _extract_yes_no_prob(response: Any) -> tuple[float, float, str]:
         first = content_items[0]
         for item in getattr(first, "top_logprobs", []) or []:
             tok = str(getattr(item, "token", "")).strip().lower()
+            tok = tok.removeprefix("<").removesuffix(">").strip(" .,:;!?\"'")
             lp = float(getattr(item, "logprob", float("-inf")))
             if tok == "yes":
                 prob_yes += math.exp(lp)
             elif tok == "no":
                 prob_no += math.exp(lp)
-    text = ""
-    try:
-        text = response.choices[0].message.content or ""
-    except Exception:
-        pass
-    if prob_yes == 0.0 and prob_no == 0.0:
-        low = text.strip().lower()
-        if low.startswith("<yes>") or low.startswith("yes"):
-            prob_yes = 1.0
-        elif low.startswith("<no>") or low.startswith("no"):
-            prob_no = 1.0
     return prob_yes, prob_no, text
 
 
@@ -641,10 +654,10 @@ def _chat_text_completion(
 
 
 def _extract_yes_no_prob_from_text(text: str) -> tuple[float, float]:
-    low = (text or "").strip().lower()
-    if low.startswith("<yes>") or low.startswith("yes"):
+    label = _yes_no_label_from_text(text)
+    if label == "yes":
         return 1.0, 0.0
-    if low.startswith("<no>") or low.startswith("no"):
+    if label == "no":
         return 0.0, 1.0
     return 0.0, 0.0
 
@@ -1104,6 +1117,77 @@ def _write_prediction_csv(
         )
 
 
+def _repair_probability_matrix_from_transcript(raw_response: dict[str, Any], n: int) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    probability_matrix = np.zeros((n, n), dtype=float)
+    repaired_transcript: list[dict[str, Any]] = []
+    for raw_entry in raw_response.get("transcript", []):
+        entry = dict(raw_entry)
+        i = int(entry["effect_idx"])
+        j = int(entry["cause_idx"])
+        if not (0 <= i < n and 0 <= j < n) or i == j:
+            continue
+        repaired_samples: list[dict[str, Any]] = []
+        probs: list[float] = []
+        for raw_sample in entry.get("samples", []):
+            sample = dict(raw_sample)
+            response_text = str(sample.get("response", ""))
+            prob_yes, prob_no = _extract_yes_no_prob_from_text(response_text)
+            if prob_yes == 0.0 and prob_no == 0.0:
+                prob_yes = float(sample.get("prob_yes", 0.0))
+                prob_no = float(sample.get("prob_no", 0.0))
+            sample["prob_yes"] = float(prob_yes)
+            sample["prob_no"] = float(prob_no)
+            repaired_samples.append(sample)
+            probs.append(float(prob_yes))
+        mean_prob = float(np.mean(probs)) if probs else float(entry.get("mean_prob_yes", 0.0))
+        entry["samples"] = repaired_samples
+        entry["mean_prob_yes"] = mean_prob
+        probability_matrix[i, j] = mean_prob
+        repaired_transcript.append(entry)
+    return probability_matrix, repaired_transcript
+
+
+def _repair_existing_csv(
+    *,
+    csv_path: Path,
+    backend: str,
+    pattern: int,
+    std_df: pd.DataFrame,
+    answer: np.ndarray,
+) -> None:
+    if not csv_path.exists():
+        raise SystemExit(f"Cannot repair missing CSV: {csv_path}")
+    csv.field_size_limit(10_000_000)
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != 1:
+        raise SystemExit(f"Expected exactly one row in Takayama CSV, found {len(rows)}: {csv_path}")
+    row = rows[0]
+    raw_response = json.loads(row.get("raw_response", "") or "{}")
+    n = int(answer.shape[0])
+    probability_matrix, transcript = _repair_probability_matrix_from_transcript(raw_response, n)
+    prediction, prior_matrix = _run_backend_with_prior(
+        backend=backend,
+        pattern=pattern,
+        std_df=std_df,
+        probability_matrix=probability_matrix,
+    )
+    _write_prediction_csv(
+        out_csv=csv_path,
+        backend=backend,
+        pattern=pattern,
+        model_name=row.get("model", ""),
+        provider=row.get("provider", ""),
+        naming_regime=row.get("naming_regime", "real"),
+        sample_size_obs=int(float(row.get("obs_n", 0) or 0)),
+        answer=answer,
+        prediction=prediction,
+        transcript=transcript,
+        probability_matrix=probability_matrix,
+        prior_matrix=prior_matrix,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Takayama SCP runner with PC, Exact Search, and DirectLiNGAM backends.")
     parser.add_argument("--graph_files", type=str, nargs="+", required=True)
@@ -1121,6 +1205,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=sorted(TAKAYAMA_BACKENDS), default="pc")
     parser.add_argument("--takayama_pattern", type=int, default=2)
     parser.add_argument("--naming_regime", choices=["real", "anonymized"], default="real")
+    parser.add_argument(
+        "--repair_existing_csv",
+        type=str,
+        default=None,
+        help="Repair a completed Takayama CSV from its saved transcript without making API calls.",
+    )
     return parser.parse_args()
 
 
@@ -1134,17 +1224,19 @@ def main() -> int:
     )
 
     provider = args.provider
-    if provider == "auto":
-        if "gpt" in args.model.lower() or "o3-" in args.model.lower() or "o1-" in args.model.lower():
-            provider = "openai"
+    client = None
+    if not args.repair_existing_csv:
+        if provider == "auto":
+            if "gpt" in args.model.lower() or "o3-" in args.model.lower() or "o1-" in args.model.lower():
+                provider = "openai"
+            else:
+                provider = "illinois"
+        if provider == "openai":
+            client = _require_openai()
+        elif provider == "illinois":
+            client = _require_illinois()
         else:
-            provider = "illinois"
-    if provider == "openai":
-        client = _require_openai()
-    elif provider == "illinois":
-        client = _require_illinois()
-    else:
-        raise SystemExit("TakayamaSCP supports provider=openai or provider=illinois.")
+            raise SystemExit("TakayamaSCP supports provider=openai or provider=illinois.")
 
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
@@ -1156,6 +1248,18 @@ def main() -> int:
         _progress("loading observational dataframe")
         _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, args.seed)
         _progress(f"loaded dataframe: rows={std_df.shape[0]}, cols={std_df.shape[1]}")
+        if args.repair_existing_csv:
+            csv_path = Path(args.repair_existing_csv)
+            _progress(f"repairing existing CSV from saved transcript: {csv_path}")
+            _repair_existing_csv(
+                csv_path=csv_path,
+                backend=backend,
+                pattern=args.takayama_pattern,
+                std_df=std_df,
+                answer=answer,
+            )
+            _progress(f"repaired {csv_path.resolve()}")
+            continue
 
         if backend == "pc":
             _progress("running unconstrained PC")

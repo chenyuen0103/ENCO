@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,6 +28,133 @@ def _reuse_if_exists(path: Path, *, dry_run: bool) -> bool:
         print(f"[reuse] {path}")
         return True
     return False
+
+
+def _model_filename_tags(model_name: str) -> list[str]:
+    tags: list[str] = []
+    for raw in (model_name, model_name.split("/")[-1]):
+        tag = str(raw or "").strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _prompt_count_from_name(path: Path) -> int:
+    match = re.search(r"_p(\d+)_", path.name)
+    return int(match.group(1)) if match else 0
+
+
+def _find_legacy_external_baseline_csv(
+    *,
+    responses_dir: Path,
+    method_name: str,
+    model_name: str,
+    sample_size_obs: int,
+    sample_size_inters: int,
+) -> Path | None:
+    tags = _model_filename_tags(model_name)
+    candidates: list[Path] = []
+
+    if method_name == "CausalLLMData" and sample_size_inters == 0:
+        for tag in tags:
+            candidates.extend(sorted(responses_dir.glob(f"responses_obs{sample_size_obs}_int0_shuf1_p*_summary_joint_{tag}.csv")))
+            candidates.extend(sorted(responses_dir.glob(f"responses_obs{sample_size_obs}_int0_shuf1_p*_summary_{tag}.csv")))
+        if not candidates:
+            return None
+        candidates = sorted(
+            candidates,
+            key=lambda p: (
+                0 if "_summary_joint_" in p.name else 1,
+                -_prompt_count_from_name(p),
+                p.name,
+            ),
+        )
+        return candidates[0]
+
+    if method_name == "CausalLLMPrompt" and sample_size_obs == 0 and sample_size_inters == 0:
+        for tag in tags:
+            exact = responses_dir / f"responses_names_only_{tag}.csv"
+            if exact.exists():
+                candidates.append(exact)
+            candidates.extend(sorted(responses_dir.glob(f"responses_names_only_p*_{tag}.csv")))
+        if not candidates:
+            return None
+        candidates = sorted(
+            candidates,
+            key=lambda p: (
+                0 if "_p" not in p.stem else 1,
+                -_prompt_count_from_name(p),
+                p.name,
+            ),
+        )
+        return candidates[0]
+
+    return None
+
+
+def _materialize_legacy_external_baseline_copy(
+    *,
+    legacy_csv: Path,
+    out_csv: Path,
+    method_name: str,
+    model_name: str,
+    provider: str,
+    naming_regime: str,
+    sample_size_obs: int,
+    sample_size_inters: int,
+    dry_run: bool,
+) -> bool:
+    if dry_run:
+        print(f"[dry-run][reuse:legacy] {legacy_csv} -> {out_csv}")
+        return True
+
+    with legacy_csv.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+
+    if not rows:
+        return False
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "method",
+                "model",
+                "provider",
+                "naming_regime",
+                "obs_n",
+                "int_n",
+                "raw_response",
+                "answer",
+                "prediction",
+                "valid",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            valid_raw = row.get("valid", 1)
+            try:
+                valid = int(float(valid_raw))
+            except Exception:
+                valid = 1
+            writer.writerow(
+                {
+                    "method": method_name,
+                    "model": model_name,
+                    "provider": provider,
+                    "naming_regime": naming_regime,
+                    "obs_n": sample_size_obs,
+                    "int_n": sample_size_inters,
+                    "raw_response": row.get("raw_response", "") or "",
+                    "answer": row.get("answer", "") or "",
+                    "prediction": row.get("prediction", "") or "",
+                    "valid": valid,
+                }
+            )
+    print(f"[reuse:legacy] {legacy_csv} -> {out_csv}")
+    return True
 
 
 def _is_names_only_cell(cell: PromptCellSpec) -> bool:
@@ -209,6 +338,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             return False
         if self.method_name == "CausalLLMPrompt":
             return _is_names_only_cell(cell)
+        if self.method_name == "JiralerspongPairwise":
+            return cell.style == "summary" and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "JiralerspongBFS":
             return (not _is_names_only_cell(cell)) and cell.style == "summary" and cell.int_per_combo == 0 and cell.obs_per_prompt > 0
         if self.method_name == "TakayamaSCP":
@@ -218,7 +349,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         return False
 
     def _effective_sample_size_inters(self, baseline: BaselineSpec, cell: PromptCellSpec) -> int:
-        if self.method_name in {"TakayamaSCP", "JiralerspongBFS", "CausalLLMPrompt"}:
+        if self.method_name in {"TakayamaSCP", "JiralerspongBFS", "JiralerspongPairwise", "CausalLLMPrompt"}:
             return 0
         return baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
 
@@ -239,6 +370,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                     int(baseline.takayama_pattern),
                 )
             return (baseline.name, dataset.name, sample_size_obs, entry["naming_regime"], *extra)
+        if self.method_name == "JiralerspongPairwise":
+            return (baseline.name, dataset.name, entry["config_name"])
         if self.method_name == "CausalLLMPrompt":
             return (baseline.name, dataset.name, "names_only")
         return (baseline.name, dataset.name, entry["config_name"])
@@ -268,6 +401,30 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{takayama_suffix}{naming_suffix}.csv"
         )
         model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
+        if _reuse_if_exists(out_csv, dry_run=dry_run):
+            return out_csv
+
+        if self.method_name in {"CausalLLMData", "CausalLLMPrompt"}:
+            legacy_csv = _find_legacy_external_baseline_csv(
+                responses_dir=self.repo_root / "experiments" / "responses" / dataset.name,
+                method_name=self.method_name,
+                model_name=model_name,
+                sample_size_obs=sample_size_obs,
+                sample_size_inters=sample_size_inters,
+            )
+            if legacy_csv is not None and _materialize_legacy_external_baseline_copy(
+                legacy_csv=legacy_csv,
+                out_csv=out_csv,
+                method_name=self.method_name,
+                model_name=model_name,
+                provider=baseline.provider,
+                naming_regime=naming_regime,
+                sample_size_obs=sample_size_obs,
+                sample_size_inters=sample_size_inters,
+                dry_run=dry_run,
+            ):
+                return out_csv
+
         if self.method_name == "TakayamaSCP":
             cmd = [
                 PYTHON_EXE,
@@ -332,8 +489,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             ]
             if baseline.max_new_tokens is not None:
                 cmd.extend(["--max_new_tokens", str(baseline.max_new_tokens)])
-        if not _reuse_if_exists(out_csv, dry_run=dry_run):
-            _run(cmd, cwd=self.repo_root, dry_run=dry_run)
+        _run(cmd, cwd=self.repo_root, dry_run=dry_run)
         return out_csv
 
 
@@ -344,6 +500,7 @@ def build_baseline_adapters(repo_root: Path) -> dict[str, BaselineAdapter]:
         "GES": ClassicalBaselineAdapter(repo_root=repo_root, method_name="GES"),
         "TakayamaSCP": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="TakayamaSCP"),
         "JiralerspongBFS": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="JiralerspongBFS"),
+        "JiralerspongPairwise": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="JiralerspongPairwise"),
         "CausalLLMPrompt": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMPrompt"),
         "CausalLLMData": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMData"),
     }
