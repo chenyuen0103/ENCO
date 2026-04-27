@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import json
+import random
 import re
 import sys
 from collections import deque
@@ -50,7 +52,67 @@ except ModuleNotFoundError:
     )
 
 
-METHODS = {"TakayamaSCP", "JiralerspongBFS", "CausalLLMPrompt", "CausalLLMData"}
+METHODS = {"TakayamaSCP", "JiralerspongBFS", "JiralerspongPairwise", "CausalLLMPrompt", "CausalLLMData"}
+
+_PAIRWISE_INIT_PROMPTS: dict[str, dict[str, str]] = {
+    "neuropathic": {
+        "system": "You are an expert on neuropathic pain diagnosis.",
+        "user": "You are a helpful assistant to a neuropathic pain diagnosis expert.",
+    },
+    "asia": {
+        "system": "You are an expert on lung diseases.",
+        "user": "You are a helpful assistant to a lung disease expert.",
+    },
+    "child": {
+        "system": "You are an expert on children's diseases.",
+        "user": "You are a helpful assistant to a children's disease expert.",
+    },
+    "alarm": {
+        "system": "You are an expert on alarm systems for patient monitoring.",
+        "user": "You are a helpful assistant to an expert on alarm systems for patient monitoring.",
+    },
+    "insurance": {
+        "system": "You are an expert on car insurance risks.",
+        "user": "You are a helpful assistant to expert on car insurance risks.",
+    },
+    "sachs": {
+        "system": "You are an expert on intracellular protein signaling pathways.",
+        "user": "You are a helpful assistant to an expert on intracellular protein signaling pathways.",
+    },
+}
+
+_BFS_INIT_MESSAGES: dict[str, list[dict[str, str]]] = {
+    "asia": [
+        {"role": "system", "content": "You are an expert on lung diseases."},
+        {
+            "role": "user",
+            "content": "You are a helpful assistant to experts in lung diesease research. Our goal is to construct a causal graph between the following variables.\n",
+        },
+    ],
+    "child": [
+        {"role": "system", "content": "You are an expert on children's diseases."},
+        {
+            "role": "user",
+            "content": "You are a helpful assistant to experts in children's diesease research. Our goal is to construct a causal graph between the following variables.\n",
+        },
+    ],
+    "sachs": [
+        {"role": "system", "content": "You are an expert on intracellular protein signaling pathways."},
+        {
+            "role": "user",
+            "content": "You are a helpful assistant to experts in intracellular protein signaling research. Our goal is to construct a causal graph between the following variables.\n",
+        },
+    ],
+}
+
+_BFS_PROMPT_INIT = (
+    "Now you are going to use the data to construct a causal graph. "
+    "You will start with identifying the variable(s) that are unaffected by any other variables.\n"
+)
+_BFS_PROMPT_FORMAT = (
+    'Think step by step. Then, provide your final answer (variable names only) within the tags '
+    '<Answer>...</Answer>, seperated by ", ". '
+)
 
 
 def _resolve_provider(provider: str, model_name: str) -> str:
@@ -112,6 +174,35 @@ def _extract_name_list(text: str, *, key: str, allowed: list[str]) -> list[str]:
 
 def _empty_dag(n: int) -> np.ndarray:
     return np.zeros((n, n), dtype=int)
+
+
+def _load_observational_array(graph_path: Path, sample_size_obs: int, seed: int) -> tuple[np.ndarray, list[str]]:
+    if sample_size_obs <= 0:
+        raise ValueError("Observational pairwise prompting requires sample_size_obs > 0.")
+    graph = load_causal_graph(graph_path)
+    variables = [str(v.name) for v in graph.variables]
+    if hasattr(graph, "data_obs"):
+        arr = np.asarray(graph.data_obs)
+        if arr.shape[0] < sample_size_obs:
+            raise ValueError(
+                f"Requested sample_size_obs={sample_size_obs}, but dataset only exposes {arr.shape[0]} rows."
+            )
+        return np.asarray(arr[:sample_size_obs]), variables
+    if hasattr(graph, "sample"):
+        np.random.seed(seed)
+        return np.asarray(graph.sample(batch_size=sample_size_obs, as_array=True)), variables
+    raise ValueError("Graph object does not expose observational data or sampling.")
+
+
+def _load_variable_metadata(graph_path: Path) -> list[dict[str, str]]:
+    graph = load_causal_graph(graph_path)
+    out: list[dict[str, str]] = []
+    for var in graph.variables:
+        name = str(getattr(var, "name", ""))
+        symbol = str(getattr(var, "symbol", name) or name)
+        description = str(getattr(var, "description", name) or name)
+        out.append({"name": name, "symbol": symbol, "description": description})
+    return out
 
 
 def _would_create_cycle(adj: np.ndarray, src: int, dst: int) -> bool:
@@ -196,6 +287,57 @@ def _call_model(
     return "[ERROR] Unknown provider"
 
 
+def _render_messages_as_prompt(messages: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for item in messages:
+        role = str(item.get("role", "user")).capitalize()
+        content = str(item.get("content", ""))
+        lines.append(f"{role}: {content}")
+    return "\n\n".join(lines)
+
+
+def _call_model_messages(
+    *,
+    messages: list[dict[str, str]],
+    model_name: str,
+    provider: str,
+    temperature: float,
+    max_new_tokens: int | None,
+    hf_pipe: Any,
+) -> str:
+    if provider == "openai":
+        try:
+            from openai import OpenAI
+        except Exception as exc:
+            return f"[ERROR] ImportError: {exc}"
+        try:
+            client = OpenAI()
+            req: dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": 1,
+                "frequency_penalty": 0,
+                "presence_penalty": 0,
+            }
+            if max_new_tokens is not None:
+                req["max_tokens"] = max_new_tokens
+            resp = client.chat.completions.create(**req)
+            msg = getattr(resp.choices[0], "message", None)
+            content = getattr(msg, "content", "") or ""
+            return str(content)
+        except Exception as exc:
+            return f"[ERROR] {type(exc).__name__}: {exc}"
+    return _call_model(
+        prompt=_render_messages_as_prompt(messages),
+        model_name=model_name,
+        provider=provider,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        hf_pipe=hf_pipe,
+    )
+
+
 def _load_graph_context(graph_path: Path) -> tuple[Any, list[str], np.ndarray]:
     graph = load_causal_graph(graph_path)
     variables = [str(v.name) for v in graph.variables]
@@ -265,45 +407,149 @@ def _semantic_full_graph_prompt(prompt_text: str) -> str:
     )
 
 
-def _bfs_roots_prompt(*, dataset_name: str, remaining: list[str], context: str | None = None) -> str:
-    vars_text = ", ".join(remaining)
-    evidence_block = ""
-    if context:
-        evidence_block = (
-            "Use the following observational evidence summary when choosing likely roots:\n"
-            f"{context}\n\n"
-        )
+def _new_previous_edges() -> dict[str, dict[str, list[str]]]:
+    return {}
+
+
+def _add_node(previous_edges: dict[str, dict[str, list[str]]], node: str) -> None:
+    if node not in previous_edges:
+        previous_edges[node] = {"incoming": [], "outgoing": []}
+
+
+def _add_edge_pairwise(previous_edges: dict[str, dict[str, list[str]]], head: str, tail: str, choice: str) -> None:
+    _add_node(previous_edges, head)
+    _add_node(previous_edges, tail)
+    if choice == "A":
+        previous_edges[head]["outgoing"].append(tail)
+        previous_edges[tail]["incoming"].append(head)
+    elif choice == "B":
+        previous_edges[tail]["outgoing"].append(head)
+        previous_edges[head]["incoming"].append(tail)
+
+
+def _get_previous_relevant_edges_string(
+    previous_edges: dict[str, dict[str, list[str]]],
+    head: str,
+    tail: str,
+) -> str:
+    output = ""
+    if head in previous_edges:
+        for node in previous_edges[head]["outgoing"]:
+            output += f"{head} causes {node}.\n"
+        for node in previous_edges[head]["incoming"]:
+            output += f"{node} causes {head}.\n"
+    if tail in previous_edges:
+        for node in previous_edges[tail]["outgoing"]:
+            output += f"{tail} causes {node}.\n"
+        for node in previous_edges[tail]["incoming"]:
+            output += f"{node} causes {tail}.\n"
+    return output
+
+
+def _previous_edges_to_adjacency(previous_edges: dict[str, dict[str, list[str]]], variables: list[str]) -> np.ndarray:
+    adj = np.zeros((len(variables), len(variables)), dtype=int)
+    index_by_name = {name: idx for idx, name in enumerate(variables)}
+    for head, info in previous_edges.items():
+        if head not in index_by_name:
+            continue
+        for node in info["outgoing"]:
+            if node in index_by_name:
+                adj[index_by_name[head], index_by_name[node]] = 1
+    return adj
+
+
+def _pairwise_prompt(
+    *,
+    user_prompt: str,
+    src: str,
+    dst: str,
+    all_variables: list[dict[str, str]],
+    known_edges_text: str,
+    pearson_corr: float | None,
+) -> str:
+    descriptions = "\n".join(f'{item["name"]}: {item["description"]}' for item in all_variables)
+    stats_block = ""
+    if pearson_corr is not None:
+        stats_block = f'To help you, the Pearson correlation coefficient between "{src}" and "{dst}" is {float(pearson_corr):.2f}\n'
     return (
-        "You are an expert in causal discovery from variable semantics and evidence summaries.\n"
-        f"We are studying a system called '{dataset_name}'.\n"
-        f"Variables under consideration: {vars_text}\n\n"
-        f"{evidence_block}"
-        "Choose a small set of likely root variables among the listed variables. "
-        "A root variable should have no direct parents among the remaining variables.\n\n"
-        "Output exactly: <think>...</think><answer>{\"roots\": [\"...\"]}</answer>\n"
-        "Use exact variable names from the list. Return at most 3 roots.\n"
+        f"{user_prompt} \n"
+        "Here is a description of the causal variables in this causal graph:\n"
+        f"{descriptions}\n\n"
+        "Here are the causal relationships you know so far:\n"
+        f"{known_edges_text}\n"
+        f'We are interested in the causal relationship between "{src}" and "{dst}".\n'
+        f"{stats_block}"
+        "Which cause-and-effect relationship is more likely?\n"
+        f'A. "{src}" causes "{dst}".\n'
+        f'B. "{dst}" causes "{src}".\n'
+        f'C. There is no causal relationship between "{src}" and "{dst}".\n'
+        "Let’s work this out in a step by step way to be sure that we have the right answer. "
+        "Then provide your final answer within the tags <Answer>A/B/C</Answer>."
     )
 
 
-def _bfs_children_prompt(*, dataset_name: str, source: str, candidates: list[str], context: str | None = None) -> str:
-    vars_text = ", ".join(candidates)
-    evidence_block = ""
-    if context:
-        evidence_block = (
-            "Use the following observational evidence summary when choosing direct children:\n"
-            f"{context}\n\n"
-        )
-    return (
-        "You are an expert in causal discovery from variable semantics and evidence summaries.\n"
-        f"We are studying a system called '{dataset_name}'.\n"
-        f"Source variable: {source}\n"
-        f"Candidate target variables: {vars_text}\n\n"
-        f"{evidence_block}"
-        "List the most plausible direct children of the source variable among the candidates. "
-        "Only include direct effects, not indirect descendants.\n\n"
-        "Output exactly: <think>...</think><answer>{\"children\": [\"...\"]}</answer>\n"
-        "Use exact variable names from the candidate list.\n"
-    )
+def _extract_pairwise_choice(text: str) -> str | None:
+    explicit = re.search(r"<\s*Answer\s*>\s*([ABC])\s*<\s*/\s*Answer\s*>", text or "", flags=re.I)
+    if explicit:
+        return explicit.group(1).upper()
+    candidate = _extract_answer_text(text).strip()
+    upper = candidate.upper()
+    if upper in {"A", "B", "C"}:
+        return upper
+    match = re.search(r"\b([ABC])\b", upper)
+    if match:
+        return match.group(1)
+    low = candidate.lower()
+    if "no causal relationship" in low:
+        return "C"
+    if "causes a change in" in low:
+        first = re.search(r"changing\s+(.+?)\s+causes a change in\s+(.+?)(?:\.|$)", low)
+        if first:
+            return "A"
+    return None
+
+
+def _extract_answer_list(text: str) -> list[str]:
+    match = re.search(r"<\s*Answer\s*>(.*?)<\s*/\s*Answer\s*>", text or "", flags=re.I | re.S)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(", ")]
+
+
+def _sanitize_bfs_nodes(answer_nodes: list[str], *, nodes: list[str], independent_nodes: list[str]) -> list[str]:
+    out: list[str] = []
+    for node in answer_nodes:
+        if not node:
+            continue
+        if node in independent_nodes:
+            continue
+        if node not in nodes:
+            continue
+        if node not in out:
+            out.append(node)
+    return out
+
+
+def _bfs_corr_prompt(to_visit: str, corr: np.ndarray, variables: list[str]) -> str:
+    idx = variables.index(to_visit)
+    prompt = f"Addtionally, the Pearson correlation coefficient between {to_visit} and other variables are as follows:\n"
+    for j, var in enumerate(variables):
+        if var == to_visit:
+            continue
+        prompt += f"{var}: {float(corr[j, idx]):.2f}\n"
+    return prompt
+
+
+def _bfs_initial_messages(dataset_name: str) -> list[dict[str, str]]:
+    if dataset_name in _BFS_INIT_MESSAGES:
+        return copy.deepcopy(_BFS_INIT_MESSAGES[dataset_name])
+    return [
+        {"role": "system", "content": "You are an expert on causal systems."},
+        {
+            "role": "user",
+            "content": "You are a helpful assistant to experts constructing a causal graph between the following variables.\n",
+        },
+    ]
 
 
 def _run_causal_llm_prompt(
@@ -393,79 +639,188 @@ def _run_jiralerspong_bfs(
     anonymize: bool,
     hf_pipe: Any,
 ) -> tuple[np.ndarray, list[str], list[str]]:
-    context = None
-    if prompt_mode == "summary":
-        variables, _answer_obj, context = _build_data_prompt(
-            graph_path=graph_path,
-            sample_size_obs=sample_size_obs,
-            sample_size_inters=sample_size_inters,
-            seed=seed,
-            anonymize=anonymize,
-        )
-    else:
-        variables, _answer_obj, context = _build_names_only_prompt(
-            graph_path=graph_path,
-            num_prompts=1,
-            seed=seed,
-            anonymize=anonymize,
-        )
+    variable_cards = _load_variable_metadata(graph_path)
     dataset_name = graph_path.stem
-    var_to_idx = {v: i for i, v in enumerate(variables)}
-    remaining = list(variables)
-    frontier: deque[str] = deque()
+    variables = [item["name"] for item in variable_cards]
+    corr = None
+    if prompt_mode == "summary":
+        obs, obs_variables = _load_observational_array(graph_path, sample_size_obs=sample_size_obs, seed=seed)
+        variables = list(obs_variables)
+        card_by_name = {item["name"]: item for item in variable_cards}
+        variable_cards = [card_by_name.get(name, {"name": name, "symbol": name, "description": name}) for name in variables]
+        corr = np.corrcoef(obs, rowvar=False)
     raw_transcript: list[str] = []
-    adj = _empty_dag(len(variables))
+    message_history = _bfs_initial_messages(dataset_name)
+    message_history[1]["content"] += "".join(f'{item["name"]}: {item["description"]}\n' for item in variable_cards)
+    message_history[1]["content"] += _BFS_PROMPT_INIT + _BFS_PROMPT_FORMAT
 
-    while remaining:
-        if not frontier:
-            roots_prompt = _bfs_roots_prompt(dataset_name=dataset_name, remaining=remaining, context=context)
-            roots_raw = _call_model(
-                prompt=roots_prompt,
+    initial_raw = _call_model_messages(
+        messages=message_history,
+        model_name=model_name,
+        provider=provider,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens or 4095,
+        hf_pipe=hf_pipe,
+    )
+    raw_transcript.append(
+        json.dumps({"stage": "init", "messages": copy.deepcopy(message_history), "response": initial_raw}, ensure_ascii=False)
+    )
+    message_history.append({"role": "assistant", "content": initial_raw})
+    independent_nodes = _extract_answer_list(initial_raw)
+    unvisited_nodes = list(variables)
+    for node in independent_nodes:
+        if node in unvisited_nodes:
+            unvisited_nodes.remove(node)
+    frontier: list[str] = []
+    predict_graph: dict[str, list[str]] = {}
+
+    for to_visit in independent_nodes:
+        prompt = "Given " + ", ".join(independent_nodes) + " is(are) not affected by any other variable"
+        if len(predict_graph) == 0:
+            prompt += ".\n"
+        else:
+            prompt += " and the following causal relationships.\n"
+            for head, tails in predict_graph.items():
+                if len(tails) > 0:
+                    prompt += f"{head} causes " + ", ".join(tails) + "\n"
+        prompt += f"Select variables that are caused by {to_visit}.\n"
+        if corr is not None:
+            prompt += _bfs_corr_prompt(to_visit, corr, variables)
+        prompt += _BFS_PROMPT_FORMAT
+        message_history.append({"role": "user", "content": prompt})
+        raw = _call_model_messages(
+            messages=message_history,
+            model_name=model_name,
+            provider=provider,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens or 4095,
+            hf_pipe=hf_pipe,
+        )
+        raw_transcript.append(
+            json.dumps({"stage": "root_children", "source": to_visit, "prompt": prompt, "response": raw}, ensure_ascii=False)
+        )
+        message_history.append({"role": "assistant", "content": raw})
+        answer = _sanitize_bfs_nodes(_extract_answer_list(raw), nodes=variables, independent_nodes=independent_nodes)
+        predict_graph[to_visit] = answer
+        for node in answer:
+            if node in unvisited_nodes and node not in frontier:
+                frontier.append(node)
+
+    while len(frontier) > 0:
+        to_visit = frontier.pop(0)
+        if to_visit in unvisited_nodes:
+            unvisited_nodes.remove(to_visit)
+        prompt = "Given " + ", ".join(independent_nodes) + " is(are) not affected by any other variable and the following causal relationships.\n"
+        for head, tails in predict_graph.items():
+            if len(tails) > 0:
+                prompt += f"{head} causes " + ", ".join(tails) + "\n"
+        prompt += f"Select variables that are caused by {to_visit}.\n"
+        if corr is not None:
+            prompt += _bfs_corr_prompt(to_visit, corr, variables)
+        prompt += _BFS_PROMPT_FORMAT
+        message_history.append({"role": "user", "content": prompt})
+        raw = _call_model_messages(
+            messages=message_history,
+            model_name=model_name,
+            provider=provider,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens or 4095,
+            hf_pipe=hf_pipe,
+        )
+        raw_transcript.append(
+            json.dumps({"stage": "frontier_children", "source": to_visit, "prompt": prompt, "response": raw}, ensure_ascii=False)
+        )
+        message_history.append({"role": "assistant", "content": raw})
+        answer = _sanitize_bfs_nodes(_extract_answer_list(raw), nodes=variables, independent_nodes=independent_nodes)
+        predict_graph[to_visit] = answer
+        for node in answer:
+            if node in unvisited_nodes and node not in frontier:
+                frontier.append(node)
+
+    adj = np.zeros((len(variables), len(variables)), dtype=int)
+    index_by_name = {name: idx for idx, name in enumerate(variables)}
+    for head, tails in predict_graph.items():
+        if head not in index_by_name:
+            continue
+        for node in tails:
+            if node in index_by_name:
+                adj[index_by_name[head], index_by_name[node]] = 1
+
+    return adj, variables, raw_transcript
+
+
+def _run_jiralerspong_pairwise(
+    *,
+    graph_path: Path,
+    sample_size_obs: int,
+    prompt_mode: str,
+    model_name: str,
+    provider: str,
+    temperature: float,
+    max_new_tokens: int | None,
+    seed: int,
+    anonymize: bool,
+    hf_pipe: Any,
+) -> tuple[np.ndarray, list[str], list[str]]:
+    dataset_name = graph_path.stem
+    prompts = _PAIRWISE_INIT_PROMPTS.get(
+        dataset_name,
+        {
+            "system": "You are an expert on causal systems.",
+            "user": "You are a helpful assistant to a causal discovery expert.",
+        },
+    )
+    variable_metadata = _load_variable_metadata(graph_path)
+    by_name = {item["name"]: item for item in variable_metadata}
+    obs, variables = _load_observational_array(graph_path, sample_size_obs=sample_size_obs, seed=seed)
+    corr = np.corrcoef(obs, rowvar=False) if prompt_mode == "summary" else None
+    rng = random.Random(seed)
+    variable_cards = [by_name.get(name, {"name": name, "symbol": name, "description": name}) for name in variables]
+    previous_edges = _new_previous_edges()
+    raw_transcript: list[str] = []
+    for i in range(len(variables)):
+        for j in range(i + 1, len(variables)):
+            head = variables[i]
+            tail = variables[j]
+            if rng.random() >= 0.5:
+                head, tail = tail, head
+            known_edges_text = _get_previous_relevant_edges_string(previous_edges, head, tail)
+            pearson = None
+            if corr is not None:
+                pearson = float(corr[variables.index(head), variables.index(tail)])
+            query = _pairwise_prompt(
+                user_prompt=prompts["user"],
+                src=head,
+                dst=tail,
+                all_variables=variable_cards,
+                known_edges_text=known_edges_text,
+                pearson_corr=pearson,
+            )
+            messages = [
+                {"role": "system", "content": prompts["system"]},
+                {"role": "user", "content": query},
+            ]
+            raw = _call_model_messages(
+                messages=messages,
                 model_name=model_name,
                 provider=provider,
                 temperature=temperature,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=max_new_tokens or 2048,
                 hf_pipe=hf_pipe,
             )
-            raw_transcript.append(roots_raw)
-            roots = _extract_name_list(roots_raw, key="roots", allowed=remaining)
-            if not roots:
-                roots = [remaining[0]]
-            for root in roots:
-                if root in remaining:
-                    remaining.remove(root)
-                    frontier.append(root)
-
-        while frontier:
-            source = frontier.popleft()
-            candidates = [v for v in remaining if v != source]
-            if not candidates:
-                continue
-            children_prompt = _bfs_children_prompt(
-                dataset_name=dataset_name,
-                source=source,
-                candidates=candidates,
-                context=context,
-            )
-            children_raw = _call_model(
-                prompt=children_prompt,
-                model_name=model_name,
-                provider=provider,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                hf_pipe=hf_pipe,
-            )
-            raw_transcript.append(children_raw)
-            children = _extract_name_list(children_raw, key="children", allowed=candidates)
-            for child in children:
-                i = var_to_idx[source]
-                j = var_to_idx[child]
-                adj[i, j] = 1
-                if child in remaining:
-                    remaining.remove(child)
-                    frontier.append(child)
-
-    return _project_dag(adj), variables, raw_transcript
+            choice = _extract_pairwise_choice(raw)
+            if choice is not None:
+                _add_edge_pairwise(previous_edges, head, tail, choice)
+            record = {
+                "pair": [head, tail],
+                "pearson_corr": pearson,
+                "known_edges_text": known_edges_text,
+                "messages": messages,
+                "response": raw,
+                "choice": choice,
+            }
+            raw_transcript.append(json.dumps(record, ensure_ascii=False))
+    return _previous_edges_to_adjacency(previous_edges, variables), variables, raw_transcript
 
 
 def _run_causal_llm_data(
@@ -577,7 +932,13 @@ def main() -> int:
         raise SystemExit("JiralerspongBFS expects --prompt_mode summary.")
     if args.method == "JiralerspongBFS" and args.sample_size_inters != 0:
         raise SystemExit("JiralerspongBFS is observational-only in this implementation.")
+    if args.method == "JiralerspongPairwise" and args.prompt_mode != "summary":
+        raise SystemExit("JiralerspongPairwise expects --prompt_mode summary to match the original implementation.")
+    if args.method == "JiralerspongPairwise" and args.sample_size_inters != 0:
+        raise SystemExit("JiralerspongPairwise summary mode is observational-only in this implementation.")
     if (args.method in names_only_methods or args.method == "JiralerspongBFS") and args.naming_regime not in {"real", "names_only", "anonymized"}:
+        raise SystemExit(f"Unsupported naming regime for {args.method}: {args.naming_regime}")
+    if args.method == "JiralerspongPairwise" and args.naming_regime not in {"real", "anonymized"}:
         raise SystemExit(f"Unsupported naming regime for {args.method}: {args.naming_regime}")
     if args.method == "CausalLLMData" and args.prompt_mode != "summary":
         raise SystemExit("CausalLLMData expects --prompt_mode summary.")
@@ -612,6 +973,19 @@ def main() -> int:
                 graph_path=graph_path,
                 sample_size_obs=args.sample_size_obs,
                 sample_size_inters=args.sample_size_inters,
+                prompt_mode=args.prompt_mode,
+                model_name=args.model,
+                provider=provider,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                seed=args.seed,
+                anonymize=anonymize,
+                hf_pipe=hf_pipe,
+            )
+        elif args.method == "JiralerspongPairwise":
+            prediction, _variables, raw_responses = _run_jiralerspong_pairwise(
+                graph_path=graph_path,
+                sample_size_obs=args.sample_size_obs,
                 prompt_mode=args.prompt_mode,
                 model_name=args.model,
                 provider=provider,
