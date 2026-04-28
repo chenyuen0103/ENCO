@@ -1288,7 +1288,7 @@ def main() -> int:
 
         naming_suffix = "_anon" if args.naming_regime == "anonymized" else ""
         out_csv = Path(args.out_dir) / graph_path.stem / (
-            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{_backend_suffix(backend)}_p{int(args.takayama_pattern)}{naming_suffix}.csv"
+            f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{_backend_suffix(backend)}_p{int(args.takayama_pattern)}_seed{int(args.seed)}{naming_suffix}.csv"
         )
         checkpoint_path = _checkpoint_path_for_output(out_csv)
         run_signature = _build_run_signature(

@@ -1030,7 +1030,7 @@ def main() -> int:
         elif args.naming_regime == "names_only":
             naming_suffix = "_names_only"
         out_csv = Path(args.out_dir) / graph_path.stem / (
-            f"predictions_obs{args.sample_size_obs}_int{args.sample_size_inters}_{args.method}{naming_suffix}.csv"
+            f"predictions_obs{args.sample_size_obs}_int{args.sample_size_inters}_{args.method}_seed{int(args.seed)}{naming_suffix}.csv"
         )
         _write_prediction_csv(
             out_csv=out_csv,
