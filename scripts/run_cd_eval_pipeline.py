@@ -31,7 +31,7 @@ _RESP_RE = re.compile(
 )
 
 _ENCO_RE = re.compile(
-    r"^predictions_obs(?P<obs>\d+)_int(?P<int>\d+)_ENCO$",
+    r"^predictions_obs(?P<obs>\d+)_int(?P<int>\d+)_ENCO(?:_seed(?P<seed>\d+))?$",
     flags=re.IGNORECASE,
 )
 
@@ -219,7 +219,8 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             is_names_only = True
             method = method[: -len("_names_only")]
             prompt_style = "names_only"
-        elif method in {"TakayamaSCP", "JiralerspongBFS", "CausalLLMData"}:
+        method = re.sub(r"_seed\d+$", "", method)
+        if method.startswith("TakayamaSCP") or method in {"JiralerspongBFS", "CausalLLMData", "JiralerspongPairwise"}:
             prompt_style = "summary"
         elif method == "ENCO":
             prompt_style = "enco"

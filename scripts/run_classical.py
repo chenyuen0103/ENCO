@@ -172,7 +172,7 @@ def main() -> int:
             )
 
         dataset_name = graph_path.stem
-        out_csv = Path(args.out_dir) / dataset_name / f"predictions_obs{args.sample_size_obs}_int0_{args.method}.csv"
+        out_csv = Path(args.out_dir) / dataset_name / f"predictions_obs{args.sample_size_obs}_int0_{args.method}_seed{int(args.seed)}.csv"
         _write_prediction_csv(
             out_csv=out_csv,
             method=args.method,
