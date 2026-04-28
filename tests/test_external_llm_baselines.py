@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -165,6 +167,112 @@ class TestExternalLLMBaselines(unittest.TestCase):
         else:
             self.assertEqual(adj.tolist(), [[0, 0], [1, 0]])
         self.assertEqual(len(raw), 1)
+
+    def test_run_jiralerspong_pairwise_retries_until_parseable_choice(self) -> None:
+        call_messages = mock.Mock(side_effect=["", "<Answer>B</Answer>"])
+        with mock.patch.dict(
+            external._run_jiralerspong_pairwise.__globals__,
+            {
+                "_load_observational_array": mock.Mock(
+                    return_value=(np.array([[0.0, 1.0], [1.0, 2.0]], dtype=float), ["A", "B"])
+                ),
+                "_load_variable_metadata": mock.Mock(
+                    return_value=[
+                        {"name": "A", "symbol": "A", "description": "desc A"},
+                        {"name": "B", "symbol": "B", "description": "desc B"},
+                    ]
+                ),
+                "_call_model_messages": call_messages,
+            },
+        ):
+            adj, variables, raw = external._run_jiralerspong_pairwise(
+                graph_path=Path("/tmp/sachs.bif"),
+                sample_size_obs=100,
+                prompt_mode="summary",
+                model_name="gpt-5-mini",
+                provider="openai",
+                temperature=0.0,
+                max_new_tokens=None,
+                seed=0,
+                anonymize=False,
+                hf_pipe=None,
+            )
+        self.assertEqual(call_messages.call_count, 2)
+        self.assertEqual(variables, ["A", "B"])
+        self.assertEqual(len(raw), 1)
+        if 'A. "A" causes "B".' in call_messages.call_args.kwargs["messages"][-1]["content"]:
+            self.assertEqual(adj.tolist(), [[0, 0], [1, 0]])
+        else:
+            self.assertEqual(adj.tolist(), [[0, 1], [0, 0]])
+
+    def test_run_jiralerspong_pairwise_fails_after_unusable_responses(self) -> None:
+        call_messages = mock.Mock(side_effect=["", "[ERROR] nope", "no answer tag"])
+        with mock.patch.dict(
+            external._run_jiralerspong_pairwise.__globals__,
+            {
+                "_load_observational_array": mock.Mock(
+                    return_value=(np.array([[0.0, 1.0], [1.0, 2.0]], dtype=float), ["A", "B"])
+                ),
+                "_load_variable_metadata": mock.Mock(
+                    return_value=[
+                        {"name": "A", "symbol": "A", "description": "desc A"},
+                        {"name": "B", "symbol": "B", "description": "desc B"},
+                    ]
+                ),
+                "_call_model_messages": call_messages,
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "usable <Answer>A/B/C</Answer>"):
+                external._run_jiralerspong_pairwise(
+                    graph_path=Path("/tmp/sachs.bif"),
+                    sample_size_obs=100,
+                    prompt_mode="summary",
+                    model_name="gpt-5-mini",
+                    provider="openai",
+                    temperature=0.0,
+                    max_new_tokens=None,
+                    seed=0,
+                    anonymize=False,
+                    hf_pipe=None,
+                )
+        self.assertEqual(call_messages.call_count, 3)
+
+    def test_write_prediction_rows_preserves_multiple_replicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_csv = Path(tmpdir) / "predictions.csv"
+            external._write_prediction_rows(
+                out_csv=out_csv,
+                rows=[
+                    {
+                        "method": "CausalLLMData",
+                        "model": "m",
+                        "provider": "p",
+                        "naming_regime": "real",
+                        "obs_n": 100,
+                        "int_n": 0,
+                        "raw_response": "r0",
+                        "answer": "[[0]]",
+                        "prediction": "[[0]]",
+                        "valid": 1,
+                    },
+                    {
+                        "method": "CausalLLMData",
+                        "model": "m",
+                        "provider": "p",
+                        "naming_regime": "real",
+                        "obs_n": 100,
+                        "int_n": 0,
+                        "raw_response": "r1",
+                        "answer": "[[0]]",
+                        "prediction": "[[0]]",
+                        "valid": 1,
+                    },
+                ],
+            )
+            with out_csv.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["raw_response"] for row in rows], ["r0", "r1"])
 
 
 if __name__ == "__main__":

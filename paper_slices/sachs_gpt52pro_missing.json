@@ -5,7 +5,7 @@
   "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
   "model": "gpt-5.2-pro",
   "seed": 42,
-  "num_prompts": 3,
+  "num_prompts": 5,
   "temperature": 0.0,
   "shuffles_per_graph": 1,
   "prompt_cells": [

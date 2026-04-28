@@ -46,7 +46,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "notes": "Semantic-only names-only one-shot full-DAG baseline."
     },
     {
@@ -56,7 +56,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "notes": "One-shot summary-conditioned full-DAG baseline. Reuses matching legacy summary outputs when available."
     },
     {
@@ -66,7 +66,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "notes": "Observational-summary BFS-style querying baseline."
     },
     {
@@ -76,7 +76,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "notes": "Observational-summary pairwise edge-querying baseline."
     },
     {
@@ -86,7 +86,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "takayama_backend": "pc",
       "takayama_pattern": 2,
       "takayama_bootstrap_samples": 100,

@@ -29,6 +29,11 @@ DEFAULT_FIRST_STAGE_MAX_NEW_TOKENS = 384
 DEFAULT_SECOND_STAGE_MAX_NEW_TOKENS = 8
 
 
+def _model_requires_default_temperature(model_name: str) -> bool:
+    mn = (model_name or "").strip().lower()
+    return mn in {"gpt-5", "gpt-5-mini", "gpt-5-nano"} or mn.startswith(("o1", "o3", "o4", "o-"))
+
+
 def _progress(message: str) -> None:
     print(f"[TakayamaSCP {time.strftime('%H:%M:%S')}] {message}", flush=True)
 
@@ -119,7 +124,9 @@ def _load_observational_frames(
             raise SystemExit(
                 f"Requested sample_size_obs={sample_size_obs}, but graph only exposes {arr.shape[0]} observational rows."
             )
-        arr = arr[:sample_size_obs]
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(arr.shape[0], size=sample_size_obs, replace=False)
+        arr = arr[idx]
     elif hasattr(graph, "sample"):
         np.random.seed(seed)
         arr = np.asarray(graph.sample(batch_size=sample_size_obs, as_array=True))
@@ -598,10 +605,11 @@ def _chat_text_completion(
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": messages,
-            "temperature": temperature,
             "logprobs": logprobs if logprobs else None,
             "top_logprobs": top_logprobs if logprobs else None,
         }
+        if not _model_requires_default_temperature(model_name):
+            kwargs["temperature"] = temperature
         if "gpt-5" in model_name.lower():
             kwargs["max_completion_tokens"] = completion_tokens
         else:
@@ -681,6 +689,7 @@ def _build_run_signature(
     provider: str,
     labels: list[str],
     sample_size_obs: int,
+    seed: int,
     naming_regime: str,
     temperature: float,
     max_new_tokens: int | None,
@@ -698,6 +707,7 @@ def _build_run_signature(
         "provider": provider,
         "labels": list(labels),
         "sample_size_obs": int(sample_size_obs),
+        "seed": int(seed),
         "naming_regime": naming_regime,
         "temperature": float(temperature),
         "max_new_tokens": max_new_tokens,
@@ -1070,6 +1080,66 @@ def _write_prediction_csv(
     probability_matrix: np.ndarray,
     prior_matrix: np.ndarray,
 ) -> None:
+    _write_prediction_rows(
+        out_csv=out_csv,
+        rows=[
+            _prediction_row(
+                backend=backend,
+                pattern=pattern,
+                model_name=model_name,
+                provider=provider,
+                naming_regime=naming_regime,
+                sample_size_obs=sample_size_obs,
+                answer=answer,
+                prediction=prediction,
+                transcript=transcript,
+                probability_matrix=probability_matrix,
+                prior_matrix=prior_matrix,
+            )
+        ],
+    )
+
+
+def _prediction_row(
+    *,
+    backend: str,
+    pattern: int,
+    model_name: str,
+    provider: str,
+    naming_regime: str,
+    sample_size_obs: int,
+    answer: np.ndarray,
+    prediction: np.ndarray,
+    transcript: list[dict[str, Any]],
+    probability_matrix: np.ndarray,
+    prior_matrix: np.ndarray,
+) -> dict[str, Any]:
+    return {
+        "method": "TakayamaSCP",
+        "backend": backend,
+        "pattern": pattern,
+        "model": model_name,
+        "provider": provider,
+        "naming_regime": naming_regime,
+        "obs_n": sample_size_obs,
+        "int_n": 0,
+        "raw_response": json.dumps(
+            {
+                "backend": backend,
+                "pattern": pattern,
+                "probability_matrix_effect_by_cause": probability_matrix.tolist(),
+                "prior_matrix_effect_by_cause": np.asarray(prior_matrix).tolist(),
+                "transcript": transcript,
+            },
+            ensure_ascii=False,
+        ),
+        "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
+        "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
+        "valid": 1,
+    }
+
+
+def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -1090,31 +1160,7 @@ def _write_prediction_csv(
             ],
         )
         writer.writeheader()
-        writer.writerow(
-            {
-                "method": "TakayamaSCP",
-                "backend": backend,
-                "pattern": pattern,
-                "model": model_name,
-                "provider": provider,
-                "naming_regime": naming_regime,
-                "obs_n": sample_size_obs,
-                "int_n": 0,
-                "raw_response": json.dumps(
-                    {
-                        "backend": backend,
-                        "pattern": pattern,
-                        "probability_matrix_effect_by_cause": probability_matrix.tolist(),
-                        "prior_matrix_effect_by_cause": np.asarray(prior_matrix).tolist(),
-                        "transcript": transcript,
-                    },
-                    ensure_ascii=False,
-                ),
-                "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
-                "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
-                "valid": 1,
-            }
-        )
+        writer.writerows(rows)
 
 
 def _repair_probability_matrix_from_transcript(raw_response: dict[str, Any], n: int) -> tuple[np.ndarray, list[dict[str, Any]]]:
@@ -1200,6 +1246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--max_new_tokens_first", type=int, default=None)
     parser.add_argument("--max_new_tokens_second", type=int, default=None)
+    parser.add_argument("--num_prompts", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--bootstrap_samples", type=int, default=100)
     parser.add_argument("--backend", choices=sorted(TAKAYAMA_BACKENDS), default="pc")
@@ -1216,6 +1263,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.num_prompts <= 0:
+        raise SystemExit("--num_prompts must be > 0.")
     backend = _normalize_backend(args.backend)
     max_new_tokens_first, max_new_tokens_second = _resolve_stage_token_limits(
         shared_max_new_tokens=args.max_new_tokens,
@@ -1245,110 +1294,126 @@ def main() -> int:
             f"obs={args.sample_size_obs}, pattern={args.takayama_pattern}, naming={args.naming_regime}, "
             f"max_first={max_new_tokens_first}, max_second={max_new_tokens_second}"
         )
-        _progress("loading observational dataframe")
-        _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, args.seed)
-        _progress(f"loaded dataframe: rows={std_df.shape[0]}, cols={std_df.shape[1]}")
-        if args.repair_existing_csv:
-            csv_path = Path(args.repair_existing_csv)
-            _progress(f"repairing existing CSV from saved transcript: {csv_path}")
-            _repair_existing_csv(
-                csv_path=csv_path,
-                backend=backend,
-                pattern=args.takayama_pattern,
-                std_df=std_df,
-                answer=answer,
-            )
-            _progress(f"repaired {csv_path.resolve()}")
-            continue
-
-        if backend == "pc":
-            _progress("running unconstrained PC")
-            adjacency_matrix = _run_pc_with_background_knowledge(std_df, pk_matrix=None)
-            _progress("unconstrained PC done")
-            primary_prob, secondary_prob = _bootstrap_pc_probabilities(std_df, args.bootstrap_samples)
-        elif backend == "exact_search":
-            _progress("running unconstrained Exact Search")
-            adjacency_matrix = _run_exact_search(std_df, super_graph=None)
-            _progress("unconstrained Exact Search done")
-            primary_prob = _bootstrap_exact_search_probabilities(std_df, args.bootstrap_samples)
-            secondary_prob = None
-        elif backend == "direct_lingam":
-            _progress("running unconstrained DirectLiNGAM")
-            adjacency_matrix = _run_direct_lingam(std_df, prior_knowledge=None)
-            _progress("unconstrained DirectLiNGAM done")
-            primary_prob = _bootstrap_direct_lingam_probabilities(std_df, args.bootstrap_samples)
-            secondary_prob = None
-        else:
-            raise SystemExit(f"Unsupported backend: {backend}")
-
-        if args.naming_regime == "anonymized":
-            labels = [f"X{i+1}" for i in range(len(var_names))]
-        else:
-            labels = list(var_names)
-
         naming_suffix = "_anon" if args.naming_regime == "anonymized" else ""
         out_csv = Path(args.out_dir) / graph_path.stem / (
             f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{_backend_suffix(backend)}_p{int(args.takayama_pattern)}{naming_suffix}.csv"
         )
-        checkpoint_path = _checkpoint_path_for_output(out_csv)
-        run_signature = _build_run_signature(
-            graph_path=graph_path,
-            backend=backend,
-            model_name=args.model,
-            provider=provider,
-            labels=labels,
-            sample_size_obs=args.sample_size_obs,
-            naming_regime=args.naming_regime,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-            max_new_tokens_first=max_new_tokens_first,
-            max_new_tokens_second=max_new_tokens_second,
-            num_samples=args.num_samples,
-            bootstrap_samples=args.bootstrap_samples,
-            pattern=args.takayama_pattern,
-        )
-        probability_matrix, transcript = _llm_probability_matrix(
-            provider=provider,
-            client=client,
-            model_name=args.model,
-            backend=backend,
-            labels=labels,
-            dataset_name=graph_path.stem,
-            pattern=args.takayama_pattern,
-            adjacency_matrix=np.asarray(adjacency_matrix),
-            primary_prob=(np.asarray(primary_prob) if primary_prob is not None else None),
-            secondary_prob=(np.asarray(secondary_prob) if secondary_prob is not None else None),
-            temperature=args.temperature,
-            max_new_tokens_first=max_new_tokens_first,
-            max_new_tokens_second=max_new_tokens_second,
-            num_samples=args.num_samples,
-            anonymized=args.naming_regime == "anonymized",
-            checkpoint_path=checkpoint_path,
-            run_signature=run_signature,
-        )
-        _progress("running constrained backend with derived prior")
-        prediction, prior_matrix = _run_backend_with_prior(
-            backend=backend,
-            pattern=args.takayama_pattern,
-            std_df=std_df,
-            probability_matrix=probability_matrix,
-        )
-        _progress("constrained backend done; writing output csv")
-        _write_prediction_csv(
-            out_csv=out_csv,
-            backend=backend,
-            pattern=args.takayama_pattern,
-            model_name=args.model,
-            provider=provider,
-            naming_regime=args.naming_regime,
-            sample_size_obs=args.sample_size_obs,
-            answer=answer,
-            prediction=prediction,
-            transcript=transcript,
-            probability_matrix=probability_matrix,
-            prior_matrix=prior_matrix,
-        )
-        checkpoint_path.unlink(missing_ok=True)
+
+        rows: list[dict[str, Any]] = []
+        for prompt_idx in range(args.num_prompts):
+            seed_i = int(args.seed) + prompt_idx * 1000
+            _progress(f"replicate {prompt_idx + 1}/{args.num_prompts}: loading observational dataframe seed={seed_i}")
+            _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, seed_i)
+            _progress(f"loaded dataframe: rows={std_df.shape[0]}, cols={std_df.shape[1]}")
+            if args.repair_existing_csv:
+                if args.num_prompts != 1:
+                    raise SystemExit("--repair_existing_csv only supports --num_prompts 1.")
+                csv_path = Path(args.repair_existing_csv)
+                _progress(f"repairing existing CSV from saved transcript: {csv_path}")
+                _repair_existing_csv(
+                    csv_path=csv_path,
+                    backend=backend,
+                    pattern=args.takayama_pattern,
+                    std_df=std_df,
+                    answer=answer,
+                )
+                _progress(f"repaired {csv_path.resolve()}")
+                continue
+
+            if backend == "pc":
+                _progress("running unconstrained PC")
+                adjacency_matrix = _run_pc_with_background_knowledge(std_df, pk_matrix=None)
+                _progress("unconstrained PC done")
+                primary_prob, secondary_prob = _bootstrap_pc_probabilities(std_df, args.bootstrap_samples)
+            elif backend == "exact_search":
+                _progress("running unconstrained Exact Search")
+                adjacency_matrix = _run_exact_search(std_df, super_graph=None)
+                _progress("unconstrained Exact Search done")
+                primary_prob = _bootstrap_exact_search_probabilities(std_df, args.bootstrap_samples)
+                secondary_prob = None
+            elif backend == "direct_lingam":
+                _progress("running unconstrained DirectLiNGAM")
+                adjacency_matrix = _run_direct_lingam(std_df, prior_knowledge=None)
+                _progress("unconstrained DirectLiNGAM done")
+                primary_prob = _bootstrap_direct_lingam_probabilities(std_df, args.bootstrap_samples)
+                secondary_prob = None
+            else:
+                raise SystemExit(f"Unsupported backend: {backend}")
+
+            if args.naming_regime == "anonymized":
+                labels = [f"X{i+1}" for i in range(len(var_names))]
+            else:
+                labels = list(var_names)
+
+            checkpoint_path = _checkpoint_path_for_output(out_csv)
+            if args.num_prompts > 1:
+                checkpoint_path = out_csv.with_suffix(out_csv.suffix + f".rep{prompt_idx}.checkpoint.json")
+            run_signature = _build_run_signature(
+                graph_path=graph_path,
+                backend=backend,
+                model_name=args.model,
+                provider=provider,
+                labels=labels,
+                sample_size_obs=args.sample_size_obs,
+                seed=seed_i,
+                naming_regime=args.naming_regime,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                max_new_tokens_first=max_new_tokens_first,
+                max_new_tokens_second=max_new_tokens_second,
+                num_samples=args.num_samples,
+                bootstrap_samples=args.bootstrap_samples,
+                pattern=args.takayama_pattern,
+            )
+            probability_matrix, transcript = _llm_probability_matrix(
+                provider=provider,
+                client=client,
+                model_name=args.model,
+                backend=backend,
+                labels=labels,
+                dataset_name=graph_path.stem,
+                pattern=args.takayama_pattern,
+                adjacency_matrix=np.asarray(adjacency_matrix),
+                primary_prob=(np.asarray(primary_prob) if primary_prob is not None else None),
+                secondary_prob=(np.asarray(secondary_prob) if secondary_prob is not None else None),
+                temperature=args.temperature,
+                max_new_tokens_first=max_new_tokens_first,
+                max_new_tokens_second=max_new_tokens_second,
+                num_samples=args.num_samples,
+                anonymized=args.naming_regime == "anonymized",
+                checkpoint_path=checkpoint_path,
+                run_signature=run_signature,
+            )
+            _progress("running constrained backend with derived prior")
+            prediction, prior_matrix = _run_backend_with_prior(
+                backend=backend,
+                pattern=args.takayama_pattern,
+                std_df=std_df,
+                probability_matrix=probability_matrix,
+            )
+            _progress("constrained backend done")
+            rows.append(
+                _prediction_row(
+                    backend=backend,
+                    pattern=args.takayama_pattern,
+                    model_name=args.model,
+                    provider=provider,
+                    naming_regime=args.naming_regime,
+                    sample_size_obs=args.sample_size_obs,
+                    answer=answer,
+                    prediction=prediction,
+                    transcript=transcript,
+                    probability_matrix=probability_matrix,
+                    prior_matrix=prior_matrix,
+                )
+            )
+            checkpoint_path.unlink(missing_ok=True)
+
+        if not args.repair_existing_csv:
+            _progress("writing output csv")
+            _write_prediction_rows(out_csv=out_csv, rows=rows)
+        else:
+            continue
         _progress(f"wrote {out_csv.resolve()}")
     return 0
 

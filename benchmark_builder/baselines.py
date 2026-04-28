@@ -30,6 +30,31 @@ def _reuse_if_exists(path: Path, *, dry_run: bool) -> bool:
     return False
 
 
+def _csv_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    old_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(sys.maxsize)
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+    finally:
+        csv.field_size_limit(old_limit)
+
+
+def _reuse_if_has_rows(path: Path, *, dry_run: bool, min_rows: int) -> bool:
+    if dry_run:
+        return False
+    if not path.exists():
+        return False
+    rows = _csv_row_count(path)
+    if rows >= min_rows:
+        print(f"[reuse] {path} rows={rows}")
+        return True
+    print(f"[rerun] {path} rows={rows} < required={min_rows}")
+    return False
+
+
 def _model_filename_tags(model_name: str) -> list[str]:
     tags: list[str] = []
     for raw in (model_name, model_name.split("/")[-1]):
@@ -82,8 +107,8 @@ def _find_legacy_external_baseline_csv(
         candidates = sorted(
             candidates,
             key=lambda p: (
-                0 if "_p" not in p.stem else 1,
                 -_prompt_count_from_name(p),
+                0 if "_p" not in p.stem else 1,
                 p.name,
             ),
         )
@@ -103,17 +128,20 @@ def _materialize_legacy_external_baseline_copy(
     sample_size_obs: int,
     sample_size_inters: int,
     dry_run: bool,
+    min_rows: int = 1,
 ) -> bool:
-    if dry_run:
-        print(f"[dry-run][reuse:legacy] {legacy_csv} -> {out_csv}")
-        return True
-
     with legacy_csv.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         rows = list(reader)
 
     if not rows:
         return False
+    if len(rows) < min_rows:
+        print(f"[skip:legacy] {legacy_csv} rows={len(rows)} < required={min_rows}")
+        return False
+    if dry_run:
+        print(f"[dry-run][reuse:legacy] {legacy_csv} -> {out_csv} rows={len(rows)}")
+        return True
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
@@ -401,7 +429,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{takayama_suffix}{naming_suffix}.csv"
         )
         model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
-        if _reuse_if_exists(out_csv, dry_run=dry_run):
+        num_prompts = max(1, int(getattr(spec, "num_prompts", 1)))
+        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
 
         if self.method_name in {"CausalLLMData", "CausalLLMPrompt"}:
@@ -421,6 +450,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 naming_regime=naming_regime,
                 sample_size_obs=sample_size_obs,
                 sample_size_inters=sample_size_inters,
+                min_rows=num_prompts,
                 dry_run=dry_run,
             ):
                 return out_csv
@@ -435,6 +465,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 str(sample_size_obs),
                 "--seed",
                 str(baseline.seed if baseline.seed is not None else spec.seed),
+                "--num_prompts",
+                str(num_prompts),
                 "--out_dir",
                 str(self.repo_root / "experiments" / "responses"),
                 "--model",
@@ -470,6 +502,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 str(sample_size_inters),
                 "--seed",
                 str(baseline.seed if baseline.seed is not None else spec.seed),
+                "--num_prompts",
+                str(num_prompts),
                 "--out_dir",
                 str(self.repo_root / "experiments" / "responses"),
                 "--model",

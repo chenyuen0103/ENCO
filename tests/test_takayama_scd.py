@@ -2,17 +2,56 @@
 from __future__ import annotations
 
 import unittest
+import csv
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
 from experiments.run_takayama_scd import (
     _build_first_prompt,
+    _chat_text_completion,
     _probability_to_pk,
     _directed_prediction_from_pc_signed,
+    _prediction_row,
+    _write_prediction_rows,
 )
 
 
 class TestTakayamaSCD(unittest.TestCase):
+    def test_chat_completion_omits_temperature_for_gpt5_mini(self) -> None:
+        class FakeChoice:
+            message = type("Message", (), {"content": "ok"})()
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.kwargs = None
+
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeResponse()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        client = FakeClient()
+        result = _chat_text_completion(
+            provider="openai",
+            client=client,
+            model_name="gpt-5-mini",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.0,
+            max_new_tokens=8,
+        )
+
+        self.assertEqual(result["text"], "ok")
+        self.assertNotIn("temperature", client.chat.completions.kwargs)
+        self.assertEqual(client.chat.completions.kwargs["max_completion_tokens"], 8)
+
     def test_probability_to_pk_thresholds(self) -> None:
         probs = np.array(
             [
@@ -44,18 +83,57 @@ class TestTakayamaSCD(unittest.TestCase):
         directed = np.array([[0.0, 0.9], [0.0, 0.0]])
         undirected = np.zeros((2, 2), dtype=float)
         prompt = _build_first_prompt(
+            backend="pc",
             dataset_name="toy",
             labels=["A", "B"],
             i=0,
             j=1,
             pattern=2,
-            pc_adj_signed=signed,
-            pc_directed_prob=directed,
-            pc_undirected_prob=undirected,
+            adjacency_matrix=signed,
+            primary_prob=directed,
+            secondary_prob=undirected,
             anonymized=False,
         )
         self.assertIn("bootstrap probability", prompt)
         self.assertIn("PC(Peter-Clerk)", prompt)
+
+    def test_write_prediction_rows_preserves_multiple_replicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_csv = Path(tmpdir) / "takayama.csv"
+            rows = [
+                _prediction_row(
+                    backend="pc",
+                    pattern=2,
+                    model_name="m",
+                    provider="openai",
+                    naming_regime="real",
+                    sample_size_obs=100,
+                    answer=np.zeros((2, 2), dtype=int),
+                    prediction=np.zeros((2, 2), dtype=int),
+                    transcript=[{"rep": 0}],
+                    probability_matrix=np.zeros((2, 2), dtype=float),
+                    prior_matrix=np.zeros((2, 2), dtype=int),
+                ),
+                _prediction_row(
+                    backend="pc",
+                    pattern=2,
+                    model_name="m",
+                    provider="openai",
+                    naming_regime="real",
+                    sample_size_obs=100,
+                    answer=np.zeros((2, 2), dtype=int),
+                    prediction=np.ones((2, 2), dtype=int),
+                    transcript=[{"rep": 1}],
+                    probability_matrix=np.ones((2, 2), dtype=float),
+                    prior_matrix=np.ones((2, 2), dtype=int),
+                ),
+            ]
+            _write_prediction_rows(out_csv=out_csv, rows=rows)
+            with out_csv.open(newline="", encoding="utf-8") as handle:
+                loaded = list(csv.DictReader(handle))
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["method"], "TakayamaSCP")
+        self.assertIn('"rep": 1', loaded[1]["raw_response"])
 
 
 if __name__ == "__main__":

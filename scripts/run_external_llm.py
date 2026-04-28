@@ -36,6 +36,7 @@ try:
         extract_adjacency_matrix,
         is_gemini_model,
         is_openai_model,
+        _model_requires_default_temperature,
     )
 except ModuleNotFoundError:
     from generate_prompts import iter_prompts_in_memory
@@ -49,6 +50,7 @@ except ModuleNotFoundError:
         extract_adjacency_matrix,
         is_gemini_model,
         is_openai_model,
+        _model_requires_default_temperature,
     )
 
 
@@ -187,7 +189,9 @@ def _load_observational_array(graph_path: Path, sample_size_obs: int, seed: int)
             raise ValueError(
                 f"Requested sample_size_obs={sample_size_obs}, but dataset only exposes {arr.shape[0]} rows."
             )
-        return np.asarray(arr[:sample_size_obs]), variables
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(arr.shape[0], size=sample_size_obs, replace=False)
+        return np.asarray(arr[idx]), variables
     if hasattr(graph, "sample"):
         np.random.seed(seed)
         return np.asarray(graph.sample(batch_size=sample_size_obs, as_array=True)), variables
@@ -311,16 +315,21 @@ def _call_model_messages(
         except Exception as exc:
             return f"[ERROR] ImportError: {exc}"
         try:
-            client = OpenAI()
+            client = OpenAI(timeout=180.0, max_retries=2)
             use_max_completion_tokens = "gpt-5" in model_name.lower()
             req: dict[str, Any] = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": temperature,
-                "top_p": 1,
-                "frequency_penalty": 0,
-                "presence_penalty": 0,
             }
+            if not _model_requires_default_temperature(model_name):
+                req.update(
+                    {
+                        "temperature": temperature,
+                        "top_p": 1,
+                        "frequency_penalty": 0,
+                        "presence_penalty": 0,
+                    }
+                )
             if max_new_tokens is not None:
                 token_arg = "max_completion_tokens" if use_max_completion_tokens else "max_tokens"
                 req[token_arg] = max_new_tokens
@@ -460,6 +469,71 @@ def _previous_edges_to_adjacency(previous_edges: dict[str, dict[str, list[str]]]
     return adj
 
 
+def _checkpoint_path_for_output(out_csv: Path) -> Path:
+    return out_csv.with_suffix(out_csv.suffix + ".checkpoint.json")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _pairwise_checkpoint_signature(
+    *,
+    graph_path: Path,
+    sample_size_obs: int,
+    prompt_mode: str,
+    model_name: str,
+    provider: str,
+    temperature: float,
+    max_new_tokens: int | None,
+    seed: int,
+    anonymize: bool,
+) -> dict[str, Any]:
+    return {
+        "graph_file": str(graph_path.resolve()),
+        "sample_size_obs": int(sample_size_obs),
+        "prompt_mode": prompt_mode,
+        "model": model_name,
+        "provider": provider,
+        "temperature": float(temperature),
+        "max_new_tokens": max_new_tokens,
+        "seed": int(seed),
+        "anonymize": bool(anonymize),
+    }
+
+
+def _load_pairwise_checkpoint(path: Path, signature: dict[str, Any]) -> list[str]:
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("signature") != signature:
+        raise SystemExit(
+            f"Checkpoint {path} does not match this run configuration. "
+            "Move it aside or use the same command to resume."
+        )
+    records = payload.get("raw_transcript", [])
+    if not isinstance(records, list):
+        raise SystemExit(f"Malformed checkpoint raw_transcript in {path}")
+    return [str(record) for record in records]
+
+
+def _replay_pairwise_edges(raw_transcript: list[str]) -> dict[str, dict[str, list[str]]]:
+    previous_edges = _new_previous_edges()
+    for raw in raw_transcript:
+        try:
+            record = json.loads(raw)
+        except Exception:
+            continue
+        pair = record.get("pair")
+        choice = record.get("choice")
+        if isinstance(pair, list) and len(pair) == 2 and choice in {"A", "B", "C"}:
+            _add_edge_pairwise(previous_edges, str(pair[0]), str(pair[1]), str(choice))
+    return previous_edges
+
+
 def _pairwise_prompt(
     *,
     user_prompt: str,
@@ -509,6 +583,13 @@ def _extract_pairwise_choice(text: str) -> str | None:
         if first:
             return "A"
     return None
+
+
+def _response_preview(text: str, limit: int = 300) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
 
 
 def _extract_answer_list(text: str) -> list[str]:
@@ -763,6 +844,10 @@ def _run_jiralerspong_pairwise(
     seed: int,
     anonymize: bool,
     hf_pipe: Any,
+    checkpoint_path: Path | None = None,
+    partial_out_csv: Path | None = None,
+    answer: np.ndarray | None = None,
+    naming_regime: str = "real",
 ) -> tuple[np.ndarray, list[str], list[str]]:
     dataset_name = graph_path.stem
     prompts = _PAIRWISE_INIT_PROMPTS.get(
@@ -778,14 +863,37 @@ def _run_jiralerspong_pairwise(
     corr = np.corrcoef(obs, rowvar=False) if prompt_mode == "summary" else None
     rng = random.Random(seed)
     variable_cards = [by_name.get(name, {"name": name, "symbol": name, "description": name}) for name in variables]
-    previous_edges = _new_previous_edges()
-    raw_transcript: list[str] = []
+    signature = _pairwise_checkpoint_signature(
+        graph_path=graph_path,
+        sample_size_obs=sample_size_obs,
+        prompt_mode=prompt_mode,
+        model_name=model_name,
+        provider=provider,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        seed=seed,
+        anonymize=anonymize,
+    )
+    raw_transcript = _load_pairwise_checkpoint(checkpoint_path, signature) if checkpoint_path else []
+    previous_edges = _replay_pairwise_edges(raw_transcript)
+    completed_pairs = len(raw_transcript)
+    total_pairs = len(variables) * (len(variables) - 1) // 2
+    pair_idx = 0
+    if completed_pairs:
+        print(
+            f"[JiralerspongPairwise] resuming from {checkpoint_path} completed_pairs={completed_pairs}",
+            file=sys.stderr,
+            flush=True,
+        )
     for i in range(len(variables)):
         for j in range(i + 1, len(variables)):
+            pair_idx += 1
             head = variables[i]
             tail = variables[j]
             if rng.random() >= 0.5:
                 head, tail = tail, head
+            if pair_idx <= completed_pairs:
+                continue
             known_edges_text = _get_previous_relevant_edges_string(previous_edges, head, tail)
             pearson = None
             if corr is not None:
@@ -802,17 +910,45 @@ def _run_jiralerspong_pairwise(
                 {"role": "system", "content": prompts["system"]},
                 {"role": "user", "content": query},
             ]
-            raw = _call_model_messages(
-                messages=messages,
-                model_name=model_name,
-                provider=provider,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens or 2048,
-                hf_pipe=hf_pipe,
+            raw = ""
+            choice: str | None = None
+            max_attempts = 3 if provider == "openai" else 1
+            for attempt in range(1, max_attempts + 1):
+                print(
+                    f"[JiralerspongPairwise] pair {pair_idx}/{total_pairs}: querying {head} vs {tail} attempt={attempt}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raw = _call_model_messages(
+                    messages=messages,
+                    model_name=model_name,
+                    provider=provider,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens or 2048,
+                    hf_pipe=hf_pipe,
+                )
+                choice = _extract_pairwise_choice(raw)
+                if choice is not None:
+                    break
+                reason = "empty response" if not str(raw).strip() else f"unparseable response: {_response_preview(raw)}"
+                print(
+                    f"[JiralerspongPairwise] pair {pair_idx}/{total_pairs}: {reason}, retrying",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if choice is None:
+                checkpoint_msg = f" Checkpoint preserved at {checkpoint_path}." if checkpoint_path is not None else ""
+                raise RuntimeError(
+                    f"JiralerspongPairwise failed to get a usable <Answer>A/B/C</Answer> "
+                    f"for pair {pair_idx}/{total_pairs}: {head} vs {tail} after {max_attempts} attempt(s). "
+                    f"Last response: {_response_preview(raw) or '<empty>'}.{checkpoint_msg}"
+                )
+            print(
+                f"[JiralerspongPairwise] pair {pair_idx}/{total_pairs}: {head} vs {tail} choice={choice}",
+                file=sys.stderr,
+                flush=True,
             )
-            choice = _extract_pairwise_choice(raw)
-            if choice is not None:
-                _add_edge_pairwise(previous_edges, head, tail, choice)
+            _add_edge_pairwise(previous_edges, head, tail, choice)
             record = {
                 "pair": [head, tail],
                 "pearson_corr": pearson,
@@ -822,7 +958,33 @@ def _run_jiralerspong_pairwise(
                 "choice": choice,
             }
             raw_transcript.append(json.dumps(record, ensure_ascii=False))
-    return _previous_edges_to_adjacency(previous_edges, variables), variables, raw_transcript
+            if checkpoint_path is not None:
+                _atomic_write_json(
+                    checkpoint_path,
+                    {
+                        "version": 1,
+                        "signature": signature,
+                        "raw_transcript": raw_transcript,
+                    },
+                )
+            if partial_out_csv is not None and answer is not None:
+                partial_prediction = _previous_edges_to_adjacency(previous_edges, variables)
+                _write_prediction_csv(
+                    out_csv=partial_out_csv,
+                    method="JiralerspongPairwise",
+                    model_name=model_name,
+                    provider=provider,
+                    sample_size_obs=sample_size_obs,
+                    sample_size_inters=0,
+                    naming_regime=naming_regime,
+                    answer=answer,
+                    prediction=partial_prediction,
+                    raw_responses=raw_transcript,
+                )
+    prediction = _previous_edges_to_adjacency(previous_edges, variables)
+    if checkpoint_path is not None:
+        checkpoint_path.unlink(missing_ok=True)
+    return prediction, variables, raw_transcript
 
 
 def _run_causal_llm_data(
@@ -872,6 +1034,26 @@ def _write_prediction_csv(
     prediction: np.ndarray,
     raw_responses: list[str],
 ) -> None:
+    _write_prediction_rows(
+        out_csv=out_csv,
+        rows=[
+            {
+                "method": method,
+                "model": model_name,
+                "provider": provider,
+                "naming_regime": naming_regime,
+                "obs_n": sample_size_obs,
+                "int_n": sample_size_inters,
+                "raw_response": json.dumps(raw_responses, ensure_ascii=False),
+                "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
+                "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
+                "valid": 1,
+            }
+        ],
+    )
+
+
+def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -890,20 +1072,7 @@ def _write_prediction_csv(
             ],
         )
         writer.writeheader()
-        writer.writerow(
-            {
-                "method": method,
-                "model": model_name,
-                "provider": provider,
-                "naming_regime": naming_regime,
-                "obs_n": sample_size_obs,
-                "int_n": sample_size_inters,
-                "raw_response": json.dumps(raw_responses, ensure_ascii=False),
-                "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
-                "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
-                "valid": 1,
-            }
-        )
+        writer.writerows(rows)
 
 
 def main() -> int:
@@ -918,6 +1087,7 @@ def main() -> int:
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--num_prompts", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--edge_threshold", type=float, default=0.5)
     parser.add_argument("--prompt_mode", choices=["names_only", "summary", "summary_joint"], default="names_only")
@@ -926,6 +1096,8 @@ def main() -> int:
 
     if args.prompt_mode == "summary_joint":
         args.prompt_mode = "summary"
+    if args.num_prompts <= 0:
+        raise SystemExit("--num_prompts must be > 0.")
 
     names_only_methods = {"TakayamaSCP", "CausalLLMPrompt"}
     if args.method in names_only_methods and args.prompt_mode != "names_only":
@@ -956,74 +1128,6 @@ def main() -> int:
         graph_path = Path(graph_file).resolve()
         _graph, _base_variables, answer = _load_graph_context(graph_path)
         anonymize = args.naming_regime == "anonymized"
-
-        if args.method == "TakayamaSCP":
-            prediction, _variables, raw_responses = _run_takayama_scp(
-                graph_path=graph_path,
-                model_name=args.model,
-                provider=provider,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                num_samples=args.num_samples,
-                edge_threshold=args.edge_threshold,
-                anonymize=anonymize,
-                hf_pipe=hf_pipe,
-            )
-        elif args.method == "JiralerspongBFS":
-            prediction, _variables, raw_responses = _run_jiralerspong_bfs(
-                graph_path=graph_path,
-                sample_size_obs=args.sample_size_obs,
-                sample_size_inters=args.sample_size_inters,
-                prompt_mode=args.prompt_mode,
-                model_name=args.model,
-                provider=provider,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                anonymize=anonymize,
-                hf_pipe=hf_pipe,
-            )
-        elif args.method == "JiralerspongPairwise":
-            prediction, _variables, raw_responses = _run_jiralerspong_pairwise(
-                graph_path=graph_path,
-                sample_size_obs=args.sample_size_obs,
-                prompt_mode=args.prompt_mode,
-                model_name=args.model,
-                provider=provider,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                anonymize=anonymize,
-                hf_pipe=hf_pipe,
-            )
-        elif args.method == "CausalLLMPrompt":
-            prediction, _variables, raw_responses = _run_causal_llm_prompt(
-                graph_path=graph_path,
-                model_name=args.model,
-                provider=provider,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                anonymize=anonymize,
-                hf_pipe=hf_pipe,
-            )
-        elif args.method == "CausalLLMData":
-            prediction, _variables, raw_responses = _run_causal_llm_data(
-                graph_path=graph_path,
-                sample_size_obs=args.sample_size_obs,
-                sample_size_inters=args.sample_size_inters,
-                model_name=args.model,
-                provider=provider,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                anonymize=anonymize,
-                hf_pipe=hf_pipe,
-            )
-        else:
-            raise SystemExit(f"Unsupported method: {args.method}")
-
         naming_suffix = ""
         if args.naming_regime == "anonymized":
             naming_suffix = "_anon"
@@ -1032,18 +1136,100 @@ def main() -> int:
         out_csv = Path(args.out_dir) / graph_path.stem / (
             f"predictions_obs{args.sample_size_obs}_int{args.sample_size_inters}_{args.method}{naming_suffix}.csv"
         )
-        _write_prediction_csv(
-            out_csv=out_csv,
-            method=args.method,
-            model_name=args.model,
-            provider=provider,
-            sample_size_obs=args.sample_size_obs,
-            sample_size_inters=args.sample_size_inters,
-            naming_regime=args.naming_regime,
-            answer=answer,
-            prediction=prediction,
-            raw_responses=raw_responses,
-        )
+
+        rows: list[dict[str, Any]] = []
+        for prompt_idx in range(args.num_prompts):
+            seed_i = int(args.seed) + prompt_idx * 1000
+            if args.method == "TakayamaSCP":
+                prediction, _variables, raw_responses = _run_takayama_scp(
+                    graph_path=graph_path,
+                    model_name=args.model,
+                    provider=provider,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=seed_i,
+                    num_samples=args.num_samples,
+                    edge_threshold=args.edge_threshold,
+                    anonymize=anonymize,
+                    hf_pipe=hf_pipe,
+                )
+            elif args.method == "JiralerspongBFS":
+                prediction, _variables, raw_responses = _run_jiralerspong_bfs(
+                    graph_path=graph_path,
+                    sample_size_obs=args.sample_size_obs,
+                    sample_size_inters=args.sample_size_inters,
+                    prompt_mode=args.prompt_mode,
+                    model_name=args.model,
+                    provider=provider,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=seed_i,
+                    anonymize=anonymize,
+                    hf_pipe=hf_pipe,
+                )
+            elif args.method == "JiralerspongPairwise":
+                checkpoint_path = _checkpoint_path_for_output(out_csv)
+                if args.num_prompts > 1:
+                    checkpoint_path = out_csv.with_suffix(out_csv.suffix + f".rep{prompt_idx}.checkpoint.json")
+                prediction, _variables, raw_responses = _run_jiralerspong_pairwise(
+                    graph_path=graph_path,
+                    sample_size_obs=args.sample_size_obs,
+                    prompt_mode=args.prompt_mode,
+                    model_name=args.model,
+                    provider=provider,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=seed_i,
+                    anonymize=anonymize,
+                    hf_pipe=hf_pipe,
+                    checkpoint_path=checkpoint_path,
+                    partial_out_csv=(out_csv if args.num_prompts == 1 else None),
+                    answer=answer,
+                    naming_regime=args.naming_regime,
+                )
+            elif args.method == "CausalLLMPrompt":
+                prediction, _variables, raw_responses = _run_causal_llm_prompt(
+                    graph_path=graph_path,
+                    model_name=args.model,
+                    provider=provider,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=seed_i,
+                    anonymize=anonymize,
+                    hf_pipe=hf_pipe,
+                )
+            elif args.method == "CausalLLMData":
+                prediction, _variables, raw_responses = _run_causal_llm_data(
+                    graph_path=graph_path,
+                    sample_size_obs=args.sample_size_obs,
+                    sample_size_inters=args.sample_size_inters,
+                    model_name=args.model,
+                    provider=provider,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=seed_i,
+                    anonymize=anonymize,
+                    hf_pipe=hf_pipe,
+                )
+            else:
+                raise SystemExit(f"Unsupported method: {args.method}")
+
+            rows.append(
+                {
+                    "method": args.method,
+                    "model": args.model,
+                    "provider": provider,
+                    "naming_regime": args.naming_regime,
+                    "obs_n": args.sample_size_obs,
+                    "int_n": args.sample_size_inters,
+                    "raw_response": json.dumps(raw_responses, ensure_ascii=False),
+                    "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
+                    "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
+                    "valid": 1,
+                }
+            )
+
+        _write_prediction_rows(out_csv=out_csv, rows=rows)
         print(f"[{args.method}] wrote {out_csv.resolve()}")
 
     return 0

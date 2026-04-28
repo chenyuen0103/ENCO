@@ -234,12 +234,13 @@ def call_gemini(
 # Adjust this list/pattern as you observe behavior.
 _OPENAI_FIXED_TEMP_PAT = re.compile(r"^(o\d|o-|o3|o4)\b", re.IGNORECASE)
 _OPENAI_FIXED_TEMP_SET = {
-    "gpt-4.1", "gpt-4.1-mini",
-    # add other exact names if you encounter them
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
 }
 
 def _model_requires_default_temperature(model_name: str) -> bool:
-    mn = (model_name or "").strip()
+    mn = (model_name or "").strip().lower()
     return bool(_OPENAI_FIXED_TEMP_PAT.match(mn)) or (mn in _OPENAI_FIXED_TEMP_SET)
 
 def _infer_dataset_name_from_csv_path(csv_path: Path) -> Optional[str]:
@@ -274,14 +275,14 @@ def call_openai(
     model_name: str,
     prompt: str,
     *,
-    temperature: float = 0.0,   # caller can still pass 0.0, we'll omit it on the wire
+    temperature: float = 0.0,
     api_key: Optional[str] = None,
     max_retries: int = 0,
     request_timeout: float = 6000.0,
 ) -> str:
     """
     Call an OpenAI model once via the Responses API.
-    - Omits 'temperature' if it is None, 0.0, or 1.0 (default-only models like 'gpt-5-mini').
+    - Omits 'temperature' only for default-only models like 'gpt-5-mini'.
     - Returns '[ERROR] ...' on failure.
     """
     try:
@@ -349,16 +350,15 @@ def call_openai(
                 )
             )
 
-        # Build request kwargs. Do NOT include temperature if it's default-like.
+        # Build request kwargs. Some OpenAI models reject any explicit temperature.
         req: Dict[str, Any] = {"model": model_name, "input": prompt}
         try:
             t = float(temperature) if temperature is not None else None
         except Exception:
             t = None
 
-        # Only include temperature if it is a non-default value not equal to 1.0.
-        if t is not None and t not in (0.0, 1.0):
-            req["temperature"] = t  # include only when explicitly non-default
+        if t is not None and not _model_requires_default_temperature(model_name):
+            req["temperature"] = t
 
         # Retry on transient-ish failures (rate limit + 5xx/transport).
         last_exc: Optional[Exception] = None
@@ -459,6 +459,7 @@ def build_hf_pipeline(
     device_map: Optional[str] = None,
     torch_dtype: Optional[str] = None,
     clear_length_cap: bool = True,
+    merge_lora: bool = False,
 ):
     """
     Build a Hugging Face text-generation pipeline for the given model name.
@@ -539,6 +540,17 @@ def build_hf_pipeline(
                 device_map=device_map if device_map else None,
                 dtype=dtype_val if dtype_val is not None else None,
             )
+            if merge_lora:
+                try:
+                    model.eval()
+                except Exception:
+                    pass
+                try:
+                    model = model.merge_and_unload()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to merge LoRA adapter for '{model_name}': {type(e).__name__}: {e}"
+                    ) from e
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,

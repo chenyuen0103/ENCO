@@ -135,7 +135,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1
+      "num_samples": 5
     },
     {
       "name": "JiralerspongBFS",
@@ -144,7 +144,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1
+      "num_samples": 5
     },
     {
       "name": "TakayamaSCP",
@@ -153,7 +153,7 @@
       "model": "gpt-5-mini",
       "provider": "auto",
       "temperature": 0.0,
-      "num_samples": 1,
+      "num_samples": 5,
       "takayama_pattern": 2,
       "takayama_bootstrap_samples": 100
     }

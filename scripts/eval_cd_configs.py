@@ -1157,6 +1157,14 @@ def main() -> None:
         help='HF device_map for model load (e.g. "auto", "cuda:0", "none").',
     )
     ap.add_argument(
+        "--hf-merge-lora",
+        action="store_true",
+        help=(
+            "For PEFT/LoRA adapter checkpoints, merge the adapter into the base model once at load time. "
+            "This avoids runtime LoRA layers during generation and can reduce memory use for long-context eval."
+        ),
+    )
+    ap.add_argument(
         "--hf-batch-size",
         type=int,
         default=1,
@@ -1462,7 +1470,7 @@ def main() -> None:
             for shuf_n in shuf_values
         ]
 
-    hf_pipe_cache: dict[tuple[str, str | None, str], Any] = {}
+    hf_pipe_cache: dict[tuple[str, str | None, str, bool], Any] = {}
     vllm_engine_cache: dict[tuple[str, int, str, int, float, bool], Any] = {}
     vllm_log_tee: _FdTee | None = None
     using_explicit_config_file = args.config_file is not None
@@ -1663,11 +1671,12 @@ def main() -> None:
                                         vllm_batch_size = max(1, int(args.hf_batch_size))
                                     if provider == "hf":
                                         dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
-                                        hf_key = (model, dm, str(args.hf_dtype))
+                                        hf_key = (model, dm, str(args.hf_dtype), bool(args.hf_merge_lora))
                                         hf_pipe = hf_pipe_cache.get(hf_key)
                                         if hf_pipe is None:
                                             print(
-                                                f"[hf:init] loading HF pipeline once for model={model} device_map={dm} dtype={args.hf_dtype}",
+                                                f"[hf:init] loading HF pipeline once for model={model} device_map={dm} "
+                                                f"dtype={args.hf_dtype} merge_lora={bool(args.hf_merge_lora)}",
                                                 file=sys.stderr,
                                                 flush=True,
                                             )
@@ -1675,6 +1684,7 @@ def main() -> None:
                                                 model,
                                                 device_map=dm,
                                                 torch_dtype=args.hf_dtype,
+                                                merge_lora=bool(args.hf_merge_lora),
                                             )
                                             hf_pipe_cache[hf_key] = hf_pipe
                                         else:
