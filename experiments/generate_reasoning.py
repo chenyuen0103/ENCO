@@ -69,6 +69,7 @@ Compatible with train_sft.py --sft-jsonl.
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import itertools
 import json
@@ -76,11 +77,14 @@ import math
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -139,6 +143,116 @@ class TeacherConfig:
     max_revisions: int = 1
     retry_until_valid: bool = False
     retry_sleep_s: float = 0.0
+
+
+def _wait_for_vllm_server(base_url: str, *, timeout_s: float, proc: subprocess.Popen | None = None) -> None:
+    deadline = time.time() + float(timeout_s)
+    url = base_url.rstrip("/") + "/models"
+    last_error = ""
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"vLLM teacher server exited early with code {proc.returncode}.")
+        try:
+            req = Request(url, headers={"Authorization": "Bearer dummy"})
+            with urlopen(req, timeout=5.0) as resp:
+                if 200 <= int(resp.status) < 300:
+                    return
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        time.sleep(2.0)
+    raise TimeoutError(f"Timed out waiting for vLLM teacher server at {url}. Last error: {last_error}")
+
+
+def _terminate_process_tree(proc: subprocess.Popen, *, name: str) -> None:
+    if proc.poll() is not None:
+        return
+    print(f"[teacher-vllm] stopping {name} pid={proc.pid}", flush=True)
+    try:
+        proc.terminate()
+        proc.wait(timeout=20)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+def _launch_teacher_vllm(args: argparse.Namespace) -> tuple[subprocess.Popen, str]:
+    model = str(args.teacher_vllm_model or args.teacher_model or "").strip()
+    if not model:
+        raise ValueError("--auto-launch-teacher-vllm requires --teacher-model or --teacher-vllm-model")
+
+    host = str(args.teacher_vllm_host)
+    port = int(args.teacher_vllm_port)
+    base_url = f"http://{host}:{port}/v1"
+    log_path = Path(args.teacher_vllm_log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = log_path.open("w", encoding="utf-8")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        model,
+        "--served-model-name",
+        str(args.teacher_model or model),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--tensor-parallel-size",
+        str(int(args.teacher_vllm_tensor_parallel_size)),
+        "--dtype",
+        str(args.teacher_vllm_dtype),
+        "--gpu-memory-utilization",
+        str(float(args.teacher_vllm_gpu_memory_utilization)),
+        "--max-model-len",
+        str(int(args.teacher_vllm_max_model_len)),
+    ]
+    quantization = str(args.teacher_vllm_quantization or "").strip()
+    if quantization:
+        cmd.extend(["--quantization", quantization])
+
+    extra_args = list(args.teacher_vllm_extra_args or [])
+    if extra_args:
+        cmd.extend(extra_args)
+
+    env = os.environ.copy()
+    if args.teacher_vllm_cuda_visible_devices:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.teacher_vllm_cuda_visible_devices)
+    env.setdefault(str(args.teacher_api_key_env), "dummy")
+    env.setdefault("VLLM_API_KEY", env.get(str(args.teacher_api_key_env), "dummy"))
+
+    print("[teacher-vllm] launching:", " ".join(cmd), flush=True)
+    print(f"[teacher-vllm] log file: {log_path}", flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(Path.cwd()),
+        env=env,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    def _cleanup() -> None:
+        _terminate_process_tree(proc, name="teacher vLLM server")
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+    try:
+        _wait_for_vllm_server(base_url, timeout_s=float(args.teacher_vllm_startup_timeout), proc=proc)
+    except Exception:
+        _cleanup()
+        raise
+    print(f"[teacher-vllm] ready at {base_url}", flush=True)
+    return proc, base_url
 
 
 # ---------------------------------------------------------------------------
@@ -1485,6 +1599,39 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--auto-launch-teacher-vllm",
+        action="store_true",
+        help=(
+            "Launch an OpenAI-compatible vLLM teacher server before generation "
+            "and stop it when this script exits. Requires teacher_provider=openai_compatible."
+        ),
+    )
+    ap.add_argument(
+        "--teacher-vllm-model",
+        default=None,
+        help="Model id/path for the auto-launched teacher vLLM server. Defaults to --teacher-model.",
+    )
+    ap.add_argument("--teacher-vllm-host", default="127.0.0.1")
+    ap.add_argument("--teacher-vllm-port", type=int, default=8000)
+    ap.add_argument("--teacher-vllm-cuda-visible-devices", default=None)
+    ap.add_argument("--teacher-vllm-tensor-parallel-size", type=int, default=1)
+    ap.add_argument("--teacher-vllm-dtype", default="auto")
+    ap.add_argument("--teacher-vllm-quantization", default="")
+    ap.add_argument("--teacher-vllm-gpu-memory-utilization", type=float, default=0.90)
+    ap.add_argument("--teacher-vllm-max-model-len", type=int, default=32768)
+    ap.add_argument("--teacher-vllm-startup-timeout", type=float, default=600.0)
+    ap.add_argument(
+        "--teacher-vllm-log-file",
+        type=Path,
+        default=Path("experiments/logs/teacher_vllm.log"),
+    )
+    ap.add_argument(
+        "--teacher-vllm-extra-args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Extra arguments appended to vLLM api_server command. Must be last if used.",
+    )
+    ap.add_argument(
         "--teacher-api-key-env",
         default="OPENAI_API_KEY",
         help="Environment variable containing the teacher API key.",
@@ -1616,6 +1763,12 @@ def main() -> None:
     if args.prompt_style == "summary_joint":
         args.prompt_style = "summary"
     reasoning_targets = _parse_reasoning_targets(args.reasoning_target)
+    if bool(args.auto_launch_teacher_vllm):
+        if str(args.teacher_provider) != "openai_compatible":
+            sys.exit("ERROR: --auto-launch-teacher-vllm requires --teacher-provider openai_compatible")
+        _teacher_proc, launched_base_url = _launch_teacher_vllm(args)
+        args.teacher_base_url = launched_base_url
+        os.environ.setdefault(str(args.teacher_api_key_env), "dummy")
     teacher_config: Optional[TeacherConfig] = None
     if "teacher_evidence" in reasoning_targets:
         if not args.teacher_model:

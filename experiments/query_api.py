@@ -240,11 +240,14 @@ def call_gemini(
 
 # Heuristic: some OpenAI models enforce default decoding and reject any temperature value.
 # Adjust this list/pattern as you observe behavior.
-_OPENAI_FIXED_TEMP_PAT = re.compile(r"^(o\d|o-|o3|o4)\b", re.IGNORECASE)
+_OPENAI_FIXED_TEMP_PAT = re.compile(r"^(o\d|o-|o3|o4|gpt-5(?:[.\-]|$))", re.IGNORECASE)
 _OPENAI_FIXED_TEMP_SET = {
     "gpt-5",
     "gpt-5-mini",
     "gpt-5-nano",
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "gpt-5.2-codex",
 }
 
 def _model_requires_default_temperature(model_name: str) -> bool:
