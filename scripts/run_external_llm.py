@@ -725,6 +725,11 @@ def _run_jiralerspong_bfs(
     variable_cards = _load_variable_metadata(graph_path)
     dataset_name = graph_path.stem
     variables = [item["name"] for item in variable_cards]
+    print(
+        f"[JiralerspongBFS] start dataset={dataset_name} seed={seed} "
+        f"obs={sample_size_obs} vars={len(variables)}",
+        flush=True,
+    )
     corr = None
     if prompt_mode == "summary":
         obs, obs_variables = _load_observational_array(graph_path, sample_size_obs=sample_size_obs, seed=seed)
@@ -750,6 +755,11 @@ def _run_jiralerspong_bfs(
     )
     message_history.append({"role": "assistant", "content": initial_raw})
     independent_nodes = _extract_answer_list(initial_raw)
+    print(
+        f"[JiralerspongBFS] init done seed={seed} independent={len(independent_nodes)} "
+        f"{independent_nodes}",
+        flush=True,
+    )
     unvisited_nodes = list(variables)
     for node in independent_nodes:
         if node in unvisited_nodes:
@@ -757,7 +767,11 @@ def _run_jiralerspong_bfs(
     frontier: list[str] = []
     predict_graph: dict[str, list[str]] = {}
 
-    for to_visit in independent_nodes:
+    for root_idx, to_visit in enumerate(independent_nodes, start=1):
+        print(
+            f"[JiralerspongBFS] root {root_idx}/{len(independent_nodes)} seed={seed}: {to_visit}",
+            flush=True,
+        )
         prompt = "Given " + ", ".join(independent_nodes) + " is(are) not affected by any other variable"
         if len(predict_graph) == 0:
             prompt += ".\n"
@@ -788,9 +802,18 @@ def _run_jiralerspong_bfs(
         for node in answer:
             if node in unvisited_nodes and node not in frontier:
                 frontier.append(node)
+        print(
+            f"[JiralerspongBFS] root {root_idx}/{len(independent_nodes)} done seed={seed}: "
+            f"children={len(answer)} frontier={len(frontier)}",
+            flush=True,
+        )
 
     while len(frontier) > 0:
         to_visit = frontier.pop(0)
+        print(
+            f"[JiralerspongBFS] frontier seed={seed}: visiting={to_visit} remaining={len(frontier)}",
+            flush=True,
+        )
         if to_visit in unvisited_nodes:
             unvisited_nodes.remove(to_visit)
         prompt = "Given " + ", ".join(independent_nodes) + " is(are) not affected by any other variable and the following causal relationships.\n"
@@ -819,6 +842,11 @@ def _run_jiralerspong_bfs(
         for node in answer:
             if node in unvisited_nodes and node not in frontier:
                 frontier.append(node)
+        print(
+            f"[JiralerspongBFS] frontier done seed={seed}: {to_visit} "
+            f"children={len(answer)} frontier={len(frontier)}",
+            flush=True,
+        )
 
     adj = np.zeros((len(variables), len(variables)), dtype=int)
     index_by_name = {name: idx for idx, name in enumerate(variables)}
@@ -829,6 +857,11 @@ def _run_jiralerspong_bfs(
             if node in index_by_name:
                 adj[index_by_name[head], index_by_name[node]] = 1
 
+    print(
+        f"[JiralerspongBFS] done dataset={dataset_name} seed={seed} "
+        f"edges={int(adj.sum())}",
+        flush=True,
+    )
     return adj, variables, raw_transcript
 
 
@@ -1069,10 +1102,26 @@ def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None
                 "answer",
                 "prediction",
                 "valid",
+                "replicate_index",
+                "replicate_seed",
             ],
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _read_completed_replicate_rows(out_csv: Path) -> dict[int, dict[str, Any]]:
+    if not out_csv.exists():
+        return {}
+    rows: dict[int, dict[str, Any]] = {}
+    with out_csv.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                rep = int(row.get("replicate_index", ""))
+            except Exception:
+                continue
+            rows[rep] = dict(row)
+    return rows
 
 
 def main() -> int:
@@ -1137,9 +1186,20 @@ def main() -> int:
             f"predictions_obs{args.sample_size_obs}_int{args.sample_size_inters}_{args.method}_seed{int(args.seed)}{naming_suffix}.csv"
         )
 
-        rows: list[dict[str, Any]] = []
+        rows_by_replicate = _read_completed_replicate_rows(out_csv)
         for prompt_idx in range(args.num_prompts):
+            if prompt_idx in rows_by_replicate:
+                print(
+                    f"[{args.method}] replicate {prompt_idx + 1}/{args.num_prompts} "
+                    f"already present in {out_csv}; skipping",
+                    flush=True,
+                )
+                continue
             seed_i = int(args.seed) + prompt_idx * 1000
+            print(
+                f"[{args.method}] replicate {prompt_idx + 1}/{args.num_prompts} start seed={seed_i}",
+                flush=True,
+            )
             if args.method == "TakayamaSCP":
                 prediction, _variables, raw_responses = _run_takayama_scp(
                     graph_path=graph_path,
@@ -1214,22 +1274,28 @@ def main() -> int:
             else:
                 raise SystemExit(f"Unsupported method: {args.method}")
 
-            rows.append(
-                {
-                    "method": args.method,
-                    "model": args.model,
-                    "provider": provider,
-                    "naming_regime": args.naming_regime,
-                    "obs_n": args.sample_size_obs,
-                    "int_n": args.sample_size_inters,
-                    "raw_response": json.dumps(raw_responses, ensure_ascii=False),
-                    "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
-                    "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
-                    "valid": 1,
-                }
+            rows_by_replicate[prompt_idx] = {
+                "method": args.method,
+                "model": args.model,
+                "provider": provider,
+                "naming_regime": args.naming_regime,
+                "obs_n": args.sample_size_obs,
+                "int_n": args.sample_size_inters,
+                "raw_response": json.dumps(raw_responses, ensure_ascii=False),
+                "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
+                "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
+                "valid": 1,
+                "replicate_index": prompt_idx,
+                "replicate_seed": seed_i,
+            }
+            _write_prediction_rows(out_csv=out_csv, rows=[rows_by_replicate[idx] for idx in sorted(rows_by_replicate)])
+            print(
+                f"[{args.method}] replicate {prompt_idx + 1}/{args.num_prompts} done; "
+                f"rows={len(rows_by_replicate)}/{args.num_prompts}",
+                flush=True,
             )
 
-        _write_prediction_rows(out_csv=out_csv, rows=rows)
+        _write_prediction_rows(out_csv=out_csv, rows=[rows_by_replicate[idx] for idx in sorted(rows_by_replicate)])
         print(f"[{args.method}] wrote {out_csv.resolve()}")
 
     return 0

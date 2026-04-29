@@ -732,10 +732,17 @@ def _load_checkpoint_payload(checkpoint_path: Path, run_signature: dict[str, Any
         raise SystemExit(f"Unsupported checkpoint version in {checkpoint_path}. Delete it and rerun.")
     saved_signature = payload.get("run_signature")
     if saved_signature != run_signature:
-        raise SystemExit(
-            f"Checkpoint {checkpoint_path} does not match this run configuration. "
-            "Delete it and rerun, or use a different output path."
+        stale_path = checkpoint_path.with_name(f"{checkpoint_path.name}.stale-{int(time.time())}")
+        checkpoint_path.replace(stale_path)
+        _progress(
+            f"archived incompatible checkpoint {checkpoint_path} -> {stale_path}; starting this replicate fresh"
         )
+        return {
+            "version": 1,
+            "run_signature": run_signature,
+            "completed_pairs": [],
+            "current_pair": None,
+        }
     payload.setdefault("completed_pairs", [])
     payload.setdefault("current_pair", None)
     return payload
@@ -1095,6 +1102,8 @@ def _write_prediction_csv(
                 transcript=transcript,
                 probability_matrix=probability_matrix,
                 prior_matrix=prior_matrix,
+                replicate_index=None,
+                replicate_seed=None,
             )
         ],
     )
@@ -1113,6 +1122,8 @@ def _prediction_row(
     transcript: list[dict[str, Any]],
     probability_matrix: np.ndarray,
     prior_matrix: np.ndarray,
+    replicate_index: int | None = None,
+    replicate_seed: int | None = None,
 ) -> dict[str, Any]:
     return {
         "method": "TakayamaSCP",
@@ -1127,6 +1138,8 @@ def _prediction_row(
             {
                 "backend": backend,
                 "pattern": pattern,
+                "replicate_index": replicate_index,
+                "replicate_seed": replicate_seed,
                 "probability_matrix_effect_by_cause": probability_matrix.tolist(),
                 "prior_matrix_effect_by_cause": np.asarray(prior_matrix).tolist(),
                 "transcript": transcript,
@@ -1136,6 +1149,8 @@ def _prediction_row(
         "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
         "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
         "valid": 1,
+        "replicate_index": "" if replicate_index is None else int(replicate_index),
+        "replicate_seed": "" if replicate_seed is None else int(replicate_seed),
     }
 
 
@@ -1157,10 +1172,33 @@ def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None
                 "answer",
                 "prediction",
                 "valid",
+                "replicate_index",
+                "replicate_seed",
             ],
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _read_completed_replicate_rows(out_csv: Path) -> dict[int, dict[str, Any]]:
+    if not out_csv.exists():
+        return {}
+    old_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(sys.maxsize)
+        with out_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows: dict[int, dict[str, Any]] = {}
+            for row in reader:
+                raw_rep = row.get("replicate_index", "")
+                try:
+                    rep = int(raw_rep)
+                except Exception:
+                    continue
+                rows[rep] = dict(row)
+            return rows
+    finally:
+        csv.field_size_limit(old_limit)
 
 
 def _repair_probability_matrix_from_transcript(raw_response: dict[str, Any], n: int) -> tuple[np.ndarray, list[dict[str, Any]]]:
@@ -1240,14 +1278,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_size_obs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--model", type=str, default="gpt-5-mini")
+    parser.add_argument("--model", type=str, default="gpt-4.1")
     parser.add_argument("--provider", type=str, default="auto")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--max_new_tokens_first", type=int, default=None)
     parser.add_argument("--max_new_tokens_second", type=int, default=None)
     parser.add_argument("--num_prompts", type=int, default=1)
-    parser.add_argument("--num_samples", type=int, default=5)
+    parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--bootstrap_samples", type=int, default=100)
     parser.add_argument("--backend", choices=sorted(TAKAYAMA_BACKENDS), default="pc")
     parser.add_argument("--takayama_pattern", type=int, default=2)
@@ -1299,9 +1337,17 @@ def main() -> int:
             f"predictions_obs{args.sample_size_obs}_int0_TakayamaSCP{_backend_suffix(backend)}_p{int(args.takayama_pattern)}_seed{int(args.seed)}{naming_suffix}.csv"
         )
 
-        rows: list[dict[str, Any]] = []
+        rows_by_replicate = _read_completed_replicate_rows(out_csv)
+        if rows_by_replicate:
+            _progress(f"loaded {len(rows_by_replicate)} completed replicate rows from {out_csv}")
         for prompt_idx in range(args.num_prompts):
             seed_i = int(args.seed) + prompt_idx * 1000
+            checkpoint_path = _checkpoint_path_for_output(out_csv)
+            if args.num_prompts > 1:
+                checkpoint_path = out_csv.with_suffix(out_csv.suffix + f".rep{prompt_idx}.checkpoint.json")
+            if prompt_idx in rows_by_replicate and not checkpoint_path.exists():
+                _progress(f"replicate {prompt_idx + 1}/{args.num_prompts}: already present in output csv; skipping")
+                continue
             _progress(f"replicate {prompt_idx + 1}/{args.num_prompts}: loading observational dataframe seed={seed_i}")
             _raw_df, std_df, var_names, answer = _load_observational_frames(graph_path, args.sample_size_obs, seed_i)
             _progress(f"loaded dataframe: rows={std_df.shape[0]}, cols={std_df.shape[1]}")
@@ -1345,9 +1391,6 @@ def main() -> int:
             else:
                 labels = list(var_names)
 
-            checkpoint_path = _checkpoint_path_for_output(out_csv)
-            if args.num_prompts > 1:
-                checkpoint_path = out_csv.with_suffix(out_csv.suffix + f".rep{prompt_idx}.checkpoint.json")
             run_signature = _build_run_signature(
                 graph_path=graph_path,
                 backend=backend,
@@ -1392,26 +1435,33 @@ def main() -> int:
                 probability_matrix=probability_matrix,
             )
             _progress("constrained backend done")
-            rows.append(
-                _prediction_row(
-                    backend=backend,
-                    pattern=args.takayama_pattern,
-                    model_name=args.model,
-                    provider=provider,
-                    naming_regime=args.naming_regime,
-                    sample_size_obs=args.sample_size_obs,
-                    answer=answer,
-                    prediction=prediction,
-                    transcript=transcript,
-                    probability_matrix=probability_matrix,
-                    prior_matrix=prior_matrix,
-                )
+            rows_by_replicate[prompt_idx] = _prediction_row(
+                backend=backend,
+                pattern=args.takayama_pattern,
+                model_name=args.model,
+                provider=provider,
+                naming_regime=args.naming_regime,
+                sample_size_obs=args.sample_size_obs,
+                answer=answer,
+                prediction=prediction,
+                transcript=transcript,
+                probability_matrix=probability_matrix,
+                prior_matrix=prior_matrix,
+                replicate_index=prompt_idx,
+                replicate_seed=seed_i,
+            )
+            _write_prediction_rows(
+                out_csv=out_csv,
+                rows=[rows_by_replicate[idx] for idx in sorted(rows_by_replicate)],
             )
             checkpoint_path.unlink(missing_ok=True)
 
         if not args.repair_existing_csv:
             _progress("writing output csv")
-            _write_prediction_rows(out_csv=out_csv, rows=rows)
+            _write_prediction_rows(
+                out_csv=out_csv,
+                rows=[rows_by_replicate[idx] for idx in sorted(rows_by_replicate)],
+            )
         else:
             continue
         _progress(f"wrote {out_csv.resolve()}")

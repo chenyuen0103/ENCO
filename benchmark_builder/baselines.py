@@ -13,6 +13,7 @@ from .interfaces import BaselineAdapter
 from .schema import BaselineSpec, BenchmarkSpec, DatasetSpec, PromptCellSpec
 
 PYTHON_EXE = sys.executable or "python3"
+TAKAYAMA_DEFAULT_MODEL = "gpt-4.1"
 
 
 def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
@@ -28,6 +29,31 @@ def _reuse_if_exists(path: Path, *, dry_run: bool) -> bool:
     if path.exists():
         print(f"[reuse] {path}")
         return True
+    return False
+
+
+def _csv_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    old_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(sys.maxsize)
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+    finally:
+        csv.field_size_limit(old_limit)
+
+
+def _reuse_if_has_rows(path: Path, *, dry_run: bool, min_rows: int) -> bool:
+    if dry_run:
+        return False
+    if not path.exists():
+        return False
+    rows = _csv_row_count(path)
+    if rows >= min_rows:
+        print(f"[reuse] {path} rows={rows}")
+        return True
+    print(f"[rerun] {path} rows={rows} < required={min_rows}")
     return False
 
 
@@ -48,15 +74,19 @@ def _unseeded_variant_path(path: Path) -> Path:
     return path.with_name(name)
 
 
-def _materialize_existing_csv_copy(*, source_csv: Path, out_csv: Path, dry_run: bool) -> bool:
+def _materialize_existing_csv_copy(*, source_csv: Path, out_csv: Path, dry_run: bool, min_rows: int = 1) -> bool:
     if not source_csv.exists():
         return False
+    rows = _csv_row_count(source_csv)
+    if rows < min_rows:
+        print(f"[skip:unseeded] {source_csv} rows={rows} < required={min_rows}")
+        return False
     if dry_run:
-        print(f"[dry-run][reuse:unseeded] {source_csv} -> {out_csv}")
+        print(f"[dry-run][reuse:unseeded] {source_csv} -> {out_csv} rows={rows}")
         return True
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source_csv, out_csv)
-    print(f"[reuse:unseeded] {source_csv} -> {out_csv}")
+    print(f"[reuse:unseeded] {source_csv} -> {out_csv} rows={rows}")
     return True
 
 
@@ -260,13 +290,14 @@ class ClassicalBaselineAdapter(BaselineAdapter):
     ) -> Path:
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
         seed = _effective_seed(baseline, spec)
+        num_prompts = max(1, int(getattr(spec, "num_prompts", 1)))
         out_csv = self.repo_root / "experiments" / "responses" / dataset.name / (
             f"predictions_obs{sample_size_obs}_int0_{self.method_name}{_seed_suffix(seed)}.csv"
         )
         legacy_out_csv = _unseeded_variant_path(out_csv)
-        if _reuse_if_exists(out_csv, dry_run=dry_run):
+        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
-        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run):
+        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
         cmd = [
             PYTHON_EXE,
@@ -279,6 +310,8 @@ class ClassicalBaselineAdapter(BaselineAdapter):
             str(sample_size_obs),
             "--seed",
             str(seed),
+            "--num_prompts",
+            str(num_prompts),
             "--out_dir",
             str(self.repo_root / "experiments" / "responses"),
         ]
@@ -335,6 +368,7 @@ class ENCOBaselineAdapter(BaselineAdapter):
         dry_run: bool,
     ) -> Path:
         seed = _effective_seed(baseline, spec)
+        num_prompts = max(1, int(getattr(spec, "num_prompts", 1)))
         checkpoint_dir_base = baseline.checkpoint_dir or (
             f"experiments/checkpoints/benchmarks/{spec.name}/{dataset.name}/obs{cell.obs_per_prompt}_int{cell.int_per_combo}/ENCO"
         )
@@ -354,6 +388,8 @@ class ENCOBaselineAdapter(BaselineAdapter):
             str(baseline.max_inters),
             "--seed",
             str(seed),
+            "--num_prompts",
+            str(num_prompts),
             "--checkpoint_dir",
             checkpoint_dir,
         ]
@@ -362,9 +398,9 @@ class ENCOBaselineAdapter(BaselineAdapter):
             f"predictions_obs{sample_size_obs}_int{sample_size_inters}_ENCO{_seed_suffix(seed)}.csv"
         )
         legacy_out_csv = _unseeded_variant_path(out_csv)
-        if _reuse_if_exists(out_csv, dry_run=dry_run):
+        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
-        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run):
+        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
         _run(cmd, cwd=self.repo_root / "experiments", dry_run=dry_run)
         return out_csv
@@ -433,6 +469,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
         sample_size_inters = self._effective_sample_size_inters(baseline, cell)
         seed = _effective_seed(baseline, spec)
+        num_prompts = max(1, int(getattr(spec, "num_prompts", 1)))
         naming_regime = "names_only" if _is_names_only_cell(cell) else cell.naming_regime
         naming_suffix = ""
         if naming_regime == "anonymized":
@@ -445,11 +482,14 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         out_csv = self.repo_root / "experiments" / "responses" / dataset.name / (
             f"predictions_obs{sample_size_obs}_int{sample_size_inters}_{self.method_name}{takayama_suffix}{_seed_suffix(seed)}{naming_suffix}.csv"
         )
-        model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
-        if _reuse_if_exists(out_csv, dry_run=dry_run):
+        if self.method_name == "TakayamaSCP":
+            model_name = baseline.model or TAKAYAMA_DEFAULT_MODEL
+        else:
+            model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
+        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
         legacy_out_csv = _unseeded_variant_path(out_csv)
-        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run):
+        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run, min_rows=num_prompts):
             return out_csv
 
         if self.method_name in {"CausalLLMData", "CausalLLMPrompt"}:
@@ -484,6 +524,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 str(sample_size_obs),
                 "--seed",
                 str(seed),
+                "--num_prompts",
+                str(num_prompts),
                 "--out_dir",
                 str(self.repo_root / "experiments" / "responses"),
                 "--model",
@@ -519,6 +561,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 str(sample_size_inters),
                 "--seed",
                 str(seed),
+                "--num_prompts",
+                str(num_prompts),
                 "--out_dir",
                 str(self.repo_root / "experiments" / "responses"),
                 "--model",

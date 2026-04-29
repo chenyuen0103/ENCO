@@ -36,6 +36,18 @@ def _reuse_existing(path: Path, *, dry_run: bool, label: str) -> bool:
     return False
 
 
+def _reuse_artifact_if_current(path: Path, *, source: Path, dry_run: bool, label: str) -> bool:
+    if dry_run:
+        return False
+    if not path.exists():
+        return False
+    if source.exists() and path.stat().st_mtime < source.stat().st_mtime:
+        print(f"[rerun:{label}] {path} older than {source}")
+        return False
+    print(f"[reuse:{label}] {path}")
+    return True
+
+
 def _json_dump(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -111,7 +123,25 @@ def _config_hash(spec: BenchmarkSpec) -> str:
 def _merge_response_entries(existing: list[dict[str, Any]], new_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for entry in existing + new_entries:
-        key = str(entry.get("response_csv"))
+        key = "|".join(
+            str(entry.get(part) or "")
+            for part in (
+                "benchmark",
+                "dataset",
+                "config_name",
+                "prompt_style",
+                "naming_regime",
+                "reasoning_guidance",
+                "obs_n",
+                "int_n",
+                "system",
+                "system_kind",
+                "model",
+                "baseline",
+                "takayama_backend",
+                "takayama_pattern",
+            )
+        )
         merged[key] = entry
     return list(merged.values())
 
@@ -304,7 +334,7 @@ class BenchmarkRunner:
                     query_cmd.append("--overwrite")
                 if overwrite or not _reuse_existing(response_csv, dry_run=dry_run, label="response"):
                     _run(CommandPlan(label=f"query:{entry['dataset']}:{model.name}:{entry['config_name']}", cmd=query_cmd, cwd=self.experiments_dir), dry_run=dry_run)
-                if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
+                if not _reuse_artifact_if_current(per_row_path, source=response_csv, dry_run=dry_run, label="eval"):
                     _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(
@@ -436,7 +466,7 @@ class BenchmarkRunner:
                         model.name,
                     )
                     per_row_path = _per_row_metrics_path(response_csv)
-                    if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
+                    if not _reuse_artifact_if_current(per_row_path, source=response_csv, dry_run=dry_run, label="eval"):
                         _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                     response_entries.append(
                         self._response_record(
@@ -533,7 +563,7 @@ class BenchmarkRunner:
                     dry_run=dry_run,
                 )
                 per_row_path = _per_row_metrics_path(response_csv)
-                if not _reuse_existing(per_row_path, dry_run=dry_run, label="eval"):
+                if not _reuse_artifact_if_current(per_row_path, source=response_csv, dry_run=dry_run, label="eval"):
                     _run(evaluator.build_eval_command(response_csv=response_csv, evaluator=self.spec.evaluator), dry_run=dry_run)
                 response_entries.append(
                     self._response_record(

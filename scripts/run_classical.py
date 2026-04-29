@@ -36,7 +36,9 @@ def _load_observational_array(graph: Any, sample_size_obs: int, seed: int) -> tu
             raise SystemExit(
                 f"Requested sample_size_obs={sample_size_obs}, but dataset only has {arr.shape[0]} observational samples."
             )
-        return arr[:sample_size_obs], var_names
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(arr.shape[0], size=sample_size_obs, replace=False)
+        return arr[idx], var_names
 
     if not hasattr(graph, "sample"):
         raise SystemExit("Graph object does not expose observational data or sampling.")
@@ -92,30 +94,43 @@ def _run_ges(df: pd.DataFrame, *, scoring_method: str, min_improvement: float) -
     return _adjacency_from_edges(list(df.columns), list(model.edges()))
 
 
-def _write_prediction_csv(
+def _prediction_row(
     *,
-    out_csv: Path,
     method: str,
     graph_name: str,
     num_obs: int,
     answer: np.ndarray,
     prediction: np.ndarray,
-) -> None:
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    replicate_index: int,
+    replicate_seed: int,
+) -> dict[str, Any]:
     metrics = eval_pair(answer, prediction)
-    row = {
+    return {
         "method": method,
         "graph": graph_name,
         "num_obs": num_obs,
         "num_inters": 0,
         "answer": json.dumps(answer.tolist(), ensure_ascii=False),
         "prediction": json.dumps(prediction.tolist(), ensure_ascii=False),
+        "replicate_index": replicate_index,
+        "replicate_seed": replicate_seed,
         **metrics,
     }
+
+
+def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None:
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerow(row)
+        writer.writerows(rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample_size_obs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_prompts", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--pc-variant", choices=["orig", "stable", "parallel"], default="stable")
     parser.add_argument("--pc-ci-test", default="chi_square")
@@ -147,40 +163,49 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.num_prompts <= 0:
+        raise SystemExit("--num_prompts must be > 0.")
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
         graph = load_causal_graph(graph_path)
-        data_obs, var_names = _load_observational_array(graph, args.sample_size_obs, args.seed)
-        df = _coerce_discrete_dataframe(pd.DataFrame(data_obs, columns=var_names))
-
         answer = np.asarray(graph.adj_matrix).astype(int)
         np.fill_diagonal(answer, 0)
-
-        if args.method == "PC":
-            prediction = _run_pc(
-                df,
-                variant=args.pc_variant,
-                ci_test=args.pc_ci_test,
-                significance_level=args.pc_significance_level,
-                max_cond_vars=args.pc_max_cond_vars,
-            )
-        else:
-            prediction = _run_ges(
-                df,
-                scoring_method=args.ges_scoring_method,
-                min_improvement=args.ges_min_improvement,
-            )
-
         dataset_name = graph_path.stem
         out_csv = Path(args.out_dir) / dataset_name / f"predictions_obs{args.sample_size_obs}_int0_{args.method}_seed{int(args.seed)}.csv"
-        _write_prediction_csv(
-            out_csv=out_csv,
-            method=args.method,
-            graph_name=dataset_name,
-            num_obs=args.sample_size_obs,
-            answer=answer,
-            prediction=prediction,
-        )
+        rows: list[dict[str, Any]] = []
+
+        for prompt_idx in range(args.num_prompts):
+            seed_i = int(args.seed) + prompt_idx * 1000
+            data_obs, var_names = _load_observational_array(graph, args.sample_size_obs, seed_i)
+            df = _coerce_discrete_dataframe(pd.DataFrame(data_obs, columns=var_names))
+
+            if args.method == "PC":
+                prediction = _run_pc(
+                    df,
+                    variant=args.pc_variant,
+                    ci_test=args.pc_ci_test,
+                    significance_level=args.pc_significance_level,
+                    max_cond_vars=args.pc_max_cond_vars,
+                )
+            else:
+                prediction = _run_ges(
+                    df,
+                    scoring_method=args.ges_scoring_method,
+                    min_improvement=args.ges_min_improvement,
+                )
+            rows.append(
+                _prediction_row(
+                    method=args.method,
+                    graph_name=dataset_name,
+                    num_obs=args.sample_size_obs,
+                    answer=answer,
+                    prediction=prediction,
+                    replicate_index=prompt_idx,
+                    replicate_seed=seed_i,
+                )
+            )
+
+        _write_prediction_rows(out_csv=out_csv, rows=rows)
         print(f"[{args.method}] wrote {out_csv.resolve()}")
     return 0
 

@@ -171,10 +171,11 @@ def _truncation_suspected(text: str, *, output_tokens: int, max_new_tokens_hint:
 
 
 def _safe_model_tag(model: str) -> str:
-    tag = model.split("/")[-1]
-    for ch in [":", " "]:
-        tag = tag.replace(ch, "_")
-    return tag
+    model_path = Path(str(model))
+    tag = model_path.name or str(model)
+    if tag.startswith("checkpoint-") and model_path.parent.name:
+        tag = f"{model_path.parent.name}_{tag}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", tag).strip("_") or "model"
 
 
 def _default_response_path(responses_root: Path, dataset: str, base_name: str, model: str) -> Path:
@@ -363,6 +364,13 @@ def _select_provider(model: str, provider: str) -> str:
     if is_openai_model(model):
         return "openai"
     return "hf"
+
+
+def _resolve_hf_merge_lora(model: str, cli_value: bool | None) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    model_path = Path(model)
+    return model_path.exists() and (model_path / "adapter_config.json").exists()
 
 
 def _dtype_nbytes(dtype_obj: Any, fallback_hf_dtype: str = "auto") -> int:
@@ -1158,10 +1166,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--hf-merge-lora",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "For PEFT/LoRA adapter checkpoints, merge the adapter into the base model once at load time. "
-            "This avoids runtime LoRA layers during generation and can reduce memory use for long-context eval."
+            "Default: auto-enable for local adapter checkpoints with adapter_config.json; use "
+            "--no-hf-merge-lora to keep runtime LoRA layers."
         ),
     )
     ap.add_argument(
@@ -1671,12 +1681,13 @@ def main() -> None:
                                         vllm_batch_size = max(1, int(args.hf_batch_size))
                                     if provider == "hf":
                                         dm = None if not args.hf_device_map or args.hf_device_map == "none" else args.hf_device_map
-                                        hf_key = (model, dm, str(args.hf_dtype), bool(args.hf_merge_lora))
+                                        hf_merge_lora = _resolve_hf_merge_lora(model, args.hf_merge_lora)
+                                        hf_key = (model, dm, str(args.hf_dtype), hf_merge_lora)
                                         hf_pipe = hf_pipe_cache.get(hf_key)
                                         if hf_pipe is None:
                                             print(
                                                 f"[hf:init] loading HF pipeline once for model={model} device_map={dm} "
-                                                f"dtype={args.hf_dtype} merge_lora={bool(args.hf_merge_lora)}",
+                                                f"dtype={args.hf_dtype} merge_lora={hf_merge_lora}",
                                                 file=sys.stderr,
                                                 flush=True,
                                             )
@@ -1684,7 +1695,7 @@ def main() -> None:
                                                 model,
                                                 device_map=dm,
                                                 torch_dtype=args.hf_dtype,
-                                                merge_lora=bool(args.hf_merge_lora),
+                                                merge_lora=hf_merge_lora,
                                             )
                                             hf_pipe_cache[hf_key] = hf_pipe
                                         else:

@@ -25,6 +25,14 @@ except Exception:
 OPENAI_MAX_INPUT_CHARS = 10_485_760
 
 
+def _safe_model_tag(model: str) -> str:
+    model_path = Path(str(model))
+    tag = model_path.name or str(model)
+    if tag.startswith("checkpoint-") and model_path.parent.name:
+        tag = f"{model_path.parent.name}_{tag}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", tag).strip("_") or "model"
+
+
 def count_openai_tokens(model_name: str, text: str) -> int:
     """
     Return the number of tokens this text would use for a given OpenAI model.
@@ -459,7 +467,7 @@ def build_hf_pipeline(
     device_map: Optional[str] = None,
     torch_dtype: Optional[str] = None,
     clear_length_cap: bool = True,
-    merge_lora: bool = False,
+    merge_lora: Optional[bool] = None,
 ):
     """
     Build a Hugging Face text-generation pipeline for the given model name.
@@ -500,6 +508,8 @@ def build_hf_pipeline(
 
     model_path = Path(model_name)
     is_adapter = model_path.exists() and (model_path / "adapter_config.json").exists()
+    if merge_lora is None:
+        merge_lora = is_adapter
     tokenizer_name = model_name
     if is_adapter:
         try:
@@ -1353,9 +1363,7 @@ def main():
     else:
         # inputs:    prompts/experiment1/<dataset>/.../prompts_....csv
         # outputs:   responses/<dataset>/responses_...._MODEL.csv
-        safe_model_tag = args.model.split("/")[-1]
-        for ch in [":", " "]:
-            safe_model_tag = safe_model_tag.replace(ch, "_")
+        safe_model_tag = _safe_model_tag(args.model)
 
         # responses_root: "responses"
         # subdir: dataset inferred from the input path (falls back to parent dir name)

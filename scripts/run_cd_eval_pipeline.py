@@ -25,6 +25,14 @@ def _context_window_for(model: str) -> int:
     return int(_DEFAULT_CONTEXT_WINDOWS.get(key, 128_000))
 
 
+def _safe_model_tag(model: str) -> str:
+    model_path = Path(str(model))
+    tag = model_path.name or str(model)
+    if tag.startswith("checkpoint-") and model_path.parent.name:
+        tag = f"{model_path.parent.name}_{tag}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", tag).strip("_") or "model"
+
+
 _RESP_RE = re.compile(
     r"^responses_obs(?P<obs>\d+)_int(?P<int>\d+)_shuf(?P<shuf>\d+)(?P<suffix>.*)$",
     flags=re.IGNORECASE,
@@ -348,14 +356,40 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
     )
 
 
-def _find_response_csvs(experiments_dir: Path, dataset: str) -> list[Path]:
+def _default_response_dirs(experiments_dir: Path, dataset: str) -> list[Path]:
     # Responses may live either under experiments/responses/<dataset> (when run from experiments/)
     # or under repo_root/responses/<dataset> (when run from repo root).
     repo_root = experiments_dir.parent
-    resp_dirs = [
+    return [
         experiments_dir / "responses" / dataset,
         repo_root / "responses" / dataset,
     ]
+
+
+def _resolve_response_dirs(args: argparse.Namespace, experiments_dir: Path) -> list[Path]:
+    if not getattr(args, "responses_dir", None):
+        return _default_response_dirs(experiments_dir, args.dataset)
+
+    repo_root = experiments_dir.parent
+    invocation_cwd = getattr(args, "invocation_cwd", Path.cwd().resolve())
+    return [
+        Path(_resolve_file_arg(str(path), repo_root=repo_root, invocation_cwd=invocation_cwd))
+        for path in args.responses_dir
+    ]
+
+
+def _format_searched_response_dirs(resp_dirs: list[Path]) -> str:
+    return ", ".join(str(d) for d in resp_dirs) or "(none)"
+
+
+def _analysis_summary_dir(args: argparse.Namespace, experiments_dir: Path, resp_dirs: list[Path]) -> Path:
+    if getattr(args, "responses_dir", None) and resp_dirs:
+        return Path(resp_dirs[0])
+    return experiments_dir / "responses" / args.dataset
+
+
+def _find_response_csvs(resp_dirs: list[Path]) -> list[Path]:
+    resp_dirs = [Path(d) for d in resp_dirs]
     resp_dirs = [d for d in resp_dirs if d.exists()]
     if not resp_dirs:
         return []
@@ -373,6 +407,12 @@ def _find_response_csvs(experiments_dir: Path, dataset: str) -> list[Path]:
                 continue
             out.append(p)
     return sorted({p.resolve(): p for p in out}.values())
+
+
+def _display_model_for_meta(meta: ResponseMeta, args: argparse.Namespace) -> str:
+    if getattr(args, "model_label", None):
+        return str(args.model_label)
+    return meta.model
 
 
 def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any]:
@@ -495,10 +535,11 @@ def _load_evaluated_response_csvs(summary_csv: Path) -> set[Path]:
 
 
 def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
-    resp_csvs = _find_response_csvs(experiments_dir, args.dataset)
+    resp_dirs = _resolve_response_dirs(args, experiments_dir)
+    resp_csvs = _find_response_csvs(resp_dirs)
     if not resp_csvs:
         raise SystemExit(
-            f"No response CSVs found under {(experiments_dir/'responses'/args.dataset)} or {(experiments_dir.parent/'responses'/args.dataset)}. "
+            f"No response CSVs found under: {_format_searched_response_dirs(resp_dirs)}. "
             "Run the model step first."
         )
 
@@ -734,10 +775,11 @@ def _ordering_bias_from_csv(csv_path: Path) -> dict[str, Any]:
 
 
 def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
-    resp_csvs = _find_response_csvs(experiments_dir, args.dataset)
+    resp_dirs = _resolve_response_dirs(args, experiments_dir)
+    resp_csvs = _find_response_csvs(resp_dirs)
     if not resp_csvs:
         raise SystemExit(
-            f"No response CSVs found under {(experiments_dir/'responses'/args.dataset)} or {(experiments_dir.parent/'responses'/args.dataset)}. "
+            f"No response CSVs found under: {_format_searched_response_dirs(resp_dirs)}. "
             "Run the model step first."
         )
     try:
@@ -746,7 +788,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         from experiments.evaluate import evaluate_response_csv
 
     out_dir = experiments_dir / "out" / "experiment1"
-    summary_dir = experiments_dir / "responses" / args.dataset
+    summary_dir = _analysis_summary_dir(args, experiments_dir, resp_dirs)
     _ensure_parent(out_dir / "placeholder.txt", dry_run=dry_run)
     _ensure_parent(summary_dir / "placeholder.txt", dry_run=dry_run)
 
@@ -756,7 +798,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
 
     for csv_path in resp_csvs:
         meta = _parse_response_meta(args.dataset, csv_path)
-        ctx = _context_window_for(meta.model)
+        display_model = _display_model_for_meta(meta, args)
+        ctx = _context_window_for(display_model)
         pt_stats = _prompt_token_stats(csv_path, context_window=ctx)
         summary = evaluate_response_csv(
             csv_path,
@@ -766,7 +809,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )["summary"]
         row: dict[str, Any] = {
             "dataset": meta.dataset,
-            "model": meta.model,
+            "model": display_model,
+            "parsed_model": meta.model,
             "reasoning_guidance": meta.reasoning_guidance,
             "is_names_only": int(meta.is_names_only),
             "obs_n": meta.obs_n,
@@ -796,7 +840,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
             ordering_rows.append(
                 {
                     "dataset": meta.dataset,
-                    "model": meta.model,
+                    "model": display_model,
+                    "parsed_model": meta.model,
                     "reasoning_guidance": meta.reasoning_guidance,
                     "obs_n": meta.obs_n,
                     "int_n": meta.int_n,
@@ -846,6 +891,9 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
 def main() -> None:
     repo_root, experiments_dir = _repo_paths()
     invocation_cwd = Path.cwd().resolve()
+    for path in (repo_root, experiments_dir):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
 
     ap = argparse.ArgumentParser(
         description="Run Experiment 1 end-to-end: generate prompts, query models, evaluate, and analyze."
@@ -904,8 +952,25 @@ def main() -> None:
             "Default retained for backward compatibility."
         ),
     )
+    ap.add_argument(
+        "--responses-dir",
+        action="append",
+        default=[],
+        help=(
+            "Directory to search for response CSVs during evaluate/analyze. Repeatable. "
+            "When omitted, searches experiments/responses/<dataset> and responses/<dataset>."
+        ),
+    )
 
     ap.add_argument("--model", action="append", default=[], help="Repeatable.")
+    ap.add_argument(
+        "--model-label",
+        default=None,
+        help=(
+            "Override the model label written by the analyze step. Intended only for one-off "
+            "single-model legacy repairs; multi-model summaries should use unique model tags in filenames."
+        ),
+    )
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--tau", type=float, default=0.7, help="Consensus threshold for evaluate.py.")
 
@@ -944,6 +1009,7 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+    args.invocation_cwd = invocation_cwd
     args.bif_file = _resolve_file_arg(args.bif_file, repo_root=repo_root, invocation_cwd=invocation_cwd)
 
     # If dataset wasn’t explicitly set, default to bif basename

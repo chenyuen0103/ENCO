@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import csv
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from benchmark_builder.baselines import build_baseline_adapters
+from benchmark_builder.baselines import _reuse_if_has_rows, build_baseline_adapters
 from benchmark_builder.registry import BenchmarkRegistry
-from benchmark_builder.runner import _prompt_base_name
+from benchmark_builder.runner import _merge_response_entries, _prompt_base_name
 from benchmark_builder.schema import BaselineSpec, DatasetSpec, PromptCellSpec, load_benchmark_spec
 
 
@@ -90,6 +92,103 @@ class TestBenchmarkSpec(unittest.TestCase):
         self.assertTrue(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), summary))
         self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), anonymized_observational))
         self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), matrix))
+
+    def test_takayama_defaults_to_logprob_capable_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter = build_baseline_adapters(Path(tmpdir))["TakayamaSCP"]
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                adapter.run(
+                    baseline=BaselineSpec(name="TakayamaSCP", provider="openai"),
+                    dataset=DatasetSpec(name="sachs", graph_source="bif", graph_path="/tmp/sachs.bif"),
+                    graph_path=Path("/tmp/sachs.bif"),
+                    cell=PromptCellSpec(style="summary", obs_per_prompt=100, int_per_combo=0),
+                    spec=SimpleNamespace(seed=42, num_prompts=1, models=[SimpleNamespace(name="gpt-5-mini", enabled=True)]),
+                    dry_run=True,
+                )
+            self.assertIn("--model gpt-4.1", stdout.getvalue())
+            self.assertIn("--num_samples 1", stdout.getvalue())
+
+    def test_external_baseline_reuse_requires_expected_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "predictions.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["prediction"])
+                writer.writeheader()
+                writer.writerow({"prediction": "[[0]]"})
+            self.assertFalse(_reuse_if_has_rows(path, dry_run=False, min_rows=5))
+            self.assertTrue(_reuse_if_has_rows(path, dry_run=False, min_rows=1))
+
+    def test_data_backed_baselines_request_all_prompt_replicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            responses_dir = repo_root / "experiments" / "responses" / "sachs"
+            responses_dir.mkdir(parents=True)
+            for name in [
+                "predictions_obs1000_int0_PC.csv",
+                "predictions_obs1000_int50_ENCO.csv",
+            ]:
+                with (responses_dir / name).open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=["prediction"])
+                    writer.writeheader()
+                    writer.writerow({"prediction": "[[0]]"})
+
+            spec = SimpleNamespace(
+                name="test_grid",
+                seed=42,
+                num_prompts=5,
+                models=[SimpleNamespace(name="gpt-5-mini", enabled=True)],
+            )
+            dataset = DatasetSpec(name="sachs", graph_source="bif", graph_path="/tmp/sachs.bif")
+            graph_path = Path("/tmp/sachs.bif")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                build_baseline_adapters(repo_root)["PC"].run(
+                    baseline=BaselineSpec(name="PC"),
+                    dataset=dataset,
+                    graph_path=graph_path,
+                    cell=PromptCellSpec(style="summary", obs_per_prompt=1000, int_per_combo=0),
+                    spec=spec,
+                    dry_run=True,
+                )
+                build_baseline_adapters(repo_root)["ENCO"].run(
+                    baseline=BaselineSpec(name="ENCO"),
+                    dataset=dataset,
+                    graph_path=graph_path,
+                    cell=PromptCellSpec(style="summary", obs_per_prompt=1000, int_per_combo=50),
+                    spec=spec,
+                    dry_run=True,
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("predictions_obs1000_int0_PC.csv rows=1 < required=5", output)
+            self.assertIn("predictions_obs1000_int50_ENCO.csv rows=1 < required=5", output)
+            self.assertEqual(output.count("--num_prompts 5"), 2)
+
+    def test_response_bundle_merge_replaces_stale_path_for_same_logical_entry(self) -> None:
+        old_entry = {
+            "benchmark": "bench",
+            "dataset": "sachs",
+            "config_name": "summary_real_obs1000_int0",
+            "prompt_style": "summary",
+            "naming_regime": "real",
+            "reasoning_guidance": "staged",
+            "obs_n": 1000,
+            "int_n": 0,
+            "system": "TakayamaSCP",
+            "system_kind": "baseline",
+            "baseline": "TakayamaSCP",
+            "takayama_backend": "pc",
+            "takayama_pattern": 2,
+            "response_csv": "predictions_obs1000_int0_TakayamaSCP_p2.csv",
+        }
+        new_entry = {
+            **old_entry,
+            "response_csv": "predictions_obs1000_int0_TakayamaSCP_p2_seed42.csv",
+        }
+        merged = _merge_response_entries([old_entry], [new_entry])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["response_csv"], "predictions_obs1000_int0_TakayamaSCP_p2_seed42.csv")
 
     def test_causal_llm_data_reuses_legacy_summary_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

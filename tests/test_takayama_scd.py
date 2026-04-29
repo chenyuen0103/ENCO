@@ -11,7 +11,9 @@ import numpy as np
 from experiments.run_takayama_scd import (
     _build_first_prompt,
     _chat_text_completion,
+    _load_checkpoint_payload,
     _probability_to_pk,
+    _read_completed_replicate_rows,
     _directed_prediction_from_pc_signed,
     _prediction_row,
     _write_prediction_rows,
@@ -113,6 +115,8 @@ class TestTakayamaSCD(unittest.TestCase):
                     transcript=[{"rep": 0}],
                     probability_matrix=np.zeros((2, 2), dtype=float),
                     prior_matrix=np.zeros((2, 2), dtype=int),
+                    replicate_index=0,
+                    replicate_seed=42,
                 ),
                 _prediction_row(
                     backend="pc",
@@ -126,6 +130,8 @@ class TestTakayamaSCD(unittest.TestCase):
                     transcript=[{"rep": 1}],
                     probability_matrix=np.ones((2, 2), dtype=float),
                     prior_matrix=np.ones((2, 2), dtype=int),
+                    replicate_index=1,
+                    replicate_seed=1042,
                 ),
             ]
             _write_prediction_rows(out_csv=out_csv, rows=rows)
@@ -133,7 +139,48 @@ class TestTakayamaSCD(unittest.TestCase):
                 loaded = list(csv.DictReader(handle))
         self.assertEqual(len(loaded), 2)
         self.assertEqual(loaded[0]["method"], "TakayamaSCP")
+        self.assertEqual(loaded[0]["replicate_index"], "0")
+        self.assertEqual(loaded[1]["replicate_seed"], "1042")
         self.assertIn('"rep": 1', loaded[1]["raw_response"])
+
+    def test_completed_replicate_rows_ignores_legacy_rows_without_replicate_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_csv = Path(tmpdir) / "takayama.csv"
+            rows = [
+                _prediction_row(
+                    backend="pc",
+                    pattern=2,
+                    model_name="m",
+                    provider="openai",
+                    naming_regime="real",
+                    sample_size_obs=100,
+                    answer=np.zeros((2, 2), dtype=int),
+                    prediction=np.zeros((2, 2), dtype=int),
+                    transcript=[],
+                    probability_matrix=np.zeros((2, 2), dtype=float),
+                    prior_matrix=np.zeros((2, 2), dtype=int),
+                    replicate_index=1,
+                    replicate_seed=1042,
+                )
+            ]
+            _write_prediction_rows(out_csv=out_csv, rows=rows)
+            loaded = _read_completed_replicate_rows(out_csv)
+        self.assertEqual(sorted(loaded), [1])
+        self.assertEqual(loaded[1]["replicate_seed"], "1042")
+
+    def test_mismatched_checkpoint_is_archived_and_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "run.checkpoint.json"
+            checkpoint.write_text(
+                '{"version": 1, "run_signature": {"num_samples": 5}, "completed_pairs": [{"x": 1}], "current_pair": null}',
+                encoding="utf-8",
+            )
+            payload = _load_checkpoint_payload(checkpoint, {"num_samples": 1})
+            stale_files = list(Path(tmpdir).glob("run.checkpoint.json.stale-*"))
+
+        self.assertEqual(payload["completed_pairs"], [])
+        self.assertEqual(payload["run_signature"], {"num_samples": 1})
+        self.assertEqual(len(stale_files), 1)
 
 
 if __name__ == "__main__":

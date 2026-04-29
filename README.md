@@ -209,8 +209,8 @@ export OPENAI_API_KEY=...
 
 python scripts/eval_cd_configs.py \
   --bif-file causal_graphs/real_data/small_graphs/sachs.bif \
-  --config-file ./experiments/configs/eval_configs_obs1000.json \
-  --model gpt-5.2-pro \
+  --config-file ./experiments/configs/eval_configs.json \
+  --model gpt-5-mini \
   --provider openai \
   --temperature 0.0 \
   --request-timeout-s 600 \

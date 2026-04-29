@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, csv, time, json, argparse, tempfile, traceback
+import os, sys, csv, time, json, argparse, tempfile, traceback, shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from tqdm import tqdm
@@ -212,6 +212,174 @@ def call_hf_textgen_batch(
 # ------------------- vLLM backend -------------------
 
 
+def _patch_tokenizer_config_for_vllm(merged_dir: Path) -> None:
+    # Some Qwen tokenizer configs use the newer list-valued form, while older
+    # Transformers/vLLM paths expect a dict or absent field.
+    cfg_path = merged_dir / "tokenizer_config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(cfg.get("extra_special_tokens"), list):
+                cfg.pop("extra_special_tokens", None)
+                cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                print(
+                    f"[vllm:init] patched tokenizer_config extra_special_tokens for {merged_dir}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"[vllm:init] warning: failed to patch tokenizer_config for {merged_dir}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _materialize_tokenizer_files_for_vllm(*, tokenizer_source: str | Path, merged_dir: Path) -> None:
+    tokenizer_source_path = Path(str(tokenizer_source))
+    tokenizer_files = {
+        "added_tokens.json",
+        "chat_template.jinja",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    }
+    if tokenizer_source_path.exists():
+        for name in tokenizer_files:
+            src = tokenizer_source_path / name
+            if src.exists():
+                shutil.copy2(src, merged_dir / name)
+        _patch_tokenizer_config_for_vllm(merged_dir)
+        return
+
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+
+        print(
+            f"[vllm:init] materializing tokenizer for vLLM from {tokenizer_source}",
+            file=sys.stderr,
+            flush=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_source), use_fast=True)
+        tokenizer.save_pretrained(str(merged_dir))
+    except Exception as e:
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore
+
+            print(
+                f"[vllm:init] AutoTokenizer save failed; copying tokenizer files from HF cache for {tokenizer_source}",
+                file=sys.stderr,
+                flush=True,
+            )
+            snapshot_dir = Path(
+                snapshot_download(
+                    repo_id=str(tokenizer_source),
+                    allow_patterns=sorted(tokenizer_files),
+                )
+            )
+            copied = False
+            for name in tokenizer_files:
+                src = snapshot_dir / name
+                if src.exists():
+                    shutil.copy2(src, merged_dir / name)
+                    copied = True
+            if not copied:
+                raise RuntimeError(f"no tokenizer files found in snapshot {snapshot_dir}")
+        except Exception as fallback_e:
+            raise RuntimeError(
+                f"Failed to materialize tokenizer files for vLLM from {tokenizer_source}. "
+                "If this is a remote base model, make sure it is available in the Hugging Face cache "
+                "or that network access is enabled."
+            ) from fallback_e
+
+    _patch_tokenizer_config_for_vllm(merged_dir)
+
+
+def _tokenizer_files_present_for_vllm(model_dir: Path) -> bool:
+    if not (model_dir / "tokenizer_config.json").exists():
+        return False
+    if (model_dir / "tokenizer.json").exists():
+        return True
+    return (model_dir / "vocab.json").exists()
+
+
+def _tokenizer_source_for_adapter(adapter_dir: Path, adapter_cfg: Dict[str, Any]) -> str | Path:
+    if (adapter_dir / "tokenizer.json").exists() or (adapter_dir / "vocab.json").exists():
+        return adapter_dir
+    base_model_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+    if not base_model_name:
+        raise RuntimeError(
+            f"{adapter_dir} is missing tokenizer files and adapter_config.json does not declare "
+            "base_model_name_or_path; cannot prepare tokenizer files for vLLM."
+        )
+    return Path(base_model_name) if Path(base_model_name).exists() else base_model_name
+
+
+def _read_adapter_config(adapter_dir: Path) -> Dict[str, Any]:
+    adapter_cfg_path = adapter_dir / "adapter_config.json"
+    try:
+        return json.loads(adapter_cfg_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Failed to read adapter config for vLLM merge: {adapter_cfg_path}") from e
+
+
+def _repair_existing_merged_adapter_for_vllm(*, adapter_dir: Path, merged_dir: Path) -> None:
+    if _tokenizer_files_present_for_vllm(merged_dir):
+        _patch_tokenizer_config_for_vllm(merged_dir)
+        return
+    adapter_cfg = _read_adapter_config(adapter_dir)
+    tokenizer_source = _tokenizer_source_for_adapter(adapter_dir, adapter_cfg)
+    print(
+        f"[vllm:init] merged adapter is missing tokenizer files; repairing {merged_dir}",
+        file=sys.stderr,
+        flush=True,
+    )
+    _materialize_tokenizer_files_for_vllm(tokenizer_source=tokenizer_source, merged_dir=merged_dir)
+
+
+def _merge_lora_adapter_for_vllm(adapter_dir: Path) -> Path:
+    """
+    vLLM loads full HF model directories. If given a local PEFT adapter checkpoint,
+    merge it once into <checkpoint>_merged and return that directory.
+    """
+    adapter_dir = adapter_dir.resolve()
+    merged_dir = Path(str(adapter_dir) + "_merged")
+    if (merged_dir / "config.json").exists():
+        _repair_existing_merged_adapter_for_vllm(adapter_dir=adapter_dir, merged_dir=merged_dir)
+        print(f"[vllm:init] using existing merged adapter: {merged_dir}", file=sys.stderr, flush=True)
+        return merged_dir
+
+    try:
+        from peft import PeftModel  # type: ignore
+        from transformers import AutoModelForCausalLM  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "vLLM was given a PEFT/LoRA adapter checkpoint, but automatic merge requires "
+            "`peft` and `transformers` to be installed."
+        ) from e
+
+    adapter_cfg = _read_adapter_config(adapter_dir)
+    tokenizer_source = _tokenizer_source_for_adapter(adapter_dir, adapter_cfg)
+
+    print(f"[vllm:init] auto-merging LoRA adapter for vLLM: {adapter_dir} -> {merged_dir}", file=sys.stderr, flush=True)
+    base_model_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+    if not base_model_name:
+        raise RuntimeError(
+            f"{adapter_dir} adapter_config.json does not declare base_model_name_or_path; cannot auto-merge for vLLM."
+        )
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype="auto")
+    model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+    merged = model.merge_and_unload()
+
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(str(merged_dir))
+    _materialize_tokenizer_files_for_vllm(tokenizer_source=tokenizer_source, merged_dir=merged_dir)
+    print(f"[vllm:init] saved merged model for vLLM: {merged_dir}", file=sys.stderr, flush=True)
+    return merged_dir
+
+
 def build_vllm_engine(
     model_name: str,
     *,
@@ -226,6 +394,24 @@ def build_vllm_engine(
     Build a vLLM LLM engine for the given model name.
     Assumes vllm is installed and CUDA / torch are configured.
     """
+    model_path = Path(str(model_name))
+    if not model_path.is_absolute():
+        repo_candidate = (Path(__file__).resolve().parents[1] / model_path).resolve()
+        if repo_candidate.exists():
+            model_path = repo_candidate
+    if model_path.exists():
+        has_config = (model_path / "config.json").exists()
+        has_adapter = (model_path / "adapter_config.json").exists()
+        if has_adapter and not has_config:
+            model_path = _merge_lora_adapter_for_vllm(model_path)
+            has_config = (model_path / "config.json").exists()
+        if not has_config:
+            raise ValueError(
+                "vLLM model path exists but does not contain config.json: "
+                f"{model_path}. Use a full HF model directory or a merged adapter directory."
+            )
+        model_name = str(model_path.resolve())
+
     try:
         from vllm import LLM  # type: ignore
     except Exception as e:
