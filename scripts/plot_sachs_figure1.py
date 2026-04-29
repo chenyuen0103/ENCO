@@ -14,6 +14,7 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = REPO_ROOT / "benchmark_runs" / "sachs_figure1" / "figure1_summary.csv"
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
+MAX_PLOTTED_INTERVENTIONS = 200
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ def _read_summary(path: Path) -> list[SummaryRow]:
 
 
 def _select(rows: Iterable[SummaryRow], line_id: str) -> list[SummaryRow]:
-    return sorted((row for row in rows if row.line_id == line_id), key=lambda row: row.int_n)
+    return sorted((row for row in rows if row.line_id == line_id), key=lambda row: (row.int_n, row.obs_n))
 
 
 def _single(rows: Iterable[SummaryRow], line_id: str) -> SummaryRow:
@@ -67,6 +68,12 @@ def _values(rows: list[SummaryRow]) -> tuple[list[int], list[float], list[float]
     )
 
 
+def _display_model_name(model: str) -> str:
+    if model == "gpt-5-mini":
+        return "GPT-5 mini"
+    return model
+
+
 def _configure_matplotlib() -> None:
     if not os.getenv("MPLCONFIGDIR"):
         mpl_dir = Path("/tmp") / f"matplotlib_{os.getuid()}"
@@ -80,15 +87,17 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     from matplotlib.ticker import FixedLocator, FixedFormatter
 
     rows = _read_summary(summary_csv)
-    enco = _select(rows, "enco_ceiling")
-    real = _select(rows, "llm_real")
-    anon = _select(rows, "llm_anonymized")
+    enco = [row for row in _select(rows, "enco_ceiling") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
+    enco_obs = _select(rows, "enco_observational")
+    real = [row for row in _select(rows, "llm_real") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
+    anon = [row for row in _select(rows, "llm_anonymized") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
     floor = _single(rows, "semantic_floor")
     pc = _single(rows, "pc_anchor")
     ges = _single(rows, "ges_anchor")
 
     if not enco or not real or not anon:
         raise ValueError("Summary CSV must contain ENCO, llm_real, and llm_anonymized rows.")
+    llm_label = _display_model_name(real[0].system)
 
     semantic_color = "#D55E00"
     mixed_color = "#0072B2"
@@ -101,9 +110,9 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     ax.set_facecolor("white")
 
     all_m = sorted({row.int_n for row in enco + real + anon} | {0})
-    x_min, x_max = -22, max(all_m) + 38
+    x_min, x_max = -22, min(max(all_m), MAX_PLOTTED_INTERVENTIONS) + 38
     ax.set_xlim(x_min, x_max)
-    ax.set_ylim(0.0, 1.05)
+    ax.set_ylim(-0.035, 1.05)
 
     ax.axhspan(0.0, floor.f1_mean, color=below_floor_fill, alpha=0.16, zorder=0)
     ax.axhspan(floor.f1_mean, 1.0, color=target_fill, alpha=0.11, zorder=0)
@@ -131,6 +140,33 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         label="ENCO data-only ceiling",
         zorder=4,
     )
+    if enco_obs:
+        offsets = [-14.0, 14.0] if len(enco_obs) == 2 else [0.0 for _ in enco_obs]
+        obs_x = [row.int_n + float(offset) for row, offset in zip(enco_obs, offsets)]
+        obs_y = [row.f1_mean for row in enco_obs]
+        ax.scatter(
+            obs_x,
+            obs_y,
+            marker="^",
+            s=46,
+            facecolor="white",
+            edgecolor=data_color,
+            linewidth=1.4,
+            zorder=7,
+            clip_on=False,
+            label="ENCO obs-only at M=0",
+        )
+        for x, row in zip(obs_x, enco_obs):
+            label_offset = -4 if row.obs_n <= 1000 else 4
+            ax.annotate(
+                f"N={row.obs_n}",
+                xy=(x, row.f1_mean),
+                xytext=(x + label_offset, row.f1_mean + 0.06),
+                fontsize=7.5,
+                color=data_color,
+                ha="right" if label_offset < 0 else "left",
+                va="center",
+            )
     ax.errorbar(
         real_x,
         real_y,
@@ -141,7 +177,7 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         linewidth=2.0,
         elinewidth=1.0,
         capsize=2.5,
-        label="GPT-5 mini, real names",
+        label=f"{llm_label}, real names",
         zorder=5,
     )
     ax.errorbar(
@@ -155,7 +191,7 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         linestyle=(0, (4, 2)),
         elinewidth=1.0,
         capsize=2.5,
-        label="GPT-5 mini, anonymized",
+        label=f"{llm_label}, anonymized",
         zorder=5,
     )
 
@@ -173,7 +209,7 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
 
     ax.annotate(
         "No information\nbelow floor",
-        xy=(360, floor.f1_mean * 0.42),
+        xy=(150, floor.f1_mean * 0.42),
         ha="center",
         va="center",
         fontsize=9,
@@ -181,8 +217,8 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     )
     ax.annotate(
         "Real names:\nsemantic prior + data",
-        xy=(275, 0.62),
-        xytext=(300, 0.88),
+        xy=(145, 0.62),
+        xytext=(160, 0.86),
         arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
         ha="center",
         va="center",
@@ -192,7 +228,7 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     ax.annotate(
         "Anonymized:\ndata-driven signal",
         xy=(200, 0.76),
-        xytext=(118, 0.91),
+        xytext=(96, 0.92),
         arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
         ha="center",
         va="center",
@@ -201,8 +237,8 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     )
     ax.annotate(
         "Target zone for\nfuture MICAD methods",
-        xy=(315, max(floor.f1_mean + 0.08, 0.62)),
-        xytext=(430, 0.70),
+        xy=(158, max(floor.f1_mean + 0.08, 0.62)),
+        xytext=(202, 0.70),
         arrowprops=dict(arrowstyle="->", color=data_color, lw=1.2),
         ha="center",
         va="center",
@@ -210,10 +246,10 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         color=data_color,
     )
 
-    ax.set_xlabel("Intervention budget M at fixed N = 1000", fontsize=10.5)
+    ax.set_xlabel("Intervention budget M; LLM curves at fixed N = 1000", fontsize=10.5)
     ax.set_ylabel("F1", fontsize=10.5)
-    ax.xaxis.set_major_locator(FixedLocator([0, 50, 100, 200, 500]))
-    ax.xaxis.set_major_formatter(FixedFormatter(["0", "50", "100", "200", "500"]))
+    ax.xaxis.set_major_locator(FixedLocator([0, 50, 100, 200]))
+    ax.xaxis.set_major_formatter(FixedFormatter(["0", "50", "100", "200"]))
     ax.yaxis.set_major_locator(FixedLocator([0.0, 0.25, 0.50, 0.75, 1.0]))
     ax.yaxis.set_major_formatter(FixedFormatter(["0.00", "0.25", "0.50", "0.75", "1.00"]))
 

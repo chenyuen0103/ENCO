@@ -600,6 +600,8 @@ def extract_adjacency_matrix(text: str, *, fallback_variables: Optional[List[str
             return None
         if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
             return None
+        if not np.isin(arr, [0, 1]).all():
+            return None
         return arr
 
     def _from_obj(obj: Any) -> Optional[np.ndarray]:

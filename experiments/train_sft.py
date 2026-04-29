@@ -10,7 +10,9 @@ import json
 import os
 import re
 import subprocess
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import warnings
@@ -104,6 +106,58 @@ def _derive_non_quantized_model_id(model_name: str) -> str:
         candidate = re.sub(pat, "", candidate)
     candidate = re.sub(r"[-_]{2,}", "-", candidate).rstrip("-_")
     return candidate or name
+
+
+def _tokenizer_source_for_adapter(
+    model_path: str | Path,
+    *,
+    fallback_base_model: str | None = None,
+) -> str:
+    """
+    Some local Qwen adapter dirs contain tokenizer_config.json with
+    extra_special_tokens as a list, while newer Transformers expects a dict.
+    In that case, use the adapter's base tokenizer instead of failing before
+    the model is even loaded.
+    """
+    path = Path(str(model_path)).expanduser()
+    if not path.exists():
+        return str(model_path)
+
+    cfg_path = path / "tokenizer_config.json"
+    if not cfg_path.exists():
+        return str(model_path)
+
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return str(model_path)
+
+    if not isinstance(cfg.get("extra_special_tokens"), list):
+        return str(model_path)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"enco_sft_tok_{path.name}_", dir="/tmp"))
+    for filename in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+        "spiece.model",
+    ]:
+        src = path / filename
+        if src.exists():
+            shutil.copy2(src, tmp_dir / filename)
+    cfg["extra_special_tokens"] = {}
+    (tmp_dir / "tokenizer_config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"[sft] tokenizer_config at {path} has list-valued extra_special_tokens; "
+        f"using sanitized local tokenizer copy: {tmp_dir}"
+    )
+    return str(tmp_dir)
 
 
 def _import_trl_sft() -> tuple[Any, Any]:
@@ -1137,7 +1191,11 @@ def run_sft(
     from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
     is_adapter = (Path(base_model) / "adapter_config.json").exists()
-    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    tokenizer_source = _tokenizer_source_for_adapter(
+        base_model,
+        fallback_base_model=distributed_base_model,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
     distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     # DDP (torchrun, WORLD_SIZE>1) cannot handle 4-bit quantized models.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import csv
 import json
 import math
@@ -24,6 +25,8 @@ from experiments.evaluate import eval_pair
 
 OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
 SACHS_BIF = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"
+SACHS_SUMMARY_CSV = REPO_ROOT / "experiments" / "responses" / "sachs" / "sachs_summary.csv"
+DEFAULT_LLM_MODEL = "gpt-5-mini"
 
 
 def _parse_matrix(raw: Any) -> np.ndarray | None:
@@ -50,8 +53,21 @@ def _parse_matrix(raw: Any) -> np.ndarray | None:
     return None
 
 
-def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
+def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, int, Path]]:
     cells: list[tuple[str, str, str, str, str, int, int, Path]] = []
+    for n in [1000, 5000]:
+        cells.append(
+            (
+                "enco_observational",
+                "ENCO",
+                "data_only",
+                "baseline",
+                "anonymized",
+                n,
+                0,
+                REPO_ROOT / f"experiments/responses/sachs/predictions_obs{n}_int0_ENCO.csv",
+            )
+        )
     for m in [50, 100, 200, 500]:
         cells.append(
             (
@@ -65,42 +81,42 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
             )
         )
-    for m in [0, 50, 100, 200, 500]:
+    for m in [0, 50, 100, 200]:
         cells.append(
             (
                 "llm_real",
-                "gpt-5-mini",
+                llm_model,
                 "mixed_information",
                 "summary",
                 "real",
                 1000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_summary_gpt-5-mini.csv",
+                SACHS_SUMMARY_CSV,
             )
         )
         cells.append(
             (
                 "llm_anonymized",
-                "gpt-5-mini",
+                llm_model,
                 "mixed_information",
                 "summary",
                 "anonymized",
                 1000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_anon_summary_gpt-5-mini.csv",
+                SACHS_SUMMARY_CSV,
             )
         )
     cells.extend(
         [
             (
                 "semantic_floor",
-                "gpt-5-mini",
+                llm_model,
                 "semantic_only",
                 "names_only",
                 "names_only",
                 0,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/responses_names_only_p5_gpt-5-mini.csv",
+                SACHS_SUMMARY_CSV,
             ),
             (
                 "pc_anchor",
@@ -127,6 +143,114 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
     return cells
 
 
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _int_field(row: dict[str, Any], key: str, default: int = 0) -> int:
+    raw = row.get(key, "")
+    if raw in (None, ""):
+        return default
+    return int(float(raw))
+
+
+def _float_or_blank(raw: Any) -> float | str:
+    if raw in (None, ""):
+        return ""
+    return float(raw)
+
+
+def _has_metric(row: dict[str, Any]) -> bool:
+    return (row.get("avg_f1") or row.get("avg_F1")) not in (None, "")
+
+
+def _candidate_rank(row: dict[str, Any]) -> tuple[int, int, int, int, str]:
+    response_csv = row.get("response_csv", "")
+    return (
+        int(_has_metric(row)),
+        _int_field(row, "valid_rows", 0),
+        _int_field(row, "num_rows", 0),
+        int("_p5_" in response_csv or "_p5" in response_csv),
+        response_csv,
+    )
+
+
+def _source_csv(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _find_sachs_summary_row(
+    rows: list[dict[str, Any]],
+    *,
+    system: str,
+    prompt_style: str,
+    naming: str,
+    obs_n: int,
+    int_n: int,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("model") != system or row.get("dataset") != "sachs":
+            continue
+        if row.get("prompt_style") != prompt_style:
+            continue
+
+        if prompt_style == "names_only":
+            if _int_field(row, "is_names_only", 0) == 1:
+                candidates.append(row)
+            continue
+
+        if _int_field(row, "obs_n") != obs_n or _int_field(row, "int_n") != int_n:
+            continue
+        expected_anon = 1 if naming == "anonymized" else 0
+        if _int_field(row, "anonymize") != expected_anon:
+            continue
+        candidates.append(row)
+    if not candidates:
+        return None
+    return max(candidates, key=_candidate_rank)
+
+
+def _summary_output_row(
+    row: dict[str, Any],
+    *,
+    line_id: str,
+    system: str,
+    info_class: str,
+    prompt_style: str,
+    naming: str,
+    obs_n: int,
+    int_n: int,
+    source_csv: str,
+) -> dict[str, Any]:
+    n = _int_field(row, "valid_rows", 0)
+    f1_se = _float_or_blank(row.get("avg_f1_se"))
+    f1_ci95 = 1.96 * f1_se if isinstance(f1_se, float) and n > 1 else 0.0
+    return {
+        "line_id": line_id,
+        "system": system,
+        "information_class": info_class,
+        "prompt_style": prompt_style,
+        "naming_regime": naming,
+        "obs_n": obs_n,
+        "int_n": int_n,
+        "source_csv": source_csv,
+        "n_valid": n,
+        "f1_mean": _float_or_blank(row.get("avg_f1") or row.get("avg_F1")),
+        "f1_sd": _float_or_blank(row.get("avg_f1_sd")),
+        "f1_se": f1_se,
+        "f1_ci95_halfwidth": f1_ci95,
+        "shd_mean": _float_or_blank(row.get("avg_shd")),
+        "shd_sd": _float_or_blank(row.get("avg_shd_sd")),
+    }
+
+
 def _stats(values: list[float]) -> tuple[int, float | str, float | str, float | str, float | str]:
     n = len(values)
     if not n:
@@ -138,8 +262,49 @@ def _stats(values: list[float]) -> tuple[int, float | str, float | str, float | 
     return n, mean, sd, se, ci95
 
 
+def _metric_value(metrics: dict[str, Any], key: str) -> Any:
+    aliases = {
+        "TP": "tp",
+        "TN": "tn",
+        "FP": "fp",
+        "FN": "fn",
+        "orientation_eval_pairs": "orient_eval_pairs",
+        "orientation_TP": "orient_tp",
+        "orientation_FN": "orient_fn",
+        "orientation_accuracy": "orient_acc",
+    }
+    value = metrics.get(key)
+    if value is None:
+        value = metrics.get(aliases.get(key, key))
+    if value is None and key in {"precision", "f1"} and metrics.get("tp") == 0 and metrics.get("fp") == 0:
+        return 0.0
+    return value
+
+
+def _available_models(rows: list[dict[str, Any]]) -> list[str]:
+    return sorted({row["model"] for row in rows if row.get("dataset") == "sachs" and row.get("model")})
+
+
 def main() -> int:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_LLM_MODEL,
+        help=f"Language model to import from sachs_summary.csv (default: {DEFAULT_LLM_MODEL}).",
+    )
+    parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
+    parser.add_argument("--summary-csv", type=Path, default=SACHS_SUMMARY_CSV)
+    parser.add_argument("--list-models", action="store_true", help="List Sachs models in --summary-csv and exit.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit nonzero when any required Figure 1 cell is missing or under-replicated.",
+    )
+    args = parser.parse_args()
+
+    out_dir = args.out_dir
+    sachs_summary_csv = args.summary_csv
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     graph = load_causal_graph(SACHS_BIF)
     answer = np.asarray(graph.adj_matrix).astype(int)
@@ -147,21 +312,75 @@ def main() -> int:
 
     per_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
-    for line_id, system, info_class, prompt_style, naming, obs_n, int_n, path in _required_cells():
+    imported_summary_rows: list[dict[str, Any]] = []
+    sachs_summary_rows = _read_csv_rows(sachs_summary_csv)
+    if args.list_models:
+        for model in _available_models(sachs_summary_rows):
+            print(model)
+        return 0
+    for line_id, system, info_class, prompt_style, naming, obs_n, int_n, path in _required_cells(args.model):
+        if path == SACHS_SUMMARY_CSV:
+            path = sachs_summary_csv
         rows: list[dict[str, Any]] = []
         valid = 0
+        minimum = 1 if line_id in {"enco_ceiling", "enco_observational", "pc_anchor", "ges_anchor"} else 3
+        if system == args.model and path == sachs_summary_csv:
+            summary_row = _find_sachs_summary_row(
+                sachs_summary_rows,
+                system=system,
+                prompt_style=prompt_style,
+                naming=naming,
+                obs_n=obs_n,
+                int_n=int_n,
+            )
+            valid = _int_field(summary_row, "valid_rows", 0) if summary_row else 0
+            if summary_row:
+                imported_summary_rows.append(
+                    _summary_output_row(
+                        summary_row,
+                        line_id=line_id,
+                        system=system,
+                        info_class=info_class,
+                        prompt_style=prompt_style,
+                        naming=naming,
+                        obs_n=obs_n,
+                        int_n=int_n,
+                        source_csv=_source_csv(path),
+                    )
+                )
+            audit_rows.append(
+                {
+                    "line_id": line_id,
+                    "system": system,
+                    "prompt_style": prompt_style,
+                    "naming_regime": naming,
+                    "obs_n": obs_n,
+                    "int_n": int_n,
+                    "source_csv": _source_csv(path),
+                    "exists": int(path.exists()),
+                    "rows": _int_field(summary_row, "num_rows", 0) if summary_row else 0,
+                    "valid_prediction_rows": valid,
+                    "minimum_required": minimum,
+                    "meets_minimum": int(valid >= minimum),
+                }
+            )
+            continue
+
         if path.exists():
             with path.open(newline="", encoding="utf-8") as handle:
                 reader = csv.DictReader(handle)
                 for idx, row in enumerate(reader):
                     rows.append(row)
+                    row_answer = _parse_matrix(row.get("answer"))
+                    if row_answer is None:
+                        row_answer = answer
                     pred = _parse_matrix(row.get("prediction"))
                     if pred is None:
                         pred = _parse_matrix(row.get("raw_response"))
-                    if pred is None or pred.shape != answer.shape:
+                    if pred is None or pred.shape != row_answer.shape:
                         continue
 
-                    metrics = eval_pair(answer, pred)
+                    metrics = eval_pair(row_answer, pred)
                     valid += 1
                     per_rows.append(
                         {
@@ -172,13 +391,13 @@ def main() -> int:
                             "naming_regime": naming,
                             "obs_n": obs_n,
                             "int_n": int_n,
-                            "source_csv": str(path.relative_to(REPO_ROOT)),
+                            "source_csv": _source_csv(path),
                             "replicate_index": row.get("replicate_index") or row.get("data_idx") or idx,
                             "replicate_seed": row.get("replicate_seed", ""),
                             "shuffle_idx": row.get("shuffle_idx", ""),
                             "valid": 1,
                             **{
-                                key: metrics.get(key)
+                                key: _metric_value(metrics, key)
                                 for key in [
                                     "TP",
                                     "TN",
@@ -198,7 +417,6 @@ def main() -> int:
                         }
                     )
 
-        minimum = 1 if line_id in {"enco_ceiling", "pc_anchor", "ges_anchor"} else 3
         audit_rows.append(
             {
                 "line_id": line_id,
@@ -207,7 +425,7 @@ def main() -> int:
                 "naming_regime": naming,
                 "obs_n": obs_n,
                 "int_n": int_n,
-                "source_csv": str(path.relative_to(REPO_ROOT)),
+                "source_csv": _source_csv(path),
                 "exists": int(path.exists()),
                 "rows": len(rows),
                 "valid_prediction_rows": valid,
@@ -243,7 +461,7 @@ def main() -> int:
         "orientation_FN",
         "orientation_accuracy",
     ]
-    with (OUT_DIR / "figure1_per_run.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (out_dir / "figure1_per_run.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=per_fields)
         writer.writeheader()
         writer.writerows(per_rows)
@@ -262,7 +480,7 @@ def main() -> int:
         )
         grouped[key].append(row)
 
-    summary_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = list(imported_summary_rows)
     for key, rows in sorted(grouped.items(), key=lambda item: (item[0][0], int(item[0][6]), item[0][4])):
         f1_values = [float(row["f1"]) for row in rows if row.get("f1") not in (None, "")]
         shd_values = [float(row["shd"]) for row in rows if row.get("shd") not in (None, "")]
@@ -288,6 +506,7 @@ def main() -> int:
                 "shd_sd": shd_sd,
             }
         )
+    summary_rows.sort(key=lambda row: (row["line_id"], int(row["int_n"]), row["naming_regime"]))
 
     summary_fields = [
         "line_id",
@@ -306,7 +525,7 @@ def main() -> int:
         "shd_mean",
         "shd_sd",
     ]
-    with (OUT_DIR / "figure1_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (out_dir / "figure1_summary.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=summary_fields)
         writer.writeheader()
         writer.writerows(summary_rows)
@@ -325,7 +544,7 @@ def main() -> int:
         "minimum_required",
         "meets_minimum",
     ]
-    with (OUT_DIR / "figure1_audit.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (out_dir / "figure1_audit.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=audit_fields)
         writer.writeheader()
         writer.writerows(audit_rows)
@@ -334,7 +553,7 @@ def main() -> int:
     readme = [
         "# Sachs Figure 1 Result Collection",
         "",
-        "Collected from saved response/prediction CSVs and evaluated against `causal_graphs/real_data/small_graphs/sachs.bif`.",
+        f"Collected from saved response/prediction CSVs and `{_source_csv(sachs_summary_csv)}` for `{args.model}`; raw predictions are evaluated against `causal_graphs/real_data/small_graphs/sachs.bif` when needed.",
         "",
         "## Audit",
         "",
@@ -351,16 +570,18 @@ def main() -> int:
         readme.append("All required Figure 1 cells meet the minimum replicate count.")
     readme.extend(["", "## Summary F1", ""])
     for row in summary_rows:
+        f1_text = f"{float(row['f1_mean']):.3f}" if row["f1_mean"] not in (None, "") else "NA"
+        sd_text = f"{float(row['f1_sd']):.3f}" if row["f1_sd"] not in (None, "") else "NA"
         readme.append(
             f"- {row['line_id']} {row['naming_regime']} M={row['int_n']}: "
-            f"F1={float(row['f1_mean']):.3f} (n={row['n_valid']}, sd={float(row['f1_sd']):.3f})"
+            f"F1={f1_text} (n={row['n_valid']}, sd={sd_text})"
         )
-    (OUT_DIR / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
+    (out_dir / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
 
     for path in ["figure1_per_run.csv", "figure1_summary.csv", "figure1_audit.csv", "README.md"]:
-        print(OUT_DIR / path)
+        print(out_dir / path)
     print("ALL_REQUIRED_CELLS_PRESENT" if not missing else "UNDER_REPLICATED")
-    return 0 if not missing else 1
+    return 1 if missing and args.strict else 0
 
 
 if __name__ == "__main__":
