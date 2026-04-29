@@ -101,7 +101,8 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     ax.set_facecolor("white")
 
     all_m = sorted({row.int_n for row in enco + real + anon} | {0})
-    x_min, x_max = -22, max(all_m) + 38
+    max_m = max(all_m)
+    x_min, x_max = -22, max_m + 38
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(0.0, 1.05)
 
@@ -168,52 +169,69 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         zorder=6,
         label="PC/GES at M=0",
     )
-    ax.annotate("PC", xy=(0, pc.f1_mean), xytext=(16, pc.f1_mean - 0.055), fontsize=8.5, color=anchor_color)
-    ax.annotate("GES", xy=(0, ges.f1_mean), xytext=(16, ges.f1_mean + 0.02), fontsize=8.5, color=anchor_color)
+    ax.annotate(
+        "PC",
+        xy=(0, pc.f1_mean),
+        xytext=(-7, pc.f1_mean - 0.055),
+        ha="right",
+        fontsize=8.5,
+        color=anchor_color,
+    )
+    ax.annotate(
+        "GES",
+        xy=(0, ges.f1_mean),
+        xytext=(-7, ges.f1_mean + 0.035),
+        ha="right",
+        fontsize=8.5,
+        color=anchor_color,
+    )
 
     ax.annotate(
-        "No information\nbelow floor",
-        xy=(360, floor.f1_mean * 0.42),
+        "Below the semantic-only floor,\na score is not informative about data use",
+        xy=(0.72 * max_m, floor.f1_mean * 0.42),
         ha="center",
         va="center",
-        fontsize=9,
+        fontsize=8.8,
         color="#6B4B20",
     )
     ax.annotate(
-        "Real names:\nsemantic prior + data",
-        xy=(275, 0.62),
-        xytext=(300, 0.88),
+        "Real-name condition",
+        xy=(real_x[-1], real_y[-1]),
+        xytext=(0.76 * max_m, 0.66),
         arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
         ha="center",
         va="center",
         fontsize=9,
         color=mixed_color,
+        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
     )
     ax.annotate(
-        "Anonymized:\ndata-driven signal",
-        xy=(200, 0.76),
-        xytext=(118, 0.91),
+        "Anonymized condition",
+        xy=(anon_x[-2], anon_y[-2]),
+        xytext=(0.44 * max_m, 0.82),
         arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
         ha="center",
         va="center",
         fontsize=9,
         color=mixed_color,
+        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
     )
     ax.annotate(
         "Target zone for\nfuture MICAD methods",
-        xy=(315, max(floor.f1_mean + 0.08, 0.62)),
-        xytext=(430, 0.70),
+        xy=(0.64 * max_m, max(floor.f1_mean + 0.08, 0.62)),
+        xytext=(0.92 * max_m, 0.80),
         arrowprops=dict(arrowstyle="->", color=data_color, lw=1.2),
         ha="center",
         va="center",
         fontsize=9.5,
         color=data_color,
+        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
     )
 
     ax.set_xlabel("Intervention budget M at fixed N = 1000", fontsize=10.5)
     ax.set_ylabel("F1", fontsize=10.5)
-    ax.xaxis.set_major_locator(FixedLocator([0, 50, 100, 200, 500]))
-    ax.xaxis.set_major_formatter(FixedFormatter(["0", "50", "100", "200", "500"]))
+    ax.xaxis.set_major_locator(FixedLocator(all_m))
+    ax.xaxis.set_major_formatter(FixedFormatter([str(m) for m in all_m]))
     ax.yaxis.set_major_locator(FixedLocator([0.0, 0.25, 0.50, 0.75, 1.0]))
     ax.yaxis.set_major_formatter(FixedFormatter(["0.00", "0.25", "0.50", "0.75", "1.00"]))
 

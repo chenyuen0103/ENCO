@@ -50,9 +50,16 @@ def _parse_matrix(raw: Any) -> np.ndarray | None:
     return None
 
 
+def _preferred_existing(paths: list[Path]) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
 def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
     cells: list[tuple[str, str, str, str, str, int, int, Path]] = []
-    for m in [50, 100, 200, 500]:
+    for m in [50, 100, 200]:
         cells.append(
             (
                 "enco_ceiling",
@@ -62,10 +69,15 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "anonymized",
                 1000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO_seed42.csv",
+                        REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
+                    ]
+                ),
             )
         )
-    for m in [0, 50, 100, 200, 500]:
+    for m in [0, 50, 100, 200]:
         cells.append(
             (
                 "llm_real",
@@ -75,7 +87,14 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "real",
                 1000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_summary_gpt-5-mini.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT
+                        / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p3_summary_joint_gpt-5-mini.csv",
+                        REPO_ROOT
+                        / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_summary_joint_gpt-5-mini.csv",
+                    ]
+                ),
             )
         )
         cells.append(
@@ -87,7 +106,14 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "anonymized",
                 1000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_anon_summary_gpt-5-mini.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT
+                        / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p3_anon_summary_joint_gpt-5-mini.csv",
+                        REPO_ROOT
+                        / f"experiments/responses/sachs/responses_obs1000_int{m}_shuf1_p5_anon_summary_joint_gpt-5-mini.csv",
+                    ]
+                ),
             )
         )
     cells.extend(
@@ -100,7 +126,12 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "names_only",
                 0,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/responses_names_only_p5_gpt-5-mini.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT / "experiments/responses/sachs/responses_names_only_p5_gpt-5-mini.csv",
+                        REPO_ROOT / "experiments/responses/sachs/responses_names_only_p3_gpt-5-mini.csv",
+                    ]
+                ),
             ),
             (
                 "pc_anchor",
@@ -110,7 +141,12 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "anonymized",
                 1000,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC_seed42.csv",
+                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC.csv",
+                    ]
+                ),
             ),
             (
                 "ges_anchor",
@@ -120,7 +156,12 @@ def _required_cells() -> list[tuple[str, str, str, str, str, int, int, Path]]:
                 "anonymized",
                 1000,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES.csv",
+                _preferred_existing(
+                    [
+                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES_seed42.csv",
+                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES.csv",
+                    ]
+                ),
             ),
         ]
     )
