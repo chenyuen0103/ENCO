@@ -389,6 +389,8 @@ def build_vllm_engine(
     gpu_memory_utilization: float = 0.9,
     enforce_eager: bool = False,
     trust_remote_code: bool = True,
+    quantization: Optional[str] = None,
+    hf_overrides: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a vLLM LLM engine for the given model name.
@@ -441,6 +443,10 @@ def build_vllm_engine(
 
     if max_model_len is not None:
         kwargs["max_model_len"] = int(max_model_len)
+    if quantization:
+        kwargs["quantization"] = str(quantization)
+    if hf_overrides:
+        kwargs["hf_overrides"] = hf_overrides
 
     llm = LLM(**kwargs)
     return llm

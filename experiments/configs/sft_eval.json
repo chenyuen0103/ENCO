@@ -34,12 +34,15 @@
     ],
     "obs_per_prompt": [
       1000,
-      5000
+      100,
+      0
     ],
     "int_per_combo": [
-      0,
-      200
+      10,
+      50,
+      0
     ],
+
     "anonymize": [
       false,
       true
