@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -520,24 +521,48 @@ def step_generate_and_run_in_memory(args: argparse.Namespace, *, experiments_dir
     _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
 
-def _load_evaluated_response_csvs(summary_csv: Path) -> set[Path]:
-    if not summary_csv.exists():
-        return set()
+_REQUIRED_PER_ROW_COLUMNS = {
+    "format_ok",
+    "n_vars",
+    "tp",
+    "tn",
+    "fp",
+    "fn",
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "shd",
+    "acyclic",
+    "skeleton_accuracy",
+    "skeleton_precision",
+    "skeleton_recall",
+    "skeleton_f1",
+    "orient_eval_pairs",
+    "orient_tp",
+    "orient_fn",
+    "orient_acc",
+    "vstruct_precision",
+    "vstruct_recall",
+    "vstruct_f1",
+    "ancestor_accuracy",
+    "ancestor_precision",
+    "ancestor_recall",
+    "ancestor_f1",
+    "nhd",
+    "nhd_ratio",
+}
+
+
+def _per_row_cache_is_current(csv_path: Path) -> bool:
+    per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
+    if not per_row_path.exists() or per_row_path.stat().st_mtime < csv_path.stat().st_mtime:
+        return False
     try:
-        df = pd.read_csv(summary_csv)
+        columns = set(pd.read_csv(per_row_path, nrows=0).columns)
     except Exception:
-        return set()
-    if "response_csv" not in df.columns:
-        return set()
-    if "evaluated" in df.columns:
-        df = df[df["evaluated"] == 1].copy()
-    out: set[Path] = set()
-    for value in df["response_csv"].dropna():
-        try:
-            out.add(Path(str(value)).resolve())
-        except Exception:
-            continue
-    return out
+        return False
+    return _REQUIRED_PER_ROW_COLUMNS.issubset(columns)
 
 
 def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
@@ -549,20 +574,10 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
             "Run the model step first."
         )
 
-    evaluated_cache: dict[Path, set[Path]] = {}
     for csv_path in resp_csvs:
         summary_csv = csv_path.parent / "eval_summary.csv"
-        if summary_csv not in evaluated_cache:
-            evaluated_cache[summary_csv] = _load_evaluated_response_csvs(summary_csv)
 
-        per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
-        if (
-            per_row_path.exists()
-            and per_row_path.stat().st_mtime >= csv_path.stat().st_mtime
-            and not args.overwrite_eval
-        ):
-            continue
-        if not args.overwrite_eval and csv_path.resolve() in evaluated_cache[summary_csv]:
+        if _per_row_cache_is_current(csv_path) and not args.overwrite_eval:
             continue
 
         cmd = [
@@ -576,8 +591,6 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
             str(summary_csv),
         ]
         _run(cmd, cwd=experiments_dir, dry_run=dry_run)
-        if not dry_run:
-            evaluated_cache[summary_csv].add(csv_path.resolve())
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -780,6 +793,248 @@ def _ordering_bias_from_csv(csv_path: Path) -> dict[str, Any]:
     }
 
 
+def _numeric_values(df: pd.DataFrame, col: str, mask: Optional[pd.Series] = None) -> list[float]:
+    if col not in df.columns:
+        return []
+    series = pd.to_numeric(df[col], errors="coerce")
+    if mask is not None:
+        series = series[mask]
+    return [float(v) for v in series.dropna().tolist() if math.isfinite(float(v))]
+
+
+def _mean_or_none(values: list[float]) -> Optional[float]:
+    return float(sum(values) / len(values)) if values else None
+
+
+def _mean_std_iqr_ci_local(values: list[float]) -> tuple[Optional[float], Optional[float], Optional[float], tuple[Optional[float], Optional[float]]]:
+    values = [float(v) for v in values if math.isfinite(float(v))]
+    if not values:
+        return None, None, None, (None, None)
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    mean = float(arr.mean())
+    sd = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+    q25, q75 = np.percentile(arr, [25, 75])
+    iqr = float(q75 - q25)
+    se = sd / math.sqrt(len(arr)) if len(arr) > 1 else 0.0
+    return mean, sd, iqr, (float(mean - 1.96 * se), float(mean + 1.96 * se))
+
+
+def _response_rows_for_cached_summary(csv_path: Path) -> tuple[list[dict[str, Any]], list[str], str]:
+    try:
+        csv.field_size_limit(10_000_000)
+    except OverflowError:
+        csv.field_size_limit(1_000_000)
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+    for row in rows:
+        row.pop(None, None)
+    if "answer" in fieldnames:
+        answer_col = "answer"
+    elif "answer_path" in fieldnames:
+        answer_col = "answer_path"
+    else:
+        answer_col = "answer_path"
+    return rows, fieldnames, answer_col
+
+
+def _first_true_matrix(rows: list[dict[str, Any]], answer_col: str, csv_path: Path) -> Any:
+    from evaluate import load_gt_from_cell
+
+    resolve_roots: list[Path] = []
+    try:
+        if len(csv_path.parents) >= 3:
+            resolve_roots.append(csv_path.parents[2])
+    except Exception:
+        pass
+    for row in rows:
+        A_true, _vars = load_gt_from_cell(str(row.get(answer_col, "") or ""), resolve_roots=resolve_roots)
+        if A_true is not None:
+            return A_true
+    return None
+
+
+def _cached_summary_from_per_row(csv_path: Path, *, tau: float) -> Optional[dict[str, Any]]:
+    """
+    Rebuild evaluate.py's summary from <csv>.per_row.csv when that cache is fresh.
+
+    This avoids reparsing raw model responses during analyze. Consensus-only fields are
+    restored from <csv>.consensus_tau*.json when available; otherwise those fields are
+    left absent, matching a no-consensus summary rather than forcing a full re-eval.
+    """
+    per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
+    if not _per_row_cache_is_current(csv_path):
+        return None
+
+    try:
+        per_df = pd.read_csv(per_row_path)
+    except Exception:
+        return None
+    if per_df.empty and "format_ok" not in per_df.columns:
+        return None
+
+    rows, _fieldnames, answer_col = _response_rows_for_cached_summary(csv_path)
+    raw_df = pd.DataFrame(rows)
+
+    if "n_vars" in per_df.columns:
+        valid_mask = pd.to_numeric(per_df["n_vars"], errors="coerce").notna()
+    else:
+        valid_mask = pd.Series([False] * len(per_df), index=per_df.index)
+
+    summary: dict[str, Any] = {
+        "num_rows": int(len(per_df)),
+        "valid_rows": int(valid_mask.sum()),
+    }
+
+    fmt_vals = pd.to_numeric(per_df["format_ok"], errors="coerce") if "format_ok" in per_df.columns else pd.Series(dtype=float)
+    fmt_vals = fmt_vals.dropna()
+    summary["format_scored_rows"] = int(len(fmt_vals))
+    summary["format_ok_rows"] = int((fmt_vals == 1).sum()) if len(fmt_vals) else 0
+    summary["format_rate"] = (
+        float(summary["format_ok_rows"] / summary["format_scored_rows"])
+        if summary["format_scored_rows"] > 0
+        else None
+    )
+
+    avg_map = {
+        "avg_TP": "tp",
+        "avg_TN": "tn",
+        "avg_FP": "fp",
+        "avg_FN": "fn",
+        "avg_accuracy": "accuracy",
+        "avg_precision": "precision",
+        "avg_recall": "recall",
+        "avg_f1": "f1",
+        "avg_shd": "shd",
+        "acyclic_rate": "acyclic",
+        "avg_skeleton_accuracy": "skeleton_accuracy",
+        "avg_skeleton_precision": "skeleton_precision",
+        "avg_skeleton_recall": "skeleton_recall",
+        "avg_skeleton_f1": "skeleton_f1",
+        "avg_orientation_eval_pairs": "orient_eval_pairs",
+        "avg_orientation_TP": "orient_tp",
+        "avg_orientation_FN": "orient_fn",
+        "avg_orientation_accuracy": "orient_acc",
+        "avg_vstruct_precision": "vstruct_precision",
+        "avg_vstruct_recall": "vstruct_recall",
+        "avg_vstruct_f1": "vstruct_f1",
+        "avg_ancestor_accuracy": "ancestor_accuracy",
+        "avg_ancestor_precision": "ancestor_precision",
+        "avg_ancestor_recall": "ancestor_recall",
+        "avg_ancestor_f1": "ancestor_f1",
+    }
+    for out_col, per_col in avg_map.items():
+        summary[out_col] = _mean_or_none(_numeric_values(per_df, per_col, valid_mask))
+
+    if "tp" in per_df.columns and "fp" in per_df.columns:
+        tp = pd.to_numeric(per_df["tp"], errors="coerce")
+        fp = pd.to_numeric(per_df["fp"], errors="coerce")
+        edge_series = (tp + fp)[valid_mask].dropna()
+        pred_edges = [float(v) for v in edge_series.tolist() if math.isfinite(float(v))]
+    else:
+        pred_edges = []
+    summary["num_pred_edges"] = _mean_or_none(pred_edges)
+
+    from evaluate import get_true_num_edges_from_answers, scan_given_edges_df
+
+    has_given_edges, given_edge_count = scan_given_edges_df(raw_df)
+    true_num_edges = get_true_num_edges_from_answers(raw_df, answer_col=answer_col)
+    summary["true_num_edges"] = int(true_num_edges) if true_num_edges is not None else None
+    summary["given_edges"] = int(has_given_edges)
+    summary["given_edge_count"] = int(given_edge_count)
+    summary["given_edge_frac"] = (
+        float(given_edge_count / true_num_edges)
+        if true_num_edges and true_num_edges > 0 and given_edge_count > 0
+        else None
+    )
+
+    spread_specs = [
+        ("shd", "var_shd"),
+        ("accuracy", "var_accuracy"),
+        ("precision", "var_precision"),
+        ("recall", "var_recall"),
+        ("f1", "var_f1"),
+    ]
+    for per_col, prefix in spread_specs:
+        _mean, sd, iqr, ci = _mean_std_iqr_ci_local(_numeric_values(per_df, per_col, valid_mask))
+        summary[f"{prefix}_sd"] = sd
+        summary[f"{prefix}_iqr"] = iqr
+        summary[f"{prefix}_ci95_low"] = ci[0]
+        summary[f"{prefix}_ci95_high"] = ci[1]
+    _mean, sd, iqr, ci = _mean_std_iqr_ci_local(pred_edges)
+    summary["var_num_pred_edges_sd"] = sd
+    summary["var_num_pred_edges_iqr"] = iqr
+    summary["var_num_pred_edges_ci95_low"] = ci[0]
+    summary["var_num_pred_edges_ci95_high"] = ci[1]
+
+    nhd_vals = _numeric_values(per_df, "nhd", valid_mask)
+    nhd_ratio_vals = _numeric_values(per_df, "nhd_ratio", valid_mask)
+    if nhd_vals:
+        mean, sd, iqr, ci = _mean_std_iqr_ci_local(nhd_vals)
+        summary.update({
+            "nhd_mean": mean,
+            "nhd_sd": sd,
+            "nhd_iqr": iqr,
+            "nhd_ci95_low": ci[0],
+            "nhd_ci95_high": ci[1],
+        })
+    if nhd_ratio_vals:
+        mean, sd, iqr, ci = _mean_std_iqr_ci_local(nhd_ratio_vals)
+        summary.update({
+            "nhd_ratio_mean": mean,
+            "nhd_ratio_sd": sd,
+            "nhd_ratio_iqr": iqr,
+            "nhd_ratio_ci95_low": ci[0],
+            "nhd_ratio_ci95_high": ci[1],
+        })
+
+    consensus_path = csv_path.with_suffix(csv_path.suffix + f".consensus_tau{tau:.2f}.json")
+    if consensus_path.exists() and consensus_path.stat().st_mtime >= csv_path.stat().st_mtime:
+        try:
+            import numpy as np
+            from evaluate import brier_edgewise, brier_skeleton, eval_pair, nhd, nhd_baseline
+
+            artifact = _read_json(consensus_path)
+            P = np.asarray(artifact.get("P"), dtype=float)
+            consensus_adj = np.asarray(artifact.get("adjacency_matrix_consensus"), dtype=int)
+            A_true = _first_true_matrix(rows, answer_col, csv_path)
+            n = consensus_adj.shape[0]
+            off = ~np.eye(n, dtype=bool)
+            summary["consensus_tau"] = float(artifact.get("tau", tau))
+            summary["consensus_K"] = int(artifact.get("K", summary["valid_rows"]))
+            summary["consensus_num_edges"] = int(consensus_adj[off].sum())
+            if A_true is not None and A_true.shape == consensus_adj.shape:
+                consensus_metrics = eval_pair(A_true, consensus_adj)
+                summary.update({
+                    "brier": brier_edgewise(P, A_true) if P.shape == A_true.shape else None,
+                    "brier_skeleton": brier_skeleton(P, A_true) if P.shape == A_true.shape else None,
+                    "nhd_consensus": nhd(A_true, consensus_adj, use_m2=True),
+                    "consensus_accuracy": consensus_metrics["accuracy"],
+                    "consensus_precision": consensus_metrics["precision"],
+                    "consensus_recall": consensus_metrics["recall"],
+                    "consensus_f1": consensus_metrics["f1"],
+                    "consensus_shd": consensus_metrics["shd"],
+                    "consensus_acyclic": consensus_metrics["acyclic"],
+                    "consensus_skeleton_f1": consensus_metrics["skeleton_f1"],
+                    "consensus_orient_acc": consensus_metrics["orient_acc"],
+                    "consensus_vstruct_f1": consensus_metrics["vstruct_f1"],
+                    "consensus_ancestor_f1": consensus_metrics["ancestor_f1"],
+                })
+                base = nhd_baseline(A_true, int(consensus_adj[off].sum()), use_m2=True)
+                summary["nhd_ratio_consensus"] = (
+                    float(summary["nhd_consensus"] / base) if base > 0 else None
+                )
+        except Exception:
+            pass
+
+    summary.setdefault("brier", None)
+    summary.setdefault("brier_skeleton", None)
+    return summary
+
+
 def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
     resp_dirs = _resolve_response_dirs(args, experiments_dir)
     resp_csvs = _find_response_csvs(resp_dirs)
@@ -801,18 +1056,25 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
     # 1) Collect per-condition summaries into one CSV
     summary_rows: list[dict[str, Any]] = []
     ordering_rows: list[dict[str, Any]] = []
+    cached_summary_count = 0
+    full_eval_summary_count = 0
 
     for csv_path in resp_csvs:
         meta = _parse_response_meta(args.dataset, csv_path)
         display_model = _display_model_for_meta(meta, args)
         ctx = _context_window_for(display_model)
         pt_stats = _prompt_token_stats(csv_path, context_window=ctx)
-        summary = evaluate_response_csv(
-            csv_path,
-            tau=args.tau,
-            write_artifacts=False,
-            verbose=False,
-        )["summary"]
+        summary = _cached_summary_from_per_row(csv_path, tau=args.tau)
+        if summary is None:
+            full_eval_summary_count += 1
+            summary = evaluate_response_csv(
+                csv_path,
+                tau=args.tau,
+                write_artifacts=False,
+                verbose=False,
+            )["summary"]
+        else:
+            cached_summary_count += 1
         row: dict[str, Any] = {
             "dataset": meta.dataset,
             "model": display_model,
@@ -869,6 +1131,10 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         )
 
     attach_contrastive_metrics(summary_rows)
+    print(
+        f"[info] Analyze summaries: reused_per_row={cached_summary_count} "
+        f"full_eval={full_eval_summary_count}"
+    )
 
     summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
