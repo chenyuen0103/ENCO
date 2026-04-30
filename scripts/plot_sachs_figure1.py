@@ -84,6 +84,7 @@ def _configure_matplotlib() -> None:
 def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) -> list[Path]:
     _configure_matplotlib()
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     from matplotlib.ticker import FixedLocator, FixedFormatter
 
     rows = _read_summary(summary_csv)
@@ -106,23 +107,22 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     below_floor_fill = "#F3C78A"
     target_fill = "#B9D9EC"
 
-    fig, ax = plt.subplots(figsize=(7.1, 4.5))
+    fig, ax = plt.subplots(figsize=(7.3, 4.65))
     ax.set_facecolor("white")
 
     all_m = sorted({row.int_n for row in enco + real + anon} | {0})
-    x_min, x_max = -22, min(max(all_m), MAX_PLOTTED_INTERVENTIONS) + 38
+    x_min, x_max = -20, min(max(all_m), MAX_PLOTTED_INTERVENTIONS) + 32
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(-0.035, 1.05)
 
-    ax.axhspan(0.0, floor.f1_mean, color=below_floor_fill, alpha=0.16, zorder=0)
-    ax.axhspan(floor.f1_mean, 1.0, color=target_fill, alpha=0.11, zorder=0)
+    ax.axhspan(0.0, floor.f1_mean, color=below_floor_fill, alpha=0.13, zorder=0)
+    ax.axhspan(floor.f1_mean, 1.0, color=target_fill, alpha=0.07, zorder=0)
 
     ax.axhline(
         floor.f1_mean,
         color=semantic_color,
         linestyle=(0, (5, 3)),
         linewidth=1.8,
-        label=f"Semantic-only floor ({floor.f1_mean:.2f})",
         zorder=2,
     )
 
@@ -137,7 +137,6 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         marker="o",
         markersize=5.5,
         linewidth=2.4,
-        label="ENCO data-only ceiling",
         zorder=4,
     )
     if enco_obs:
@@ -154,7 +153,6 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
             linewidth=1.4,
             zorder=7,
             clip_on=False,
-            label="ENCO obs-only at M=0",
         )
         for x, row in zip(obs_x, enco_obs):
             label_offset = -4 if row.obs_n <= 1000 else 4
@@ -177,7 +175,6 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         linewidth=2.0,
         elinewidth=1.0,
         capsize=2.5,
-        label=f"{llm_label}, real names",
         zorder=5,
     )
     ax.errorbar(
@@ -191,7 +188,6 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         linestyle=(0, (4, 2)),
         elinewidth=1.0,
         capsize=2.5,
-        label=f"{llm_label}, anonymized",
         zorder=5,
     )
 
@@ -202,7 +198,6 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
         s=34,
         color=anchor_color,
         zorder=6,
-        label="PC/GES at M=0",
     )
     ax.annotate(
         "PC",
@@ -222,48 +217,82 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     )
 
     ax.annotate(
-        "No information\nbelow floor",
-        xy=(150, floor.f1_mean * 0.42),
+        "Semantic-only floor",
+        xy=(132, floor.f1_mean),
+        xytext=(0, 8),
+        textcoords="offset points",
+        ha="left",
+        va="center",
+        fontsize=8.8,
+        color=semantic_color,
+    )
+    ax.annotate(
+        "Below floor:\nno usable mixed-information gain",
+        xy=(145, floor.f1_mean * 0.44),
         ha="center",
         va="center",
         fontsize=8.8,
         color="#6B4B20",
     )
     ax.annotate(
-        "Real names:\nsemantic prior + data",
-        xy=(145, 0.62),
-        xytext=(160, 0.86),
-        arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
-        ha="center",
+        "Headroom to classical ceiling",
+        xy=(188, (enco_y[-1] + real_y[-1]) * 0.5),
+        xytext=(118, 0.86),
+        arrowprops=dict(arrowstyle="->", color=data_color, lw=1.1),
+        ha="left",
         va="center",
-        fontsize=9,
-        color=mixed_color,
-        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
-    )
-    ax.annotate(
-        "Anonymized:\ndata-driven signal",
-        xy=(200, 0.76),
-        xytext=(96, 0.92),
-        arrowprops=dict(arrowstyle="->", color=mixed_color, lw=1.0),
-        ha="center",
-        va="center",
-        fontsize=9,
-        color=mixed_color,
-        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
-    )
-    ax.annotate(
-        "Target zone for\nfuture MICAD methods",
-        xy=(158, max(floor.f1_mean + 0.08, 0.62)),
-        xytext=(202, 0.70),
-        arrowprops=dict(arrowstyle="->", color=data_color, lw=1.2),
-        ha="center",
-        va="center",
-        fontsize=9.5,
+        fontsize=9.0,
         color=data_color,
-        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
+        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.88),
     )
 
-    ax.set_xlabel("Intervention budget M; LLM curves at fixed N = 1000", fontsize=10.5)
+    def _endpoint_label(
+        xs: list[int],
+        ys: list[float],
+        *,
+        text: str,
+        color: str,
+        dx: float,
+        dy: float,
+        linestyle: str = "solid",
+        marker: str = "o",
+    ) -> None:
+        ax.annotate(
+            text,
+            xy=(xs[-1], ys[-1]),
+            xytext=(dx, dy),
+            textcoords="offset points",
+            arrowprops=dict(arrowstyle="-", color=color, lw=0.9, shrinkA=2, shrinkB=2),
+            ha="left",
+            va="center",
+            fontsize=8.9,
+            color=color,
+            bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.9),
+        )
+        ax.plot(
+            [xs[-1], xs[-1] + 0.001],
+            [ys[-1], ys[-1]],
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            markersize=0,
+            alpha=0.0,
+        )
+
+    _endpoint_label(enco_x, enco_y, text="ENCO ceiling", color=data_color, dx=8, dy=0)
+    _endpoint_label(real_x, real_y, text="Real names", color=mixed_color, dx=12, dy=-4)
+    _endpoint_label(
+        anon_x,
+        anon_y,
+        text="Anonymized",
+        color=mixed_color,
+        dx=12,
+        dy=14,
+        linestyle=(0, (4, 2)),
+        marker="s",
+    )
+
+    ax.set_xlabel("Intervention budget $M$ (LLM curves at fixed $N=1000$)", fontsize=10.5)
     ax.set_ylabel("F1", fontsize=10.5)
     ax.xaxis.set_major_locator(FixedLocator([0, 50, 100, 200]))
     ax.xaxis.set_major_formatter(FixedFormatter(["0", "50", "100", "200"]))
@@ -278,21 +307,27 @@ def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) ->
     ax.spines["bottom"].set_color("#333333")
     ax.tick_params(axis="both", labelsize=9)
 
+    legend_handles = [
+        Line2D([0], [0], color=semantic_color, linestyle=(0, (5, 3)), linewidth=1.8, label=f"Floor ({floor.f1_mean:.2f})"),
+        Line2D([0], [0], marker="^", markersize=7, markerfacecolor="white", markeredgewidth=1.4, markeredgecolor=data_color, linewidth=0, label="ENCO obs-only"),
+        Line2D([0], [0], marker="D", markersize=6.5, color=anchor_color, linewidth=0, label="PC / GES"),
+    ]
     legend = ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.20),
+        handles=legend_handles,
+        loc="lower left",
+        bbox_to_anchor=(0.01, 0.02),
         ncol=3,
         frameon=True,
-        framealpha=0.96,
+        framealpha=0.97,
         facecolor="white",
         edgecolor="#DDDDDD",
-        fontsize=8.0,
-        columnspacing=1.0,
+        fontsize=8.1,
+        columnspacing=1.2,
         handlelength=2.0,
     )
     legend.get_frame().set_linewidth(0.8)
 
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for fmt in formats:
