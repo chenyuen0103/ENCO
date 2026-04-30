@@ -82,7 +82,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -143,6 +143,18 @@ class TeacherConfig:
     max_revisions: int = 1
     retry_until_valid: bool = False
     retry_sleep_s: float = 0.0
+    vllm_model: Optional[str] = None
+    vllm_tensor_parallel_size: int = 1
+    vllm_dtype: str = "auto"
+    vllm_max_model_len: Optional[int] = None
+    vllm_gpu_memory_utilization: float = 0.90
+    vllm_enforce_eager: bool = False
+    vllm_cuda_visible_devices: Optional[str] = None
+    vllm_quantization: Optional[str] = None
+    vllm_yarn_factor: Optional[float] = None
+    vllm_original_max_position_embeddings: int = 32768
+    vllm_engine: Any = None
+    vllm_tokenizer: Any = None
 
 
 def _wait_for_vllm_server(base_url: str, *, timeout_s: float, proc: subprocess.Popen | None = None) -> None:
@@ -658,6 +670,64 @@ def _call_teacher_openai_compatible(prompt: str, cfg: TeacherConfig) -> str:
         return f"[ERROR] {type(e).__name__}: {e}"
 
 
+def _call_teacher_vllm(prompt: str, cfg: TeacherConfig) -> str:
+    if cfg.vllm_engine is None:
+        if cfg.vllm_cuda_visible_devices:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.vllm_cuda_visible_devices)
+        try:
+            from query_vllm import build_vllm_engine, call_vllm_textgen  # type: ignore
+        except ImportError:
+            try:
+                from experiments.query_vllm import build_vllm_engine, call_vllm_textgen  # type: ignore
+            except ImportError as e:
+                return f"[ERROR] vLLM helper unavailable: {type(e).__name__}: {e}"
+        model = str(cfg.vllm_model or cfg.model)
+        print(
+            "[teacher-vllm] loading embedded vLLM engine "
+            f"model={model} tp={cfg.vllm_tensor_parallel_size} "
+            f"dtype={cfg.vllm_dtype} max_model_len={cfg.vllm_max_model_len or 'auto'} "
+            f"gpu_mem={cfg.vllm_gpu_memory_utilization}",
+            flush=True,
+        )
+        try:
+            cfg.vllm_engine = build_vllm_engine(
+                model,
+                tensor_parallel_size=int(cfg.vllm_tensor_parallel_size),
+                vllm_dtype=str(cfg.vllm_dtype),
+                max_model_len=cfg.vllm_max_model_len,
+                gpu_memory_utilization=float(cfg.vllm_gpu_memory_utilization),
+                enforce_eager=bool(cfg.vllm_enforce_eager),
+                quantization=cfg.vllm_quantization,
+                hf_overrides=(
+                    {
+                        "rope_scaling": {
+                            "type": "yarn",
+                            "factor": float(cfg.vllm_yarn_factor),
+                            "original_max_position_embeddings": int(
+                                cfg.vllm_original_max_position_embeddings
+                            ),
+                        }
+                    }
+                    if cfg.vllm_yarn_factor and float(cfg.vllm_yarn_factor) > 0
+                    else None
+                ),
+            )
+        except Exception as e:
+            return f"[ERROR] Embedded vLLM init failed: {type(e).__name__}: {e}"
+        cfg._vllm_call = call_vllm_textgen  # type: ignore[attr-defined]
+
+    try:
+        call_vllm_textgen = getattr(cfg, "_vllm_call")
+        return call_vllm_textgen(
+            cfg.vllm_engine,
+            prompt,
+            temperature=float(cfg.temperature),
+            max_new_tokens=int(cfg.max_tokens),
+        )
+    except Exception as e:
+        return f"[ERROR] Embedded vLLM generation failed: {type(e).__name__}: {e}"
+
+
 def _call_teacher_openai_responses(prompt: str, cfg: TeacherConfig) -> str:
     try:
         from openai import OpenAI  # type: ignore
@@ -731,6 +801,8 @@ def _call_teacher_gemini(prompt: str, cfg: TeacherConfig) -> str:
 
 def _call_teacher(prompt: str, cfg: TeacherConfig) -> str:
     provider = cfg.provider.lower()
+    if provider == "vllm":
+        return _call_teacher_vllm(prompt, cfg)
     if provider == "openai_responses":
         return _call_teacher_openai_responses(prompt, cfg)
     if provider in {"openai", "openai_compatible"}:
@@ -738,6 +810,39 @@ def _call_teacher(prompt: str, cfg: TeacherConfig) -> str:
     if provider == "gemini":
         return _call_teacher_gemini(prompt, cfg)
     return f"[ERROR] Unsupported teacher provider: {cfg.provider}"
+
+
+def _teacher_vllm_prompt_token_count(prompt: str, cfg: TeacherConfig) -> Optional[int]:
+    if cfg.provider.lower() != "vllm" or not cfg.vllm_max_model_len:
+        return None
+    if cfg.vllm_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+        except Exception as e:
+            print(
+                f"[warn] could not import transformers for vLLM prompt-length precheck: {e}",
+                file=sys.stderr,
+            )
+            return None
+        model = str(cfg.vllm_model or cfg.model)
+        try:
+            cfg.vllm_tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
+        except Exception as e:
+            print(
+                f"[warn] could not load tokenizer for vLLM prompt-length precheck "
+                f"model={model}: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            return None
+    try:
+        encoded = cfg.vllm_tokenizer(prompt, add_special_tokens=False)
+        return int(len(encoded.get("input_ids") or []))
+    except Exception as e:
+        print(
+            f"[warn] vLLM prompt-length precheck failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _build_teacher_evidence_think(
@@ -752,6 +857,17 @@ def _build_teacher_evidence_think(
         adj=adj,
         variables=variables,
     )
+    prompt_tokens = _teacher_vllm_prompt_token_count(teacher_prompt, teacher_config)
+    if (
+        prompt_tokens is not None
+        and teacher_config.vllm_max_model_len is not None
+        and prompt_tokens > int(teacher_config.vllm_max_model_len)
+    ):
+        raise ValueError(
+            "teacher prompt too long for embedded vLLM "
+            f"({prompt_tokens} > {int(teacher_config.vllm_max_model_len)} tokens); "
+            "skipping teacher reasoning"
+        )
     current_prompt = teacher_prompt
     raw = ""
     think = ""
@@ -1586,7 +1702,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--teacher-provider",
-        choices=["openai", "openai_compatible", "openai_responses", "gemini"],
+        choices=["openai", "openai_compatible", "openai_responses", "gemini", "vllm"],
         default="openai_compatible",
         help="Teacher backend for --reasoning-target teacher_evidence.",
     )
@@ -1616,7 +1732,23 @@ def main() -> None:
     ap.add_argument("--teacher-vllm-cuda-visible-devices", default=None)
     ap.add_argument("--teacher-vllm-tensor-parallel-size", type=int, default=1)
     ap.add_argument("--teacher-vllm-dtype", default="auto")
+    ap.add_argument("--teacher-vllm-enforce-eager", action="store_true")
     ap.add_argument("--teacher-vllm-quantization", default="")
+    ap.add_argument(
+        "--teacher-vllm-yarn-factor",
+        type=float,
+        default=0.0,
+        help=(
+            "Set >0 to pass a YaRN RoPE scaling hf_overrides block to embedded "
+            "vLLM. Qwen2.5 long context commonly uses factor=4.0 from 32768 to 131072."
+        ),
+    )
+    ap.add_argument(
+        "--teacher-vllm-original-max-position-embeddings",
+        type=int,
+        default=32768,
+        help="Original context length used in the YaRN RoPE scaling override.",
+    )
     ap.add_argument("--teacher-vllm-gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--teacher-vllm-max-model-len", type=int, default=32768)
     ap.add_argument("--teacher-vllm-startup-timeout", type=float, default=600.0)
@@ -1771,11 +1903,14 @@ def main() -> None:
         os.environ.setdefault(str(args.teacher_api_key_env), "dummy")
     teacher_config: Optional[TeacherConfig] = None
     if "teacher_evidence" in reasoning_targets:
-        if not args.teacher_model:
-            sys.exit("ERROR: --reasoning-target teacher_evidence requires --teacher-model")
+        if not (args.teacher_model or args.teacher_vllm_model):
+            sys.exit(
+                "ERROR: --reasoning-target teacher_evidence requires "
+                "--teacher-model or --teacher-vllm-model"
+            )
         teacher_config = TeacherConfig(
             provider=str(args.teacher_provider),
-            model=str(args.teacher_model),
+            model=str(args.teacher_model or args.teacher_vllm_model),
             base_url=args.teacher_base_url,
             api_key_env=str(args.teacher_api_key_env),
             temperature=float(args.teacher_temperature),
@@ -1786,6 +1921,26 @@ def main() -> None:
             max_revisions=int(args.teacher_max_revisions),
             retry_until_valid=bool(args.teacher_retry_until_valid),
             retry_sleep_s=float(args.teacher_retry_sleep),
+            vllm_model=args.teacher_vllm_model,
+            vllm_tensor_parallel_size=int(args.teacher_vllm_tensor_parallel_size),
+            vllm_dtype=str(args.teacher_vllm_dtype),
+            vllm_max_model_len=(
+                int(args.teacher_vllm_max_model_len)
+                if int(args.teacher_vllm_max_model_len) > 0
+                else None
+            ),
+            vllm_gpu_memory_utilization=float(args.teacher_vllm_gpu_memory_utilization),
+            vllm_enforce_eager=bool(args.teacher_vllm_enforce_eager),
+            vllm_cuda_visible_devices=args.teacher_vllm_cuda_visible_devices,
+            vllm_quantization=(str(args.teacher_vllm_quantization).strip() or None),
+            vllm_yarn_factor=(
+                float(args.teacher_vllm_yarn_factor)
+                if float(args.teacher_vllm_yarn_factor) > 0
+                else None
+            ),
+            vllm_original_max_position_embeddings=int(
+                args.teacher_vllm_original_max_position_embeddings
+            ),
         )
     prompt_reasoning_guidance = (
         None

@@ -25,8 +25,8 @@ from experiments.evaluate import eval_pair
 
 OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
 SACHS_BIF = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"
-SACHS_SUMMARY_CSV = REPO_ROOT / "experiments" / "responses" / "sachs" / "sachs_summary.csv"
-DEFAULT_LLM_MODEL = "gpt-5-mini"
+SACHS_SUMMARY_CSV = REPO_ROOT / "scripts" / "responses" / "sachs" / "sachs_summary.csv"
+DEFAULT_LLM_MODEL = "gpt-5-pro"
 
 
 def _parse_matrix(raw: Any) -> np.ndarray | None:
