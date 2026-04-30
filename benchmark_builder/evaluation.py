@@ -13,13 +13,25 @@ PYTHON_EXE = sys.executable or "python3"
 
 _CONTRASTIVE_METRIC_COLS = (
     "avg_f1",
+    "avg_shd",
     "avg_skeleton_f1",
+    "avg_orientation_accuracy",
+    "avg_vstruct_f1",
     "avg_ancestor_f1",
     "acyclic_rate",
+    "brier",
+    "brier_skeleton",
     "consensus_f1",
+    "consensus_shd",
     "consensus_skeleton_f1",
+    "consensus_orient_acc",
+    "consensus_vstruct_f1",
     "consensus_ancestor_f1",
     "consensus_acyclic",
+    "nhd_mean",
+    "nhd_ratio_mean",
+    "nhd_consensus",
+    "nhd_ratio_consensus",
 )
 
 
