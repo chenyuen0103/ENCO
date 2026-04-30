@@ -38,9 +38,9 @@ from query_api import (
     count_openai_tokens,
 )
 try:
-    from query_vllm import build_vllm_engine, call_vllm_textgen_batch
+    from query_vllm import build_vllm_engine, build_yarn_hf_overrides, call_vllm_textgen_batch
 except ImportError:
-    from experiments.query_vllm import build_vllm_engine, call_vllm_textgen_batch
+    from experiments.query_vllm import build_vllm_engine, build_yarn_hf_overrides, call_vllm_textgen_batch
 
 FORMAT_RE = re.compile(r"(?s)^\s*(?:<think>)?.*?</think>\s*<answer>.*?</answer>\s*$")
 ANSWER_RE = re.compile(r"(?s)<answer>\s*(.*?)\s*</answer>")
@@ -1235,6 +1235,23 @@ def main() -> None:
         help="Pass enforce_eager=True to vLLM (useful for debugging).",
     )
     ap.add_argument(
+        "--vllm-enable-yarn",
+        action="store_true",
+        help="Enable YaRN RoPE scaling through vLLM hf_overrides for long-context Qwen models.",
+    )
+    ap.add_argument(
+        "--vllm-yarn-factor",
+        type=float,
+        default=4.0,
+        help="YaRN scaling factor for --vllm-enable-yarn. Qwen2.5 long-context docs use 4.0.",
+    )
+    ap.add_argument(
+        "--vllm-yarn-original-max-position-embeddings",
+        type=int,
+        default=32768,
+        help="Original context length for YaRN. Qwen2.5 long-context docs use 32768.",
+    )
+    ap.add_argument(
         "--vllm-max-new-tokens",
         type=int,
         default=0,
@@ -1481,7 +1498,7 @@ def main() -> None:
         ]
 
     hf_pipe_cache: dict[tuple[str, str | None, str, bool], Any] = {}
-    vllm_engine_cache: dict[tuple[str, int, str, int, float, bool], Any] = {}
+    vllm_engine_cache: dict[tuple[str, int, str, int, float, bool, str], Any] = {}
     vllm_log_tee: _FdTee | None = None
     using_explicit_config_file = args.config_file is not None
 
@@ -1711,6 +1728,18 @@ def main() -> None:
                                                 "Set --vllm-max-new-tokens or --hf-max-new-tokens."
                                             )
                                         vllm_max_model_len = max(0, int(args.vllm_max_model_len))
+                                        vllm_hf_overrides = build_yarn_hf_overrides(
+                                            enabled=bool(args.vllm_enable_yarn),
+                                            factor=float(args.vllm_yarn_factor),
+                                            original_max_position_embeddings=int(
+                                                args.vllm_yarn_original_max_position_embeddings
+                                            ),
+                                        )
+                                        vllm_hf_overrides_key = json.dumps(
+                                            vllm_hf_overrides or {},
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        )
                                         vllm_key = (
                                             model,
                                             int(args.vllm_tensor_parallel_size),
@@ -1718,6 +1747,7 @@ def main() -> None:
                                             vllm_max_model_len,
                                             float(args.vllm_gpu_mem_util),
                                             bool(args.vllm_enforce_eager),
+                                            vllm_hf_overrides_key,
                                         )
                                         vllm_engine = vllm_engine_cache.get(vllm_key)
                                         if vllm_engine is None:
@@ -1725,7 +1755,8 @@ def main() -> None:
                                                 "[vllm:init] loading vLLM engine once for "
                                                 f"model={model} tp={int(args.vllm_tensor_parallel_size)} "
                                                 f"dtype={args.vllm_dtype} max_model_len={vllm_max_model_len or 'auto'} "
-                                                f"gpu_mem_util={float(args.vllm_gpu_mem_util):.2f}",
+                                                f"gpu_mem_util={float(args.vllm_gpu_mem_util):.2f} "
+                                                f"yarn={bool(args.vllm_enable_yarn)}",
                                                 file=sys.stderr,
                                                 flush=True,
                                             )
@@ -1745,6 +1776,7 @@ def main() -> None:
                                                     max_model_len=(vllm_max_model_len if vllm_max_model_len > 0 else None),
                                                     gpu_memory_utilization=float(args.vllm_gpu_mem_util),
                                                     enforce_eager=bool(args.vllm_enforce_eager),
+                                                    hf_overrides=vllm_hf_overrides,
                                                 )
                                             except Exception:
                                                 _append_vllm_error_log(
@@ -1758,7 +1790,8 @@ def main() -> None:
                                                         f"dtype={args.vllm_dtype}, "
                                                         f"max_model_len={vllm_max_model_len or 'auto'}, "
                                                         f"gpu_mem_util={float(args.vllm_gpu_mem_util):.2f}, "
-                                                        f"enforce_eager={bool(args.vllm_enforce_eager)})"
+                                                        f"enforce_eager={bool(args.vllm_enforce_eager)}, "
+                                                        f"hf_overrides={vllm_hf_overrides_key})"
                                                     ),
                                                     detail=traceback.format_exc(),
                                                 )

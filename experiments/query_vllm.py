@@ -380,6 +380,30 @@ def _merge_lora_adapter_for_vllm(adapter_dir: Path) -> Path:
     return merged_dir
 
 
+def build_yarn_hf_overrides(
+    *,
+    enabled: bool,
+    factor: float = 4.0,
+    original_max_position_embeddings: int = 32768,
+) -> Optional[Dict[str, Any]]:
+    """Build vLLM hf_overrides for YaRN RoPE scaling."""
+    if not enabled:
+        return None
+    factor = float(factor)
+    original_max_position_embeddings = int(original_max_position_embeddings)
+    if factor <= 1.0:
+        raise ValueError("--vllm-yarn-factor must be greater than 1.0 when YaRN is enabled.")
+    if original_max_position_embeddings <= 0:
+        raise ValueError("--vllm-yarn-original-max-position-embeddings must be positive.")
+    return {
+        "rope_scaling": {
+            "factor": factor,
+            "original_max_position_embeddings": original_max_position_embeddings,
+            "type": "yarn",
+        }
+    }
+
+
 def build_vllm_engine(
     model_name: str,
     *,
@@ -657,6 +681,23 @@ def main():
         action="store_true",
         help="If set, pass enforce_eager=True to vLLM (debugging)."
     )
+    ap.add_argument(
+        "--vllm-enable-yarn",
+        action="store_true",
+        help="Enable YaRN RoPE scaling through vLLM hf_overrides for long-context Qwen models."
+    )
+    ap.add_argument(
+        "--vllm-yarn-factor",
+        type=float,
+        default=4.0,
+        help="YaRN scaling factor for --vllm-enable-yarn. Qwen2.5 long-context docs use 4.0."
+    )
+    ap.add_argument(
+        "--vllm-yarn-original-max-position-embeddings",
+        type=int,
+        default=32768,
+        help="Original context length for YaRN. Qwen2.5 long-context docs use 32768."
+    )
 
     ap.add_argument(
         "--prompt-col",
@@ -791,6 +832,11 @@ def main():
 
     if provider == "vllm" and not args.dry_run:
         try:
+            vllm_hf_overrides = build_yarn_hf_overrides(
+                enabled=bool(args.vllm_enable_yarn),
+                factor=float(args.vllm_yarn_factor),
+                original_max_position_embeddings=int(args.vllm_yarn_original_max_position_embeddings),
+            )
             vllm_engine = build_vllm_engine(
                 args.model,
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -799,6 +845,7 @@ def main():
                 gpu_memory_utilization=args.vllm_gpu_mem_util,
                 enforce_eager=bool(args.vllm_enforce_eager),
                 trust_remote_code=True,
+                hf_overrides=vllm_hf_overrides,
             )
             print("Parallel size:", vllm_engine.llm_engine.parallel_config)
         except Exception as e:
