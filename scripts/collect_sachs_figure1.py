@@ -78,12 +78,7 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "anonymized",
                 1000,
                 m,
-                _preferred_existing(
-                    [
-                        REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO_seed42.csv",
-                        REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
-                    ]
-                ),
+                REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
             )
         )
     for m in [0, 50, 100, 200]:
@@ -131,12 +126,7 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "anonymized",
                 1000,
                 0,
-                _preferred_existing(
-                    [
-                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC_seed42.csv",
-                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC.csv",
-                    ]
-                ),
+                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC.csv",
             ),
             (
                 "ges_anchor",
@@ -146,12 +136,7 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "anonymized",
                 1000,
                 0,
-                _preferred_existing(
-                    [
-                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES_seed42.csv",
-                        REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES.csv",
-                    ]
-                ),
+                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES.csv",
             ),
         ]
     )

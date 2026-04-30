@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from .baselines import build_baseline_adapters
-from .evaluation import EvalScriptEvaluator, contamination_audit, direct_csv_summary, write_csv
+from .evaluation import (
+    EvalScriptEvaluator,
+    attach_contrastive_metrics,
+    contamination_audit,
+    direct_csv_summary,
+    write_csv,
+)
 from .graph_io import file_sha256, materialize_graph_source
 from .interfaces import CommandPlan
 from .registry import BenchmarkRegistry
@@ -683,6 +689,7 @@ class BenchmarkRunner:
         eval_csv = self.run_root / "evaluation_summary.csv"
         cons_csv = self.run_root / "consensus_summary.csv"
         audit_csv = self.run_root / "contamination_audit.csv"
+        attach_contrastive_metrics(summary_rows)
         write_csv(eval_csv, summary_rows)
         write_csv(cons_csv, consensus_rows)
         write_csv(audit_csv, contamination_audit(summary_rows))

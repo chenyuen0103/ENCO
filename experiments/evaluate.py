@@ -77,6 +77,65 @@ def nhd_ratio(G_true: np.ndarray, G_pred: np.ndarray, use_m2: bool = True) -> fl
     base = nhd_baseline(G_true, k_pred, use_m2=use_m2)
     return nhd_val / base if base > 0 else np.nan
 
+
+def _safe_div(num: float, den: float) -> Optional[float]:
+    return (num / den) if den > 0 else None
+
+
+def _safe_f1(prec: Optional[float], rec: Optional[float]) -> Optional[float]:
+    if prec is None or rec is None or (prec + rec) <= 0:
+        return None
+    return 2 * prec * rec / (prec + rec)
+
+
+def _adjacency_to_digraph(A: np.ndarray) -> nx.DiGraph:
+    G = nx.DiGraph()
+    n = A.shape[0]
+    G.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(n):
+            if i != j and int(A[i, j]) == 1:
+                G.add_edge(i, j)
+    return G
+
+
+def _skeleton_upper(A: np.ndarray) -> np.ndarray:
+    return np.triu((A + A.T) > 0, k=1)
+
+
+def _vstructure_set(A: np.ndarray) -> set[tuple[int, int, int]]:
+    """
+    Return the set of unshielded collider triples (i, k, j) with i < j and
+    i -> k <- j and no edge between i and j in either direction.
+    """
+    n = A.shape[0]
+    out: set[tuple[int, int, int]] = set()
+    for k in range(n):
+        parents = [i for i in range(n) if i != k and int(A[i, k]) == 1]
+        for idx_i in range(len(parents)):
+            for idx_j in range(idx_i + 1, len(parents)):
+                i = parents[idx_i]
+                j = parents[idx_j]
+                if int(A[i, j]) == 0 and int(A[j, i]) == 0:
+                    a, b = sorted((i, j))
+                    out.add((a, k, b))
+    return out
+
+
+def _reachability_matrix(A: np.ndarray) -> np.ndarray:
+    """
+    Ordered-pair reachability, excluding self reachability.
+    Works for arbitrary directed graphs, not only DAGs.
+    """
+    G = _adjacency_to_digraph(A)
+    tc = nx.transitive_closure(G)
+    n = A.shape[0]
+    R = np.zeros((n, n), dtype=int)
+    for i, j in tc.edges():
+        if i != j:
+            R[i, j] = 1
+    return R
+
 def brier_edgewise(P: np.ndarray, Y: np.ndarray) -> float:
     """Directed-edge Brier over i!=j."""
     assert P.shape == Y.shape
@@ -723,19 +782,33 @@ def eval_pair(A_true: np.ndarray, A_pred: np.ndarray) -> Dict[str, Any]:
     fn = int(np.sum(t & (~p) & mask_offdiag))
 
     total = tp + tn + fp + fn
-    acc = (tp + tn) / total if total > 0 else None
-    prec = tp / (tp + fp) if (tp + fp) > 0 else None
-    rec  = tp / (tp + fn) if (tp + fn) > 0 else None
-    f1 = (2 * prec * rec / (prec + rec)) if (prec is not None and rec is not None and (prec + rec) > 0) else None
+    acc = _safe_div(tp + tn, total)
+    prec = _safe_div(tp, tp + fp)
+    rec = _safe_div(tp, tp + fn)
+    f1 = _safe_f1(prec, rec)
 
     shd = fp + fn
+
+    pred_graph = _adjacency_to_digraph(A_pred)
+    acyclic = int(nx.is_directed_acyclic_graph(pred_graph))
+
+    # skeleton recovery on unordered pairs i < j
+    skel_true = _skeleton_upper(A_true)
+    skel_pred = _skeleton_upper(A_pred)
+    skel_tp = int(np.sum(skel_true & skel_pred))
+    skel_tn = int(np.sum((~skel_true) & (~skel_pred) & np.triu(np.ones_like(skel_true, dtype=bool), k=1)))
+    skel_fp = int(np.sum((~skel_true) & skel_pred))
+    skel_fn = int(np.sum(skel_true & (~skel_pred)))
+    skel_total = skel_tp + skel_tn + skel_fp + skel_fn
+    skel_acc = _safe_div(skel_tp + skel_tn, skel_total)
+    skel_prec = _safe_div(skel_tp, skel_tp + skel_fp)
+    skel_rec = _safe_div(skel_tp, skel_tp + skel_fn)
+    skel_f1 = _safe_f1(skel_prec, skel_rec)
 
     # orientation on correctly predicted skeletons
     orient_eval = 0
     orient_tp = 0
     orient_fn = 0
-    skel_true = ((A_true + A_true.T) > 0)
-    skel_pred = ((A_pred + A_pred.T) > 0)
     for i in range(n):
         for j in range(i+1, n):
             if not (skel_true[i, j] and skel_pred[i, j]):
@@ -748,7 +821,30 @@ def eval_pair(A_true: np.ndarray, A_pred: np.ndarray) -> Dict[str, Any]:
                     orient_tp += 1
                 else:
                     orient_fn += 1
-    orient_acc = (orient_tp / orient_eval) if orient_eval > 0 else None
+    orient_acc = _safe_div(orient_tp, orient_eval)
+
+    # unshielded collider / v-structure recovery
+    v_true = _vstructure_set(A_true)
+    v_pred = _vstructure_set(A_pred)
+    v_tp = len(v_true & v_pred)
+    v_fp = len(v_pred - v_true)
+    v_fn = len(v_true - v_pred)
+    v_prec = _safe_div(v_tp, v_tp + v_fp)
+    v_rec = _safe_div(v_tp, v_tp + v_fn)
+    v_f1 = _safe_f1(v_prec, v_rec)
+
+    # transitive ancestor/descendant relation recovery on ordered pairs
+    anc_true = _reachability_matrix(A_true).astype(bool)
+    anc_pred = _reachability_matrix(A_pred).astype(bool)
+    anc_tp = int(np.sum(anc_true & anc_pred & mask_offdiag))
+    anc_tn = int(np.sum((~anc_true) & (~anc_pred) & mask_offdiag))
+    anc_fp = int(np.sum((~anc_true) & anc_pred & mask_offdiag))
+    anc_fn = int(np.sum(anc_true & (~anc_pred) & mask_offdiag))
+    anc_total = anc_tp + anc_tn + anc_fp + anc_fn
+    anc_acc = _safe_div(anc_tp + anc_tn, anc_total)
+    anc_prec = _safe_div(anc_tp, anc_tp + anc_fp)
+    anc_rec = _safe_div(anc_tp, anc_tp + anc_fn)
+    anc_f1 = _safe_f1(anc_prec, anc_rec)
 
     return {
         "n_vars": n,
@@ -761,10 +857,33 @@ def eval_pair(A_true: np.ndarray, A_pred: np.ndarray) -> Dict[str, Any]:
         "recall": rec,
         "f1": f1,
         "shd": shd,
+        "acyclic": acyclic,
+        "skeleton_tp": skel_tp,
+        "skeleton_tn": skel_tn,
+        "skeleton_fp": skel_fp,
+        "skeleton_fn": skel_fn,
+        "skeleton_accuracy": skel_acc,
+        "skeleton_precision": skel_prec,
+        "skeleton_recall": skel_rec,
+        "skeleton_f1": skel_f1,
         "orient_eval_pairs": orient_eval,
         "orient_tp": orient_tp,
         "orient_fn": orient_fn,
         "orient_acc": orient_acc,
+        "vstruct_tp": v_tp,
+        "vstruct_fp": v_fp,
+        "vstruct_fn": v_fn,
+        "vstruct_precision": v_prec,
+        "vstruct_recall": v_rec,
+        "vstruct_f1": v_f1,
+        "ancestor_tp": anc_tp,
+        "ancestor_tn": anc_tn,
+        "ancestor_fp": anc_fp,
+        "ancestor_fn": anc_fn,
+        "ancestor_accuracy": anc_acc,
+        "ancestor_precision": anc_prec,
+        "ancestor_recall": anc_rec,
+        "ancestor_f1": anc_f1,
     }
 
 
@@ -962,11 +1081,26 @@ def evaluate_response_csv(
     prec_list: List[Optional[float]] = []
     rec_list: List[Optional[float]] = []
     f1_list: List[Optional[float]] = []
+    acyclic_list: List[int] = []
+
+    skel_acc_list: List[Optional[float]] = []
+    skel_prec_list: List[Optional[float]] = []
+    skel_rec_list: List[Optional[float]] = []
+    skel_f1_list: List[Optional[float]] = []
 
     orient_eval_list: List[int] = []
     orient_tp_list: List[int] = []
     orient_fn_list: List[int] = []
     orient_acc_list: List[Optional[float]] = []
+
+    vstruct_prec_list: List[Optional[float]] = []
+    vstruct_rec_list: List[Optional[float]] = []
+    vstruct_f1_list: List[Optional[float]] = []
+
+    ancestor_acc_list: List[Optional[float]] = []
+    ancestor_prec_list: List[Optional[float]] = []
+    ancestor_rec_list: List[Optional[float]] = []
+    ancestor_f1_list: List[Optional[float]] = []
 
     valid_rows = 0
     shape_mismatch_rows = 0
@@ -1008,7 +1142,13 @@ def evaluate_response_csv(
         if A_true is None or A_pred is None:
             met = {k: None for k in [
                 "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall",
-                "f1", "shd", "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+                "f1", "shd", "acyclic",
+                "skeleton_tp", "skeleton_tn", "skeleton_fp", "skeleton_fn",
+                "skeleton_accuracy", "skeleton_precision", "skeleton_recall", "skeleton_f1",
+                "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+                "vstruct_tp", "vstruct_fp", "vstruct_fn", "vstruct_precision", "vstruct_recall", "vstruct_f1",
+                "ancestor_tp", "ancestor_tn", "ancestor_fp", "ancestor_fn",
+                "ancestor_accuracy", "ancestor_precision", "ancestor_recall", "ancestor_f1",
             ]}
         else:
             met = eval_pair(A_true, A_pred)
@@ -1038,11 +1178,26 @@ def evaluate_response_csv(
             prec_list.append(met["precision"])
             rec_list.append(met["recall"])
             f1_list.append(met["f1"])
+            acyclic_list.append(met["acyclic"])
+
+            skel_acc_list.append(met["skeleton_accuracy"])
+            skel_prec_list.append(met["skeleton_precision"])
+            skel_rec_list.append(met["skeleton_recall"])
+            skel_f1_list.append(met["skeleton_f1"])
 
             orient_eval_list.append(met["orient_eval_pairs"])
             orient_tp_list.append(met["orient_tp"])
             orient_fn_list.append(met["orient_fn"])
             orient_acc_list.append(met["orient_acc"])
+
+            vstruct_prec_list.append(met["vstruct_precision"])
+            vstruct_rec_list.append(met["vstruct_recall"])
+            vstruct_f1_list.append(met["vstruct_f1"])
+
+            ancestor_acc_list.append(met["ancestor_accuracy"])
+            ancestor_prec_list.append(met["ancestor_precision"])
+            ancestor_rec_list.append(met["ancestor_recall"])
+            ancestor_f1_list.append(met["ancestor_f1"])
 
             n = A_pred.shape[0]
             mask_offdiag = ~np.eye(n, dtype=bool)
@@ -1085,17 +1240,36 @@ def evaluate_response_csv(
         avg_precision = _mean_or_none(prec_list)
         avg_recall = _mean_or_none(rec_list)
         avg_f1 = _mean_or_none(f1_list)
+        avg_acyclic = float(sum(acyclic_list) / valid_rows)
+
+        avg_skeleton_accuracy = _mean_or_none(skel_acc_list)
+        avg_skeleton_precision = _mean_or_none(skel_prec_list)
+        avg_skeleton_recall = _mean_or_none(skel_rec_list)
+        avg_skeleton_f1 = _mean_or_none(skel_f1_list)
 
         avg_orient_eval = float(sum(orient_eval_list) / valid_rows)
         avg_orient_TP = float(sum(orient_tp_list) / valid_rows)
         avg_orient_FN = float(sum(orient_fn_list) / valid_rows)
         avg_orient_acc = _mean_or_none(orient_acc_list)
+
+        avg_vstruct_precision = _mean_or_none(vstruct_prec_list)
+        avg_vstruct_recall = _mean_or_none(vstruct_rec_list)
+        avg_vstruct_f1 = _mean_or_none(vstruct_f1_list)
+
+        avg_ancestor_accuracy = _mean_or_none(ancestor_acc_list)
+        avg_ancestor_precision = _mean_or_none(ancestor_prec_list)
+        avg_ancestor_recall = _mean_or_none(ancestor_rec_list)
+        avg_ancestor_f1 = _mean_or_none(ancestor_f1_list)
         avg_pred_edges = float(sum(pred_edges_list) / valid_rows)
     else:
         avg_TP = avg_TN = avg_FP = avg_FN = avg_SHD = None
         avg_accuracy = avg_precision = avg_recall = avg_f1 = None
+        avg_acyclic = None
+        avg_skeleton_accuracy = avg_skeleton_precision = avg_skeleton_recall = avg_skeleton_f1 = None
         avg_orient_eval = avg_orient_TP = avg_orient_FN = None
         avg_orient_acc = None
+        avg_vstruct_precision = avg_vstruct_recall = avg_vstruct_f1 = None
+        avg_ancestor_accuracy = avg_ancestor_precision = avg_ancestor_recall = avg_ancestor_f1 = None
         avg_pred_edges = None
 
     has_given_edges, given_edge_count = scan_given_edges_df(df)
@@ -1202,10 +1376,22 @@ def evaluate_response_csv(
         "avg_recall": avg_recall,
         "avg_f1": avg_f1,
         "avg_shd": avg_SHD,
+        "acyclic_rate": avg_acyclic,
+        "avg_skeleton_accuracy": avg_skeleton_accuracy,
+        "avg_skeleton_precision": avg_skeleton_precision,
+        "avg_skeleton_recall": avg_skeleton_recall,
+        "avg_skeleton_f1": avg_skeleton_f1,
         "avg_orientation_eval_pairs": avg_orient_eval,
         "avg_orientation_TP": avg_orient_TP,
         "avg_orientation_FN": avg_orient_FN,
         "avg_orientation_accuracy": avg_orient_acc,
+        "avg_vstruct_precision": avg_vstruct_precision,
+        "avg_vstruct_recall": avg_vstruct_recall,
+        "avg_vstruct_f1": avg_vstruct_f1,
+        "avg_ancestor_accuracy": avg_ancestor_accuracy,
+        "avg_ancestor_precision": avg_ancestor_precision,
+        "avg_ancestor_recall": avg_ancestor_recall,
+        "avg_ancestor_f1": avg_ancestor_f1,
         "num_pred_edges": avg_pred_edges,
         "true_num_edges": int(true_num_edges) if true_num_edges is not None else None,
         "given_edges": int(has_given_edges),
@@ -1280,7 +1466,11 @@ def evaluate_response_csv(
                 "consensus_recall": consensus_metrics["recall"],
                 "consensus_f1": consensus_metrics["f1"],
                 "consensus_shd": consensus_metrics["shd"],
+                "consensus_acyclic": consensus_metrics["acyclic"],
+                "consensus_skeleton_f1": consensus_metrics["skeleton_f1"],
                 "consensus_orient_acc": consensus_metrics["orient_acc"],
+                "consensus_vstruct_f1": consensus_metrics["vstruct_f1"],
+                "consensus_ancestor_f1": consensus_metrics["ancestor_f1"],
             })
 
     _log("=== Global metrics (averages per row) + consensus ===")
@@ -1389,7 +1579,13 @@ def main():
     metric_keys = [
         "format_ok",
         "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1",
-        "shd", "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+        "shd", "acyclic",
+        "skeleton_tp", "skeleton_tn", "skeleton_fp", "skeleton_fn",
+        "skeleton_accuracy", "skeleton_precision", "skeleton_recall", "skeleton_f1",
+        "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+        "vstruct_tp", "vstruct_fp", "vstruct_fn", "vstruct_precision", "vstruct_recall", "vstruct_f1",
+        "ancestor_tp", "ancestor_tn", "ancestor_fp", "ancestor_fn",
+        "ancestor_accuracy", "ancestor_precision", "ancestor_recall", "ancestor_f1",
         "nhd", "nhd_ratio",
     ]
 

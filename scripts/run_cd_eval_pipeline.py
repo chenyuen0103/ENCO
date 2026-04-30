@@ -12,6 +12,14 @@ from typing import Any, Optional
 
 import pandas as pd
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENTS_DIR = REPO_ROOT / "experiments"
+for _path in (REPO_ROOT, EXPERIMENTS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from benchmark_builder.evaluation import attach_contrastive_metrics
+
 
 _DEFAULT_CONTEXT_WINDOWS: dict[str, int] = {
     # Keep a small mapping; adjust/extend as needed.
@@ -70,9 +78,7 @@ class ResponseMeta:
 
 
 def _repo_paths() -> tuple[Path, Path]:
-    repo_root = Path(__file__).resolve().parents[1]
-    experiments_dir = repo_root / "experiments"
-    return repo_root, experiments_dir
+    return REPO_ROOT, EXPERIMENTS_DIR
 
 
 def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
@@ -861,6 +867,8 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         raise SystemExit(
             "No response CSV summaries could be computed. Check the response CSV files."
         )
+
+    attach_contrastive_metrics(summary_rows)
 
     summary_csv = summary_dir / f"{args.dataset}_summary.csv"
     if not dry_run:
