@@ -382,7 +382,7 @@ A conversation between User and Assistant. The user asks a question, and the Ass
 user
 ROLE: You are an expert in causal discovery from observational and interventional data.
 TASK: Infer the directed causal graph over the variables.
-The following are empirical distributions computed from data sampled from an anonymized Bayesian network.
+The following are empirical distributions computed from data sampled from an unknown Bayesian network.
 ASSUMPTIONS:
 - The true graph is a DAG (no directed cycles).
 - Causal sufficiency holds (no unobserved confounders among these variables).

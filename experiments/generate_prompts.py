@@ -432,6 +432,7 @@ def iter_prompts_in_memory(
                         variables_out, rows_text_source, dataset_name,
                         causal_rules, give_steps, include_def_int=include_def_int,
                         reasoning_guidance=resolved_reasoning_guidance,
+                        anonymize=anonymize,
                         require_think_answer_blocks=require_think_answer_blocks,
                         output_edge_list=use_edge_list_output,
                     )
@@ -951,7 +952,7 @@ def format_prompt_cb_matrix(
     lines.append("TASK: Infer the directed causal graph over the variables.")
 
     if anonymize:
-        lines.append("The following are empirical distributions computed from data sampled from an anonymized Bayesian network.")
+        lines.append("The following are empirical distributions computed from data sampled from an unknown Bayesian network.")
     else:
         lines.append(f"The following are empirical distributions computed from data sampled from a Bayesian network named {dataset_name}.")
 
@@ -1140,7 +1141,7 @@ def format_prompt_descendants_summary(
         f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
     )
     if anonymize:
-        lines.append("The following are empirical summaries from an anonymized Bayesian network.")
+        lines.append("The following are empirical summaries from an unknown Bayesian network.")
     else:
         lines.append(f"The following are empirical summaries from a Bayesian network named {dataset_name}.")
 
@@ -1274,7 +1275,7 @@ def format_prompt_descendants_matrix(
         f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
     )
     if anonymize:
-        lines.append("The following are empirical data from an anonymized Bayesian network.")
+        lines.append("The following are empirical data from an unknown Bayesian network.")
     else:
         lines.append(f"The following are empirical data from a Bayesian network named {dataset_name}.")
 
@@ -1353,7 +1354,7 @@ def format_prompt_descendants_no_data(
         f"TASK: For the intervention do({intervention_target} = {intervention_value}), identify which variables are descendants of {intervention_target}."
     )
     if anonymize:
-        lines.append("We are studying an anonymized Bayesian network.")
+        lines.append("We are studying an unknown Bayesian network.")
     else:
         lines.append(f"We are studying a Bayesian network named {dataset_name}.")
     lines.append("No observational or interventional data are provided for this case.")
@@ -1639,7 +1640,7 @@ def format_prompt_summary_full_joint(
     lines.append("ROLE: You are an expert in causal discovery from observational and interventional data.")
     lines.append("TASK: Infer the directed causal graph over the variables.")
     if anonymize:
-        lines.append("The following are empirical distributions computed from data sampled from an anonymized Bayesian network.")
+        lines.append("The following are empirical distributions computed from data sampled from an unknown Bayesian network.")
     else:
         lines.append(f"The following are empirical distributions computed from data sampled from a Bayesian network named {dataset_name}.")
     lines.append("ASSUMPTIONS:")
