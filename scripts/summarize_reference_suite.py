@@ -29,14 +29,6 @@ except Exception:
     tiktoken = None
 
 
-limit = sys.maxsize
-while True:
-    try:
-        csv.field_size_limit(limit)
-        break
-    except OverflowError:
-        limit //= 10
-
 
 DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/reference_suite")
 DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data/small_graphs")
