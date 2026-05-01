@@ -23,6 +23,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+try:
+    import tiktoken  # type: ignore
+except Exception:
+    tiktoken = None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL_SCRIPT = REPO_ROOT / "scripts" / "eval_cd_configs.py"
@@ -51,6 +56,20 @@ ALLOWED_COL_ORDERS = {"original", "reverse", "random", "topo", "reverse_topo"}
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _count_reference_tokens(text: str) -> int:
+    """
+    Stable benchmark token count for prompt_text.
+
+    This intentionally uses a fixed tokenizer (`cl100k_base`) rather than a
+    model-specific tokenizer so benchmark metadata stays comparable across
+    downstream model runs.
+    """
+    if tiktoken is None:
+        return -1
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
 
 
 def _sha256_file(path: Path) -> str:
@@ -170,6 +189,7 @@ def main() -> int:
         "shuffle_idx",
         "given_edges",
         "prompt_text",
+        "prompt_tokens_ref",
         "prompt_sha256",
         "answer",
         "answer_sha256",
@@ -177,6 +197,7 @@ def main() -> int:
 
     config_summaries: list[dict[str, Any]] = []
     total_rows = 0
+    prompt_tokens_ref_values: list[int] = []
 
     with output_csv.open("w", encoding="utf-8", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=fieldnames)
@@ -241,6 +262,9 @@ def main() -> int:
 
             for row in prompt_iter:
                 prompt_text = str(row["prompt_text"])
+                prompt_tokens_ref = _count_reference_tokens(prompt_text)
+                if prompt_tokens_ref >= 0:
+                    prompt_tokens_ref_values.append(prompt_tokens_ref)
                 writer.writerow(
                     {
                         "dataset": dataset,
@@ -264,6 +288,7 @@ def main() -> int:
                         "shuffle_idx": int(row["shuffle_idx"]),
                         "given_edges": row.get("given_edges", ""),
                         "prompt_text": prompt_text,
+                        "prompt_tokens_ref": prompt_tokens_ref,
                         "prompt_sha256": _sha256_text(prompt_text),
                         "answer": answer_json,
                         "answer_sha256": answer_sha256,
@@ -307,6 +332,16 @@ def main() -> int:
         "output_csv": str(output_csv),
         "output_csv_sha256": _sha256_file(output_csv),
         "total_rows": total_rows,
+        "prompt_token_reference": {
+            "tokenizer": "cl100k_base",
+            "available": tiktoken is not None,
+            "prompt_tokens_ref_max": max(prompt_tokens_ref_values) if prompt_tokens_ref_values else None,
+            "prompt_tokens_ref_mean": (
+                sum(prompt_tokens_ref_values) / float(len(prompt_tokens_ref_values))
+                if prompt_tokens_ref_values
+                else None
+            ),
+        },
         "configs": config_summaries,
         "guarantee": (
             "For overlapping configs, rows in this CSV are generated via the same "
