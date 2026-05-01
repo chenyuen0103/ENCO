@@ -28,8 +28,8 @@ except Exception:
     tiktoken = None
 
 
-DEFAULT_BENCHMARK_ROOT = Path("/Users/yuenc2/Desktop/ENCO/benchmark_data/reference_suite")
-DEFAULT_BIF_ROOT = Path("/Users/yuenc2/Desktop/ENCO/causal_graphs/real_data/small_graphs")
+DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/reference_suite")
+DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data/small_graphs")
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,17 +48,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-csv",
-        default=None,
+        default="data_summary.csv",
         help="Optional path for per-dataset summary CSV.",
     )
     parser.add_argument(
         "--output-tex",
-        default=None,
+        default="data_summary_table.tex",
         help="Optional path for LaTeX table summarizing per-dataset statistics.",
     )
     parser.add_argument(
         "--output-json",
-        default=None,
+        default="data_summary.json",
         help="Optional path for full suite summary JSON.",
     )
     return parser.parse_args()
