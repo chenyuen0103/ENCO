@@ -517,6 +517,7 @@ representative controlled synthetic challenge family:
 ```bash
 python scripts/build_benchmark_data_suite.py
 python scripts/summarize_reference_suite.py
+python scripts/plot_dataset_composition.py
 ```
 
 See also `docs/tutorials/benchmark_authoring.md`.
