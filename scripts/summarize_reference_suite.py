@@ -30,8 +30,8 @@ except Exception:
 
 
 
-DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/reference_suite")
-DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data/small_graphs")
+DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/graphs")
+DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data")
 
 
 def parse_args() -> argparse.Namespace:
