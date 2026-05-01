@@ -30,9 +30,17 @@ def load_causal_graph(path: str | Path):
 
         return CausalDAG.load_from_file(str(graph_path))
     if suffix == ".npz":
-        from causal_graphs.graph_export import load_graph as load_dataset_graph
+        import numpy as np
+        from causal_graphs.graph_definition import CausalDAGDataset
 
-        return load_dataset_graph(str(graph_path))
+        arr = np.load(str(graph_path))
+        return CausalDAGDataset(
+            adj_matrix=arr["adj_matrix"],
+            data_obs=arr["data_obs"],
+            data_int=arr["data_int"],
+            latents=arr["latents"] if "latents" in arr else None,
+            exclude_inters=arr["exclude_inters"] if "exclude_inters" in arr else None,
+        )
     raise ValueError(f"Unsupported graph file type: {graph_path}")
 
 

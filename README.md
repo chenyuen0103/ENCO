@@ -511,6 +511,14 @@ Useful configs:
 - `benchmark_specs/synthetic_ladder.json`
 - `benchmark_specs/authoring_demo.json`
 
+To regenerate the benchmark-data CSV assets for the real graphs plus the
+representative controlled synthetic challenge family:
+
+```bash
+python scripts/build_benchmark_data_suite.py
+python scripts/summarize_reference_suite.py
+```
+
 See also `docs/tutorials/benchmark_authoring.md`.
 
 Compatibility shims remain at several older `experiments/run_*` paths, but new

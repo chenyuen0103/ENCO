@@ -135,7 +135,11 @@ def _config_name(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build data-only benchmark CSVs from eval-compatible prompt configs.")
-    parser.add_argument("--bif-file", required=True, help="Path to the source BIF/PT/NPZ graph file.")
+    parser.add_argument(
+        "--bif-file",
+        required=True,
+        help="Path to the source graph file. Supports BIF/PT/NPZ; kept as --bif-file for compatibility.",
+    )
     parser.add_argument("--config-file", required=True, help="JSON config file in eval_cd_configs-compatible format.")
     parser.add_argument("--output-csv", required=True, help="Merged output CSV path.")
     parser.add_argument("--manifest-json", default=None, help="Optional manifest JSON path. Defaults to <output-csv>.manifest.json.")

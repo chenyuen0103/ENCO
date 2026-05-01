@@ -167,6 +167,44 @@ def sample_interventional_values_vec(
         raise RuntimeError("sample_interventional_values_vec: no samples generated.")
     return arr_all
 
+
+def _has_presampled_data(graph: Any) -> bool:
+    return hasattr(graph, "data_obs") and hasattr(graph, "data_int")
+
+
+def _sample_observational_array(graph: Any, batch_size: int, rng: np.random.Generator) -> np.ndarray:
+    if _has_presampled_data(graph):
+        data_obs = np.asarray(graph.data_obs)
+        if batch_size <= 0:
+            return data_obs[:0].copy()
+        idxs = rng.integers(low=0, high=data_obs.shape[0], size=batch_size)
+        return data_obs[idxs]
+    return graph.sample(batch_size=batch_size, as_array=True)
+
+
+def _sample_interventional_array(
+    graph: Any,
+    *,
+    var_idx: int,
+    var_name: str,
+    dataset_size: int,
+    num_categs: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    if _has_presampled_data(graph):
+        data_int = np.asarray(graph.data_int)
+        if dataset_size <= 0:
+            empty = data_int[var_idx, :0].copy()
+            return empty, np.zeros((0,), dtype=np.int32)
+        idxs = rng.integers(low=0, high=data_int.shape[1], size=dataset_size)
+        arr_int = data_int[var_idx, idxs]
+        values_vec = np.asarray(arr_int[:, var_idx], dtype=np.int32)
+        return arr_int, values_vec
+
+    values_vec = rng.integers(low=0, high=num_categs, size=dataset_size, dtype=np.int32)
+    arr_int = sample_interventional_values_vec(graph, var_idx, var_name, values_vec)
+    return arr_int, values_vec
+
 def iter_prompts_in_memory(
     *,
     bif_file: str,
@@ -307,8 +345,9 @@ def iter_prompts_in_memory(
         for i in range(num_prompts):
             seed_data = seed + i * 1000
             np.random.seed(seed_data)
+            rng_data = np.random.default_rng(seed_data)
 
-            arr_obs = graph.sample(batch_size=obs_per_prompt, as_array=True)
+            arr_obs = _sample_observational_array(graph, obs_per_prompt, rng_data)
             obs_rows_base = []
             obs_rows_num: List[List[float]] = []
             for r in arr_obs:
@@ -334,8 +373,14 @@ def iter_prompts_in_memory(
                         num_categs = len(codebook.get(var_name, [])) or 2
 
                     dataset_size = int_per_combo
-                    values_vec = rng_int.integers(low=0, high=num_categs, size=dataset_size, dtype=np.int32)
-                    arr_int = sample_interventional_values_vec(graph, var_idx, var_name, values_vec)
+                    arr_int, values_vec = _sample_interventional_array(
+                        graph,
+                        var_idx=var_idx,
+                        var_name=var_name,
+                        dataset_size=dataset_size,
+                        num_categs=num_categs,
+                        rng=rng_int,
+                    )
 
                     for sample_idx, r in enumerate(arr_int):
                         s_idx = int(values_vec[sample_idx])
