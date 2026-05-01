@@ -19,7 +19,6 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_INPUT = REPO_ROOT / "benchmark_runs" / "sachs_figure1" / "figure1_summary.csv"
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
-SACHS_BIF = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"
 MAX_PLOTTED_INTERVENTIONS = 200
 
 
@@ -105,11 +104,11 @@ def _metric_config(metric: str, floor: SummaryRow, rows: list[SummaryRow]) -> di
             "ylim": (-0.035, 1.05),
             "yticks": [0.0, 0.25, 0.50, 0.75, 1.0],
             "yticklabels": ["0.00", "0.25", "0.50", "0.75", "1.00"],
-            "semantic_label": "Semantic-only floor",
-            "legend_semantic": f"Floor ({floor.f1_mean:.2f})",
+            "semantic_label": "",
+            "legend_semantic": f"Semantic-Only ({floor.f1_mean:.2f})",
             "lower_region": (0.0, floor.f1_mean),
             "upper_region": (floor.f1_mean, 1.0),
-            "bad_region_label": "Below floor:\nno usable mixed-information gain",
+            "bad_region_label": "Below Semantic-Only:\nNo mixed-information gain",
             "bad_region_xy": (145, floor.f1_mean * 0.44),
             "gap_label": "Headroom:\nENCO - LLM",
             "better": "higher",
@@ -149,24 +148,10 @@ def _write_formats(fig, out_dir: Path, basename: str, formats: list[str]) -> lis
     return written
 
 
-def _zero_matrix_baseline() -> dict[str, float]:
-    import numpy as np
-
-    from benchmark_builder.graph_io import load_causal_graph
-    from experiments.evaluate import eval_pair
-
-    graph = load_causal_graph(SACHS_BIF)
-    true_adj = (np.asarray(graph.adj_matrix) > 0).astype(int)
-    zero_adj = np.zeros_like(true_adj)
-    metrics = eval_pair(true_adj, zero_adj)
-    f1 = metrics.get("f1")
-    return {"f1": 0.0 if f1 is None else float(f1), "shd": float(metrics["shd"])}
-
-
 def _display_model_name(model: str) -> str:
     if model == "gpt-5-mini":
         return "GPT-5 mini"
-    if model == "gpt-5.2-Pro":
+    if model.lower() == "gpt-5.2-pro":
         return "GPT-5.2-Pro"
     return model
 
@@ -197,7 +182,6 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     llm_label = _display_model_name(real[0].system)
     cfg = _metric_config(metric, floor, rows)
     floor_y = _value(floor, metric)
-    zero_baseline_y = _zero_matrix_baseline()[metric]
     pc_y = _value(pc, metric)
     ges_y = _value(ges, metric)
 
@@ -205,7 +189,6 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     mixed_color = "#0072B2"
     data_color = "#111111"
     anchor_color = "#6F6F6F"
-    zero_color = "#8A8A8A"
     below_floor_fill = "#F3C78A"
     target_fill = "#B9D9EC"
 
@@ -233,17 +216,10 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
         linewidth=1.8,
         zorder=2,
     )
-    ax.axhline(
-        zero_baseline_y,
-        color=zero_color,
-        linestyle=(0, (1.2, 2.2)),
-        linewidth=1.5,
-        zorder=3,
-    )
 
     enco_x, enco_y, _ = _values(enco, metric)
-    real_x, real_y, real_err = _values(real, metric)
-    anon_x, anon_y, anon_err = _values(anon, metric)
+    real_x, real_y, _ = _values(real, metric)
+    anon_x, anon_y, _ = _values(anon, metric)
 
     ax.plot(
         enco_x,
@@ -254,44 +230,32 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
         linewidth=2.4,
         zorder=4,
     )
-    ax.errorbar(
+    ax.plot(
         real_x,
         real_y,
-        yerr=real_err,
         color=mixed_color,
         marker="o",
         markersize=5,
         linewidth=2.0,
-        elinewidth=1.0,
-        capsize=2.5,
         zorder=5,
     )
-    ax.errorbar(
+    ax.plot(
         anon_x,
         anon_y,
-        yerr=anon_err,
         color=mixed_color,
         marker="s",
         markersize=5,
         linewidth=2.0,
         linestyle=(0, (4, 2)),
-        elinewidth=1.0,
-        capsize=2.5,
         zorder=5,
     )
 
-    ax.scatter(
-        [0, 0],
-        [pc_y, ges_y],
-        marker="D",
-        s=34,
-        color=anchor_color,
-        zorder=6,
-    )
+    ax.scatter([0], [pc_y], marker="D", s=34, color=anchor_color, zorder=6)
+    ax.scatter([0], [ges_y], marker="X", s=42, color=anchor_color, zorder=6)
     ax.annotate(
         "PC",
         xy=(0, pc_y),
-        xytext=(-16, -18),
+        xytext=(-9, 0),
         textcoords="offset points",
         ha="right",
         va="center",
@@ -301,7 +265,7 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     ax.annotate(
         "GES",
         xy=(0, ges_y),
-        xytext=(-16, 12),
+        xytext=(-9, 0),
         textcoords="offset points",
         ha="right",
         va="center",
@@ -382,21 +346,7 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
             alpha=0.0,
         )
 
-    _endpoint_label(enco_x, enco_y, text="ENCO ceiling", color=data_color, dx=8, dy=0)
-
-    zero_label_x = 132 if metric == "f1" else 198
-    zero_label_y_offset = 11 if metric == "f1" else -11
-    ax.annotate(
-        "Zero-matrix baseline",
-        xy=(zero_label_x, zero_baseline_y),
-        xytext=(0, zero_label_y_offset),
-        textcoords="offset points",
-        ha="left" if metric == "f1" else "right",
-        va="center",
-        fontsize=8.5,
-        color=zero_color,
-        bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.9),
-    )
+    _endpoint_label(enco_x, enco_y, text="ENCO", color=data_color, dx=8, dy=0)
 
     ax.set_xlabel("Intervention budget $M$ (LLM curves at fixed $N=1000$)", fontsize=10.5)
     ax.set_ylabel(cfg["ylabel"], fontsize=10.5)
@@ -415,12 +365,12 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     ax.tick_params(axis="both", labelsize=9)
 
     legend_handles = [
-        Line2D([0], [0], color=data_color, marker="o", markersize=5.5, linewidth=2.4, label="ENCO ceiling"),
-        Line2D([0], [0], color=mixed_color, marker="o", markersize=5, linewidth=2.0, label=f"{llm_label}: real names"),
-        Line2D([0], [0], color=mixed_color, marker="s", markersize=5, linewidth=2.0, linestyle=(0, (4, 2)), label=f"{llm_label}: anonymized"),
+        Line2D([0], [0], color=data_color, marker="o", markersize=5.5, linewidth=2.4, label="ENCO"),
+        Line2D([0], [0], color=mixed_color, marker="o", markersize=5, linewidth=2.0, label=f"{llm_label}: Real Names"),
+        Line2D([0], [0], color=mixed_color, marker="s", markersize=5, linewidth=2.0, linestyle=(0, (4, 2)), label=f"{llm_label}: Anonymized"),
         Line2D([0], [0], color=semantic_color, linestyle=(0, (5, 3)), linewidth=1.8, label=cfg["legend_semantic"]),
-        Line2D([0], [0], color=zero_color, linestyle=(0, (1.2, 2.2)), linewidth=1.5, label=f"Zero matrix ({zero_baseline_y:.1f})"),
-        Line2D([0], [0], marker="D", markersize=6.5, color=anchor_color, linewidth=0, label="PC / GES"),
+        Line2D([0], [0], marker="D", markersize=6.5, color=anchor_color, linewidth=0, label="PC"),
+        Line2D([0], [0], marker="X", markersize=7, color=anchor_color, linewidth=0, label="GES"),
     ]
     legend = ax.legend(
         handles=legend_handles,
@@ -437,15 +387,15 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     )
     legend.get_frame().set_linewidth(0.8)
 
-    fig.text(
-        0.5,
-        0.02,
-        "Caption note: at M=0, ENCO collapses to the observational-only setting; this point is omitted from the plotted ENCO curve.",
-        ha="center",
-        va="bottom",
-        fontsize=8.0,
-        color="#333333",
-    )
+    # fig.text(
+    #     0.5,
+    #     0.02,
+    #     # "Caption note: at M=0, ENCO collapses to the observational-only setting; this point is omitted from the plotted ENCO curve.",
+    #     ha="center",
+    #     va="bottom",
+    #     fontsize=8.0,
+    #     color="#333333",
+    # )
     fig.tight_layout(rect=(0, 0.055, 1, 1))
     written = _write_formats(fig, out_dir, basename, formats)
     plt.close(fig)

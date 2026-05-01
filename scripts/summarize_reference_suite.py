@@ -2,13 +2,25 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import re
 from collections import Counter
 from pathlib import Path
 from statistics import median
 from typing import Any
+import csv
+import sys
+
+csv.field_size_limit(sys.maxsize)
+
+
+limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(limit)
+        break
+    except OverflowError:
+        limit //= 10
 
 try:
     import tiktoken  # type: ignore
