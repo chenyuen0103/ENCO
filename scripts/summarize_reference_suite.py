@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -9,8 +10,6 @@ from collections import Counter
 from pathlib import Path
 from statistics import mean, median
 from typing import Any
-import csv
-import sys
 
 csv.field_size_limit(sys.maxsize)
 
@@ -32,6 +31,7 @@ except Exception:
 
 DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/graphs")
 DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data")
+DEFAULT_OUTPUT_ROOT = Path("./benchmark_data/summaries")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,26 +41,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--benchmark-root",
         default=str(DEFAULT_BENCHMARK_ROOT),
-        help="Directory containing one CSV per dataset built by scripts/build_benchmark_data.py.",
+        help=(
+            "Directory containing benchmark CSVs. The directory is searched recursively, "
+            "so benchmark_data/graphs/{small,large} works without temporary symlinks."
+        ),
     )
     parser.add_argument(
         "--bif-root",
         default=str(DEFAULT_BIF_ROOT),
-        help="Directory containing <dataset>.bif files used to recover graph sizes.",
+        help=(
+            "Directory containing <dataset>.bif files used to recover graph sizes. "
+            "The directory is searched recursively."
+        ),
     )
     parser.add_argument(
         "--output-csv",
-        default="data_summary.csv",
+        default=str(DEFAULT_OUTPUT_ROOT / "data_summary.csv"),
         help="Optional path for per-dataset summary CSV.",
     )
     parser.add_argument(
         "--output-tex",
-        default="data_summary_table.tex",
+        default=str(DEFAULT_OUTPUT_ROOT / "data_summary_table.tex"),
         help="Optional path for LaTeX table summarizing per-dataset statistics.",
     )
     parser.add_argument(
         "--output-json",
-        default="data_summary.json",
+        default=str(DEFAULT_OUTPUT_ROOT / "data_summary.json"),
         help="Optional path for full suite summary JSON.",
     )
     return parser.parse_args()
@@ -186,16 +192,31 @@ def write_tex(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def find_benchmark_csvs(benchmark_root: Path) -> list[Path]:
+    return sorted(
+        p
+        for p in benchmark_root.rglob("*.csv")
+        if p.is_file() and not p.name.endswith(".manifest.csv")
+    )
+
+
+def index_bifs(bif_root: Path) -> dict[str, Path]:
+    bif_paths = sorted(p for p in bif_root.rglob("*.bif") if p.is_file())
+    by_dataset: dict[str, Path] = {}
+    for path in bif_paths:
+        by_dataset.setdefault(path.stem, path)
+    return by_dataset
+
+
 def main() -> int:
     args = parse_args()
     benchmark_root = Path(args.benchmark_root).resolve()
     bif_root = Path(args.bif_root).resolve()
 
-    csv_paths = sorted(
-        p for p in benchmark_root.glob("*.csv") if not p.name.endswith(".manifest.csv")
-    )
+    csv_paths = find_benchmark_csvs(benchmark_root)
     if not csv_paths:
         raise SystemExit(f"No benchmark CSVs found in {benchmark_root}")
+    bif_by_dataset = index_bifs(bif_root)
 
     dataset_rows: list[dict[str, Any]] = []
     overall_cells = 0
@@ -213,9 +234,9 @@ def main() -> int:
             continue
 
         dataset = rows[0].get("dataset") or csv_path.stem
-        bif_path = bif_root / f"{dataset}.bif"
-        if not bif_path.exists():
-            raise SystemExit(f"Missing BIF for dataset '{dataset}': {bif_path}")
+        bif_path = bif_by_dataset.get(dataset)
+        if bif_path is None:
+            raise SystemExit(f"Missing BIF for dataset '{dataset}' under {bif_root}")
         graph_stats = parse_bif_stats(bif_path)
 
         config_representatives: dict[str, dict[str, str]] = {}
