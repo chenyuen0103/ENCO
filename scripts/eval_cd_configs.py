@@ -1439,7 +1439,7 @@ def main() -> None:
     cli_wrapper_mode = args.wrapper_mode or ("chat" if args.cot_hint else None)
     anonymize_opts = [False, True]
     obs_sizes = [0, 100, 1000, 5000, 8000]
-    int_sizes = [0, 50, 100, 200, 500]
+    int_sizes = [0, 50, 100, 200]
     row_order_opts = ["random", "sorted", "reverse"]
     # For now, only use the default column order.
     col_order_opts = ["original"]

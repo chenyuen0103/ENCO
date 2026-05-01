@@ -71,7 +71,13 @@ def _load_graph_file_light(filename: str) -> SimpleNamespace:
 
 def load_graph_file(filename: str) -> SimpleNamespace:
     if _load_graph_file_full is not None:
-        return _load_graph_file_full(filename)
+        try:
+            return _load_graph_file_full(filename)
+        except Exception:
+            # Fall back to the lightweight BIF parser when the full graph loader
+            # pulls in optional heavyweight dependencies (for example torch) that
+            # are unavailable in the current environment.
+            pass
     return _load_graph_file_light(filename)
 
 

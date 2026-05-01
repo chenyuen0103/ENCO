@@ -19,17 +19,19 @@ def file_sha256(path: Path) -> str:
 
 
 def load_causal_graph(path: str | Path):
-    from causal_graphs.graph_definition import CausalDAG
-    from causal_graphs.graph_export import load_graph as load_dataset_graph
-    from causal_graphs.graph_real_world import load_graph_file
-
     graph_path = Path(path)
     suffix = graph_path.suffix.lower()
     if suffix == ".bif":
+        from causal_graphs.graph_real_world import load_graph_file
+
         return load_graph_file(str(graph_path))
     if suffix == ".pt":
+        from causal_graphs.graph_definition import CausalDAG
+
         return CausalDAG.load_from_file(str(graph_path))
     if suffix == ".npz":
+        from causal_graphs.graph_export import load_graph as load_dataset_graph
+
         return load_dataset_graph(str(graph_path))
     raise ValueError(f"Unsupported graph file type: {graph_path}")
 

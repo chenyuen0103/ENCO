@@ -223,7 +223,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--int-values",
-        default="0,50,100,200,500",
+        default="0,50,100,200",
         help="Comma-separated intervention samples per (variable,value).",
     )
     ap.add_argument(
