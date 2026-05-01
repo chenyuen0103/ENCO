@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
 from typing import Any
 import csv
 import sys
@@ -26,6 +27,15 @@ try:
     import tiktoken  # type: ignore
 except Exception:
     tiktoken = None
+
+
+limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(limit)
+        break
+    except OverflowError:
+        limit //= 10
 
 
 DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/reference_suite")
@@ -158,9 +168,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_tex(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        r"\begin{tabular}{lrrrrrrl}",
+        r"\begin{tabular}{lrrrrrrrr}",
         r"\toprule",
-        r"Dataset & Nodes & Edges & Density & Cells & Rows & Tok. max & Formats \\",
+        "Dataset & Nodes & Edges & Density & Cells & Rows & Tok. min & Tok. mean & Tok. max \\\\",
         r"\midrule",
     ]
     for row in rows:
@@ -173,11 +183,12 @@ def write_tex(path: Path, rows: list[dict[str, Any]]) -> None:
                     f'{float(row["density"]):.3f}',
                     str(row["benchmark_cells"]),
                     str(row["rows"]),
+                    str(row["token_min"] if row["token_min"] is not None else "--"),
+                    str(row["token_mean"] if row["token_mean"] is not None else "--"),
                     str(row["token_max"] if row["token_max"] is not None else "--"),
-                    latex_escape(str(row["formats"])),
                 ]
             )
-            + r" \\"
+            + r" \\" 
         )
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -259,17 +270,18 @@ def main() -> int:
                 "rows": len(rows),
                 "benchmark_cells": len(configs),
                 "prompts_per_cell": round(len(rows) / len(configs), 2),
-                "formats": format_counter(dataset_format_counts),
                 "views": format_counter(view_counter),
                 "naming": format_counter(naming_counter),
                 "obs_grid": ",".join(str(v) for v in sorted({int(r["obs_per_prompt"]) for r in configs})),
                 "int_grid": ",".join(str(v) for v in sorted({int(r["int_per_combo"]) for r in configs})),
                 "budget_counts": format_budget_counter(budget_counter),
-                "token_p50": percentile(token_values, 0.50),
-                "token_p95": percentile(token_values, 0.95),
+                "token_min": min(token_values) if token_values else None,
+                "token_mean": round(mean(token_values), 1) if token_values else None,
                 "token_max": max(token_values) if token_values else None,
             }
         )
+
+    dataset_rows.sort(key=lambda row: (row["nodes"], row["dataset"]))
 
     suite_summary = {
         "datasets": len(dataset_rows),
@@ -283,8 +295,8 @@ def main() -> int:
             for (obs, intr), count in sorted(cells_by_budget.items())
         ],
         "tokenizer": "cl100k_base" if tiktoken is not None else "unavailable",
-        "token_p50": percentile(overall_tokens, 0.50),
-        "token_p95": percentile(overall_tokens, 0.95),
+        "token_min": min(overall_tokens) if overall_tokens else None,
+        "token_mean": round(mean(overall_tokens), 1) if overall_tokens else None,
         "token_max": max(overall_tokens) if overall_tokens else None,
     }
 
@@ -294,9 +306,8 @@ def main() -> int:
             f"{row['dataset']:10s} "
             f"nodes={row['nodes']:>3} edges={row['edges']:>3} density={float(row['density']):.4f} "
             f"rows={row['rows']:>4} cells={row['benchmark_cells']:>3} "
-            f"formats=[{row['formats']}] naming=[{row['naming']}] "
-            f"obs=[{row['obs_grid']}] int=[{row['int_grid']}] "
-            f"tok(p50/p95/max)={row['token_p50']}/{row['token_p95']}/{row['token_max']}"
+            f"naming=[{row['naming']}] obs=[{row['obs_grid']}] int=[{row['int_grid']}] "
+            f"tok(min/mean/max)={row['token_min']}/{row['token_mean']}/{row['token_max']}"
         )
 
     print("\nOverall suite summary")
