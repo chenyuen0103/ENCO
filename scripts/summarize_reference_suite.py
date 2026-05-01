@@ -30,7 +30,7 @@ except Exception:
 
 
 DEFAULT_BENCHMARK_ROOT = Path("./benchmark_data/graphs")
-DEFAULT_BIF_ROOT = Path("./causal_graphs/real_data")
+DEFAULT_GRAPH_ROOT = Path("./causal_graphs")
 DEFAULT_OUTPUT_ROOT = Path("./benchmark_data/summaries")
 
 
@@ -47,12 +47,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--bif-root",
-        default=str(DEFAULT_BIF_ROOT),
+        "--graph-root",
+        default=str(DEFAULT_GRAPH_ROOT),
         help=(
-            "Directory containing <dataset>.bif files used to recover graph sizes. "
-            "The directory is searched recursively."
+            "Directory containing source graph files used to recover graph sizes. "
+            "The directory is searched recursively for BIF and NPZ files."
         ),
+    )
+    parser.add_argument(
+        "--bif-root",
+        default=None,
+        help="Deprecated alias for --graph-root.",
     )
     parser.add_argument(
         "--output-csv",
@@ -101,6 +106,39 @@ def parse_bif_stats(path: Path) -> dict[str, Any]:
         "cardinality_median": median(cardinalities) if cardinalities else None,
         "cardinality_max": max(cardinalities) if cardinalities else None,
     }
+
+
+def parse_npz_stats(path: Path) -> dict[str, Any]:
+    import numpy as np
+
+    arr = np.load(path)
+    adj_matrix = np.asarray(arr["adj_matrix"])
+    node_count = int(adj_matrix.shape[0])
+    edge_count = int((adj_matrix > 0).sum())
+    density = (edge_count / (node_count * (node_count - 1))) if node_count > 1 else 0.0
+
+    cardinalities: list[int] = []
+    data_obs = np.asarray(arr["data_obs"]) if "data_obs" in arr else None
+    if data_obs is not None and data_obs.size and np.issubdtype(data_obs.dtype, np.integer):
+        cardinalities = [int(data_obs[:, idx].max()) + 1 for idx in range(data_obs.shape[1])]
+
+    return {
+        "nodes": node_count,
+        "edges": edge_count,
+        "density": density,
+        "cardinality_min": min(cardinalities) if cardinalities else None,
+        "cardinality_median": median(cardinalities) if cardinalities else None,
+        "cardinality_max": max(cardinalities) if cardinalities else None,
+    }
+
+
+def parse_graph_stats(path: Path) -> dict[str, Any]:
+    suffix = path.suffix.lower()
+    if suffix == ".bif":
+        return parse_bif_stats(path)
+    if suffix == ".npz":
+        return parse_npz_stats(path)
+    raise SystemExit(f"Unsupported source graph type for summary stats: {path}")
 
 
 def percentile(values: list[int], q: float) -> int | None:
@@ -200,23 +238,36 @@ def find_benchmark_csvs(benchmark_root: Path) -> list[Path]:
     )
 
 
-def index_bifs(bif_root: Path) -> dict[str, Path]:
-    bif_paths = sorted(p for p in bif_root.rglob("*.bif") if p.is_file())
+def index_graphs(graph_root: Path) -> dict[str, Path]:
+    graph_paths = sorted(
+        p for p in graph_root.rglob("*") if p.is_file() and p.suffix.lower() in {".bif", ".npz"}
+    )
     by_dataset: dict[str, Path] = {}
-    for path in bif_paths:
+    for path in graph_paths:
         by_dataset.setdefault(path.stem, path)
+        if path.stem.startswith("graph_"):
+            by_dataset.setdefault(path.stem.removeprefix("graph_"), path)
     return by_dataset
+
+
+def resolve_source_graph(row: dict[str, str], dataset: str, graph_by_dataset: dict[str, Path]) -> Path | None:
+    raw_path = row.get("bif_file") or row.get("graph_file") or ""
+    if raw_path:
+        graph_path = Path(raw_path)
+        if graph_path.exists():
+            return graph_path
+    return graph_by_dataset.get(dataset)
 
 
 def main() -> int:
     args = parse_args()
     benchmark_root = Path(args.benchmark_root).resolve()
-    bif_root = Path(args.bif_root).resolve()
+    graph_root = Path(args.bif_root or args.graph_root).resolve()
 
     csv_paths = find_benchmark_csvs(benchmark_root)
     if not csv_paths:
         raise SystemExit(f"No benchmark CSVs found in {benchmark_root}")
-    bif_by_dataset = index_bifs(bif_root)
+    graph_by_dataset = index_graphs(graph_root)
 
     dataset_rows: list[dict[str, Any]] = []
     overall_cells = 0
@@ -234,10 +285,10 @@ def main() -> int:
             continue
 
         dataset = rows[0].get("dataset") or csv_path.stem
-        bif_path = bif_by_dataset.get(dataset)
-        if bif_path is None:
-            raise SystemExit(f"Missing BIF for dataset '{dataset}' under {bif_root}")
-        graph_stats = parse_bif_stats(bif_path)
+        graph_path = resolve_source_graph(rows[0], dataset, graph_by_dataset)
+        if graph_path is None:
+            raise SystemExit(f"Missing source graph for dataset '{dataset}' under {graph_root}")
+        graph_stats = parse_graph_stats(graph_path)
 
         config_representatives: dict[str, dict[str, str]] = {}
         token_values: list[int] = []
