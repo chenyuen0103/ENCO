@@ -1,4 +1,7 @@
-{
+{ "config_defaults": {
+    "wrapper_mode": "chat",
+    "append_format_hint": true
+  },
   "configs": [
     {
       "prompt_style": "summary",
