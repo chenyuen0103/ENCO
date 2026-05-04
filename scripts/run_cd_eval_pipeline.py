@@ -314,7 +314,7 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
             method = method[: -len("_names_only")]
             prompt_style = "names_only"
         method = re.sub(r"_seed\d+$", "", method)
-        if method.startswith("TakayamaSCP") or method in {"JiralerspongBFS", "CausalLLMData", "JiralerspongPairwise"}:
+        if method.startswith("TakayamaSCP") or method in {"JiralerspongBFS", "CausalLLMData", "CausalLLMDataNeural", "JiralerspongPairwise"}:
             prompt_style = "summary"
         elif method == "ENCO":
             prompt_style = "enco"

@@ -38,8 +38,8 @@ CONDITION_SHORT = {
 }
 DATA_ONLY_METHODS = {"PC", "GES", "ENCO"}
 PAPER_MODEL_ORDER = [
-    "GPT-5 mini",
-    "GPT-5.2 pro",
+    "GPT-5 Mini",
+    "GPT-5.2 Pro",
     "Qwen3-4B",
     "Qwen3-30B-A3B",
     "Qwen2.5-7B",
@@ -258,6 +258,42 @@ def latex_escape(text: object) -> str:
     return "".join(replacements.get(ch, ch) for ch in s)
 
 
+def format_primary_latex_cell(value: object) -> str:
+    text = "" if pd.isna(value) else str(value)
+    if text == "--":
+        return r"\cellcolor{gray!18}--"
+
+    parts = text.split("/", maxsplit=1)
+    if len(parts) != 2:
+        return latex_escape(text)
+    try:
+        valid = float(parts[0])
+        total = float(parts[1])
+    except ValueError:
+        return latex_escape(text)
+    if total <= 0:
+        return r"\cellcolor{gray!18}" + latex_escape(text)
+
+    rate = max(0.0, min(1.0, valid / total))
+    if rate >= 1.0:
+        return latex_escape(text)
+    intensity = max(3, round((1.0 - rate) * 18))
+    return rf"\cellcolor{{red!{intensity}}}" + latex_escape(text)
+
+
+def primary_model_family(model: object) -> str:
+    text = "" if pd.isna(model) else str(model)
+    if text.startswith("GPT-"):
+        return "OpenAI"
+    if text.startswith("Qwen3"):
+        return "Qwen3"
+    if text.startswith("Qwen2.5"):
+        return "Qwen2.5"
+    if text.startswith("Llama-3.1"):
+        return "Llama 3.1"
+    return text
+
+
 def write_primary_latex(df: pd.DataFrame, path: Path, obs: int, inter: int, include_anon: bool) -> None:
     conditions = ["names_only", "real+summary", "real+matrix"]
     if include_anon:
@@ -266,9 +302,10 @@ def write_primary_latex(df: pd.DataFrame, path: Path, obs: int, inter: int, incl
     n_condition_cols = len(conditions)
     total_condition_cols = len(GRAPH_ORDER) * n_condition_cols
     lines = [
+        r"% Requires \usepackage[table]{xcolor} or \usepackage{colortbl}",
         r"\begin{table*}[t]",
         r"\centering",
-        rf"\caption{{Valid parsed runs at the primary budget ($N={obs}$, $M={inter}$). Each graph cell reports {subheaders}, where entries are valid/total runs. ``--'' denotes a missing matched cell or a context-window error, not a parser failure.}}",
+        rf"\caption{{Valid responses ratio at $N={obs}$, $M={inter}$. Each graph cell reports {subheaders}, where entries are valid/total runs. ``--'' denotes the prompts exceed context-window error.}}",
         r"\label{tab:valid_rate_primary_budget}",
         r"\scriptsize",
         r"\setlength{\tabcolsep}{3pt}",
@@ -290,10 +327,15 @@ def write_primary_latex(df: pd.DataFrame, path: Path, obs: int, inter: int, incl
         + r" \\",
         r"\midrule",
     ]
+    previous_family = None
     for _, row in df.iterrows():
+        family = primary_model_family(row["model"])
+        if previous_family is not None and family != previous_family:
+            lines.append(r"\midrule")
+        previous_family = family
         vals = [latex_escape(row["model"])]
         vals.extend(
-            latex_escape(row.get(f"{graph}_{CONDITION_SHORT[condition]}", "--"))
+            format_primary_latex_cell(row.get(f"{graph}_{CONDITION_SHORT[condition]}", "--"))
             for graph in GRAPH_ORDER
             for condition in conditions
         )

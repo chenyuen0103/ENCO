@@ -153,7 +153,7 @@ def _merge_response_entries(existing: list[dict[str, Any]], new_entries: list[di
 
 
 def _baseline_prefers_anonymized(baseline_name: str) -> bool:
-    return baseline_name in {"PC", "GES", "ENCO"}
+    return baseline_name in {"PC", "GES", "ENCO", "CausalLLMDataNeural"}
 
 
 @dataclass

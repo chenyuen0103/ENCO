@@ -14,6 +14,7 @@ from .schema import BaselineSpec, BenchmarkSpec, DatasetSpec, PromptCellSpec
 
 PYTHON_EXE = sys.executable or "python3"
 TAKAYAMA_DEFAULT_MODEL = "gpt-4.1"
+NEURAL_CAUSAL_LLM_METHODS = {"CausalLLMDataNeural"}
 
 
 def _run(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
@@ -414,6 +415,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
     def applies_to(self, baseline: BaselineSpec, cell: PromptCellSpec) -> bool:
         if not baseline.enabled:
             return False
+        if self.method_name in NEURAL_CAUSAL_LLM_METHODS:
+            return (not _is_names_only_cell(cell)) and cell.obs_per_prompt > 0 and cell.int_per_combo == 0
         if cell.naming_regime == "anonymized":
             return False
         if self.method_name == "CausalLLMPrompt":
@@ -429,7 +432,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         return False
 
     def _effective_sample_size_inters(self, baseline: BaselineSpec, cell: PromptCellSpec) -> int:
-        if self.method_name in {"TakayamaSCP", "JiralerspongBFS", "JiralerspongPairwise", "CausalLLMPrompt"}:
+        if self.method_name in {"TakayamaSCP", "JiralerspongBFS", "JiralerspongPairwise", "CausalLLMPrompt"} | NEURAL_CAUSAL_LLM_METHODS:
             return 0
         return baseline.sample_size_inters if baseline.sample_size_inters is not None else cell.int_per_combo
 
@@ -442,6 +445,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
         entry: dict[str, Any],
     ) -> tuple[Any, ...]:
         sample_size_obs = baseline.sample_size_obs if baseline.sample_size_obs is not None else cell.obs_per_prompt
+        if self.method_name in NEURAL_CAUSAL_LLM_METHODS:
+            return (baseline.name, dataset.name, sample_size_obs)
         if self.method_name in {"TakayamaSCP", "JiralerspongBFS"}:
             extra = ()
             if self.method_name == "TakayamaSCP":
@@ -486,10 +491,11 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             model_name = baseline.model or TAKAYAMA_DEFAULT_MODEL
         else:
             model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
-        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=num_prompts):
+        expected_rows = 1 if self.method_name in NEURAL_CAUSAL_LLM_METHODS else num_prompts
+        if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=expected_rows):
             return out_csv
         legacy_out_csv = _unseeded_variant_path(out_csv)
-        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run, min_rows=num_prompts):
+        if _materialize_existing_csv_copy(source_csv=legacy_out_csv, out_csv=out_csv, dry_run=dry_run, min_rows=expected_rows):
             return out_csv
 
         if self.method_name in {"CausalLLMData", "CausalLLMPrompt"}:
@@ -514,7 +520,38 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             ):
                 return out_csv
 
-        if self.method_name == "TakayamaSCP":
+        if self.method_name in NEURAL_CAUSAL_LLM_METHODS:
+            checkpoint_base = baseline.checkpoint_dir or (
+                f"experiments/checkpoints/benchmarks/{spec.name}/{dataset.name}/obs{sample_size_obs}_int0/{self.method_name}"
+            )
+            checkpoint_path = self.repo_root / f"{checkpoint_base}{_seed_suffix(seed)}.pth"
+            cmd = [
+                PYTHON_EXE,
+                "scripts/run_causal_llm_neural.py",
+                "--graph_files",
+                str(graph_path),
+                "--sample_size_obs",
+                str(sample_size_obs),
+                "--seed",
+                str(seed),
+                "--out_dir",
+                str(self.repo_root / "experiments" / "responses"),
+                "--out_csv",
+                str(out_csv),
+                "--method_name",
+                self.method_name,
+                "--model_path",
+                str(checkpoint_path),
+                "--num_epochs",
+                str(baseline.causal_llm_epochs),
+                "--batch_size",
+                str(baseline.causal_llm_batch_size),
+                "--epsilon",
+                str(baseline.causal_llm_epsilon),
+                "--l1_lambda",
+                str(baseline.causal_llm_l1_lambda),
+            ]
+        elif self.method_name == "TakayamaSCP":
             cmd = [
                 PYTHON_EXE,
                 "scripts/takayama_scd.py",
@@ -596,4 +633,5 @@ def build_baseline_adapters(repo_root: Path) -> dict[str, BaselineAdapter]:
         "JiralerspongPairwise": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="JiralerspongPairwise"),
         "CausalLLMPrompt": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMPrompt"),
         "CausalLLMData": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMData"),
+        "CausalLLMDataNeural": ExternalLLMBaselineAdapter(repo_root=repo_root, method_name="CausalLLMDataNeural"),
     }

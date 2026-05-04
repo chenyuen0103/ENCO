@@ -227,24 +227,32 @@ def drop_models_without_valid_responses(
     graph: str,
     figure_label: str,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Drop models with no valid parsed runs in any displayed condition."""
-    valid_cols = [
-        CONDITION_VALID_COLUMNS[cond]
-        for cond in condition_columns
-        if CONDITION_VALID_COLUMNS.get(cond) in plot_df.columns
-    ]
-    if valid_cols:
-        valid = plot_df[valid_cols].apply(pd.to_numeric, errors="coerce")
-        keep = valid.gt(0).any(axis=1)
+    """Drop models with fewer than half valid displayed bars."""
+    validity_by_condition = []
+    for cond in condition_columns:
+        valid_col = CONDITION_VALID_COLUMNS.get(cond)
+        if valid_col in plot_df.columns:
+            valid = pd.to_numeric(plot_df[valid_col], errors="coerce").gt(0)
+        else:
+            valid = np.isfinite(pd.to_numeric(plot_df[cond], errors="coerce").to_numpy(dtype=float))
+            valid = pd.Series(valid, index=plot_df.index)
+        validity_by_condition.append(valid)
+
+    if validity_by_condition:
+        valid = pd.concat(validity_by_condition, axis=1)
+        min_valid_bars = (len(condition_columns) + 1) // 2
+        valid_bar_count = valid.sum(axis=1)
+        keep = valid_bar_count.ge(min_valid_bars)
     else:
-        values = plot_df[condition_columns].apply(pd.to_numeric, errors="coerce")
-        keep = np.isfinite(values.to_numpy(dtype=float)).any(axis=1)
+        min_valid_bars = 1
+        keep = pd.Series(False, index=plot_df.index)
 
     dropped = plot_df.loc[~keep, "model"].dropna().astype(str).tolist()
     if dropped:
         print(
             f"[info] Dropping {len(dropped)} model(s) from {figure_label} "
-            f"for graph={graph} with no valid responses in displayed bars: "
+            f"for graph={graph} with fewer than {min_valid_bars}/"
+            f"{len(condition_columns)} valid displayed bars: "
             + ", ".join(dropped)
         )
 
@@ -351,16 +359,16 @@ def plot_decisive_evidence_ladder(
                 ax.text(bar.get_x() + bar.get_width() / 2, label_y, f"{val:.2f}", ha="center", va="bottom", fontsize=7)
                 if is_low_valid:
                     total_text = f"/{int(total_count)}" if np.isfinite(total_count) else ""
-                    ax.text(
-                        bar.get_x() + bar.get_width() / 2,
-                        max(0.045, min(val - 0.055, val * 0.20)),
-                        f"n={int(valid_count)}{total_text}",
-                        ha="center",
-                        va="center",
-                        fontsize=6.5,
-                        color="white",
-                        fontweight="semibold",
-                    )
+                    # ax.text(
+                    #     bar.get_x() + bar.get_width() / 2,
+                    #     max(0.045, min(val - 0.055, val * 0.20)),
+                    #     f"n={int(valid_count)}{total_text}",
+                    #     ha="center",
+                    #     va="center",
+                    #     fontsize=6.5,
+                    #     color="white",
+                    #     fontweight="semibold",
+                    # )
 
     classical_vals = plot_df["best_data_only_f1"].map(finite_or_nan)
     if classical_vals.notna().any():
@@ -377,9 +385,9 @@ def plot_decisive_evidence_ladder(
     handles, labels = ax.get_legend_handles_labels()
     if any_low_valid:
         handles.append(Patch(facecolor="white", edgecolor="#333333", hatch="///", label="<3 valid runs (60%)"))
-        labels.append("<3 valid runs (60%)")
+        labels.append("<60% valid runs")
     ax.legend(handles, labels, frameon=False, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 1.20))
-    stem = _stem("fig1_decisive_evidence_ladder", graph, legacy=legacy_stem)
+    stem = _stem("fig1_ladder", graph, legacy=legacy_stem)
     if anonymized:
         stem = f"{stem}_anonymized"
     save_figure(fig, out_dir, stem, formats)
@@ -398,7 +406,8 @@ def plot_model_size_ladder(
     rows = graph_df[graph_df["family"].isin(["Qwen2.5", "Qwen3", "Llama 3.1"])].copy()
     rows = rows.dropna(subset=["size_value"], how="any")
     families = []
-    for family in ["Qwen2.5", "Qwen3", "Llama 3.1"]:
+    # for family in ["Qwen2.5", "Qwen3", "Llama 3.1"]:
+    for family in ["Qwen2.5", "Qwen3"]:
         sub = rows[rows.family.eq(family)]
         finite_points = sub[CONDITION_COLUMNS].notna().any(axis=1).sum()
         if finite_points >= 2:
@@ -666,14 +675,14 @@ def write_latex_includes(out_dir: Path) -> None:
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_decisive_evidence_ladder.pdf}
+  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_ladder.pdf}
   \caption{Matched evidence-use ladder on the primary graph and budget. Each model is evaluated on the same graph and data; only the exposed information changes from names-only to summary statistics to raw matrix rows. Error bars show standard errors over valid parsed runs; hatched bars mark conditions with fewer than three valid parsed runs (60\%). The dashed line shows the strongest classical causal discovery reference at the same data budget.}
   \label{fig:decisive_evidence_ladder}
 \end{figure*}
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_decisive_evidence_ladder_anonymized.pdf}
+  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_anonymized.pdf}
   \caption{Anonymized companion to the matched evidence-use ladder. The bars use anonymized summaries and matrices; the dashed line preserves the strongest classical reference at the same data budget.}
   \label{fig:decisive_evidence_ladder_anonymized}
 \end{figure*}

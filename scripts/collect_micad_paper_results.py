@@ -45,8 +45,8 @@ class ModelInfo:
 
 
 MODEL_INFOS = [
-    ModelInfo("gpt-5-mini", "GPT-5 mini", "OpenAI", "mini", 1.0, "closed"),
-    ModelInfo("gpt-5.2-pro", "GPT-5.2 pro", "OpenAI", "pro", 2.0, "closed"),
+    ModelInfo("gpt-5-mini", "GPT-5 Mini", "OpenAI", "mini", 1.0, "closed"),
+    ModelInfo("gpt-5.2-pro", "GPT-5.2 Pro", "OpenAI", "pro", 2.0, "closed"),
     ModelInfo("Qwen/Qwen3-4B-Thinking-2507", "Qwen3-4B", "Qwen3", "4B", 4.0, "open"),
     ModelInfo("Qwen/Qwen3-30B-A3B-Thinking-2507", "Qwen3-30B-A3B", "Qwen3", "30B-A3B", 30.0, "open"),
     ModelInfo("Qwen/Qwen2.5-7B-Instruct-1M", "Qwen2.5-7B", "Qwen2.5", "7B", 7.0, "open"),

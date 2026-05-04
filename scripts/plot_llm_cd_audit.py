@@ -27,12 +27,18 @@ csv.field_size_limit(10_000_000)
 
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmark_runs" / "figures"
 
+# NeurIPS-style full-width figure sizing. The NeurIPS text block is about
+# 5.5 inches wide; captions should carry the title, so the plot stays compact.
+FIG_WIDTH = 5.5
+BASE_FONT = 7.5
+
 # ── display labels ────────────────────────────────────────────────────────────
 DISPLAY = {
     "JiralerspongBFS":      "Jiralerspong BFS",
-    "JiralerspongPairwise": "Jiralerspong Pairwise",
+    "JiralerspongPairwise": "Long Pairwise",
     "TakayamaSCP":          "Takayama SCP",
-    "CausalLLMData":        "Roy CausalLLM + Data",
+    "CausalLLMData":        "Roy CausalLLM + Data (prompt)",
+    "CausalLLMDataNeural":  "Roy CausalLLM neural",
     "CausalLLMPrompt":      "Roy CausalLLM",
 }
 
@@ -77,6 +83,19 @@ def _f1_shd(row: dict) -> tuple[float, float]:
     return float(row["avg_f1"]), float(row["avg_shd"])
 
 
+def _mean_per_row_metrics(path: Path) -> tuple[float, float] | None:
+    if not path.exists():
+        return None
+    rows = _read_eval_summary(path)
+    valid = [r for r in rows if r.get("f1") not in (None, "") and r.get("shd") not in (None, "")]
+    if not valid:
+        return None
+    return (
+        sum(float(r["f1"]) for r in valid) / len(valid),
+        sum(float(r["shd"]) for r in valid) / len(valid),
+    )
+
+
 def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, float]]:
     """Return (method_rows, f1_refs, shd_refs) for the given obs budget."""
 
@@ -110,6 +129,9 @@ def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, fl
         ("JiralerspongBFS",      full_grid,  dict(obs_n=obs, naming_regime="real"),  False),
         ("TakayamaSCP",          full_grid,  dict(obs_n=obs, naming_regime="real"),  False),
         ("CausalLLMPrompt",      llm_base,   dict(naming_regime="names_only"),        False),
+        # All-pairs LLM querying follows the early pairwise LLM-CD pattern of
+        # Long et al. (2022); the implementation reuses the historical method
+        # key for backward-compatible result lookup.
         ("JiralerspongPairwise", llm_base,   dict(obs_n=obs, naming_regime="real"),  True),
         ("CausalLLMData",        llm_base,   dict(obs_n=obs, naming_regime="real"),  True),
     ]
@@ -117,19 +139,34 @@ def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, fl
     methods: list[MethodRow] = []
     for name, pool, kw, obs_fallback in sources:
         row = _find_row(pool, system=name, **kw)
+        per_row_metrics = None
+        if row is None and name == "JiralerspongPairwise":
+            per_row_metrics = _mean_per_row_metrics(
+                REPO_ROOT
+                / "experiments"
+                / "responses"
+                / "sachs"
+                / f"predictions_obs{obs}_int0_JiralerspongPairwise_seed42.csv.per_row.csv"
+            )
         if row is None:
             # Try obs=1000 fallback only for methods that don't have an obs-specific run,
             # and mark them so the plot can render a dagger (†) on the label.
-            if obs_fallback and obs != 1000:
+            if per_row_metrics is not None:
+                f1, shd = per_row_metrics
+                fallback = False
+            elif obs_fallback and obs != 1000:
                 row = _find_row(pool, system=name,
                                 obs_n=1000, naming_regime=kw.get("naming_regime", "real"))
+                if row is not None:
+                    f1, shd = _f1_shd(row)
+                fallback = True
             if row is None:
-                print(f"[warn] {name} not found at obs={obs} – skipping", file=sys.stderr)
-                continue
-            fallback = True
+                if per_row_metrics is None:
+                    print(f"[warn] {name} not found at obs={obs} – skipping", file=sys.stderr)
+                    continue
         else:
             fallback = False
-        f1, shd = _f1_shd(row)
+            f1, shd = _f1_shd(row)
         kind = "floor" if name == "CausalLLMPrompt" else "llm"
         label = DISPLAY[name] + (" †" if fallback else "")
         methods.append(MethodRow(name=name, label=label, f1=f1, shd=shd, kind=kind))
@@ -160,7 +197,22 @@ def plot(methods: list[MethodRow],
     _configure_matplotlib()
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "font.size": BASE_FONT,
+        "axes.labelsize": BASE_FONT,
+        "xtick.labelsize": BASE_FONT - 0.5,
+        "ytick.labelsize": BASE_FONT,
+        "legend.fontsize": BASE_FONT - 0.5,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "savefig.pad_inches": 0.02,
+        "mathtext.fontset": "stix",
+    })
 
     n = len(methods)
     ys = list(range(n))
@@ -168,14 +220,14 @@ def plot(methods: list[MethodRow],
 
     # ── reference line styles ─────────────────────────────────────────────────
     ref_styles = {
-        "PC":             dict(color=COL_ANCHOR,   linestyle=(0, (4, 3)), linewidth=1.3),
-        "GES":            dict(color=COL_ANCHOR,   linestyle=(0, (2, 2)), linewidth=1.3),
-        "Semantic floor": dict(color=COL_SEMANTIC, linestyle=(0, (5, 3)), linewidth=1.6),
+        "PC":             dict(color=COL_ANCHOR,   linestyle=(0, (4, 3)), linewidth=0.9),
+        "GES":            dict(color=COL_ANCHOR,   linestyle=(0, (2, 2)), linewidth=0.9),
+        "Semantic floor": dict(color=COL_SEMANTIC, linestyle=(0, (5, 3)), linewidth=1.0),
     }
 
-    fig_h = max(3.2, 0.6 * n + 1.8)
-    fig, axes = plt.subplots(1, 2, figsize=(9.0, fig_h), sharey=True)
-    fig.subplots_adjust(wspace=0.06, top=0.82, bottom=0.30)
+    fig_h = max(2.35, 0.34 * n + 1.0)
+    fig, axes = plt.subplots(1, 2, figsize=(FIG_WIDTH, fig_h), sharey=True)
+    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.84, bottom=0.30)
 
     panels = [
         ("F1",  [m.f1  for m in methods], f1_refs,  None, True),
@@ -186,53 +238,48 @@ def plot(methods: list[MethodRow],
         data_max = max(max(vals), max(refs.values()))
         x_max = data_max * 1.18
 
-        # reference lines — draw line then place label to the right of it,
-        # staggered vertically so close lines (PC/GES/floor) never overlap
-        ref_items = list(refs.items())
-        for i, (ref_name, ref_val) in enumerate(ref_items):
+        # Reference lines are identified in the legend.
+        for ref_name, ref_val in refs.items():
             ax.axvline(ref_val, zorder=1, **ref_styles[ref_name])
-            y_data = -0.1 - 0.38 * i          # below the lowest row, stacked downward
-            ax.text(ref_val, y_data, ref_name,
-                    ha="center", va="top", fontsize=7.2,
-                    color=ref_styles[ref_name]["color"],
-                    transform=ax.transData, clip_on=False)
 
         # lollipops
         for y, m, val in zip(ys, methods, vals):
             dot_color = COL_SEMANTIC if m.kind == "floor" else COL_LLM
-            ax.plot([0, val], [y, y], color=COL_STEM, linewidth=1.4, zorder=2)
-            ax.plot(val, y, "o", color=dot_color, markersize=8, zorder=3)
-            offset = 0.018 * x_max
+            ax.plot([0, val], [y, y], color=COL_STEM, linewidth=0.9, zorder=2)
+            ax.plot(val, y, "o", color=dot_color, markersize=4.8, zorder=3)
+            offset = 0.03 * x_max
             ax.text(val + offset, y, f"{val:.2f}",
-                    va="center", ha="left", fontsize=8.0, color=dot_color)
+                    va="center", ha="left", fontsize=BASE_FONT - 0.5, color=dot_color)
 
         ax.set_xlim(0, x_max * 1.2)
         ax.set_ylim(-0.6, n - 0.4)
-        ax.set_xlabel(metric, fontsize=10.5)
+        ax.set_xlabel(metric)
         ax.set_yticks(ys)
-        ax.grid(axis="x", color="#E0E0E0", linewidth=0.7, zorder=0)
+        ax.grid(axis="x", color="#E6E6E6", linewidth=0.45, zorder=0)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
-        ax.spines["left"].set_color("#CCCCCC")
+        ax.spines["left"].set_color("#BDBDBD")
         ax.spines["bottom"].set_color("#333333")
-        ax.tick_params(axis="both", labelsize=9)
+        ax.spines["left"].set_linewidth(0.6)
+        ax.spines["bottom"].set_linewidth(0.6)
+        ax.tick_params(axis="both", length=2.5, width=0.6, pad=2)
 
     # y-axis labels only on left panel
-    axes[0].set_yticklabels(labels, fontsize=9)
+    axes[0].set_yticklabels(labels)
     axes[0].set_ylabel("")
 
     # footnote for fallback obs
     if any("†" in m.label for m in methods):
-        fig.text(0.5, 0.155, "† obs=1000 run shown; obs=5000 not yet available.",
-                 ha="center", va="top", fontsize=7.5, color="#555555",
+        fig.text(0.5, 0.055, "† obs=1000 run shown; obs=5000 not yet available.",
+                 ha="center", va="top", fontsize=BASE_FONT - 1.0, color="#555555",
                  style="italic")
 
     # ── legend ────────────────────────────────────────────────────────────────
     legend_handles = [
-        Line2D([0], [0], color=COL_LLM,     marker="o", markersize=7, linewidth=0,
-               label="LLM-CD method"),
-        Line2D([0], [0], color=COL_SEMANTIC, marker="o", markersize=7, linewidth=0,
-               label="Semantic-only (names-only)"),
+        Line2D([0], [0], color=COL_LLM,     marker="o", markersize=4.8, linewidth=0,
+               label="LLM-CD"),
+        Line2D([0], [0], color=COL_SEMANTIC, marker="o", markersize=4.8, linewidth=0,
+               label="Semantic-only"),
         Line2D([0], [0], color=ref_styles["PC"]["color"],
                linestyle=ref_styles["PC"]["linestyle"],
                linewidth=ref_styles["PC"]["linewidth"], label="PC"),
@@ -244,13 +291,10 @@ def plot(methods: list[MethodRow],
                linewidth=ref_styles["Semantic floor"]["linewidth"],
                label="Semantic floor"),
     ]
-    fig.legend(handles=legend_handles, loc="lower center",
-               ncol=5, fontsize=8.0, frameon=True,
-               framealpha=0.95, facecolor="white", edgecolor="#DDDDDD",
-               bbox_to_anchor=(0.5, 0.01))
-
-    fig.suptitle(f"LLM-CD Methods — Sachs (obs={obs})",
-                 fontsize=14)
+    fig.legend(handles=legend_handles, loc="upper center",
+               ncol=5, frameon=False, columnspacing=0.8,
+               handlelength=1.6, handletextpad=0.4,
+               bbox_to_anchor=(0.58, 0.995))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -267,8 +311,8 @@ def plot(methods: list[MethodRow],
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--obs",      type=int,  default=1000,
-                        help="Observational budget to plot (default: 1000)")
+    parser.add_argument("--obs",      type=int,  default=5000,
+                        help="Observational budget to plot (default: 5000)")
     parser.add_argument("--out-dir",  type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--basename", default=None,
                         help="Output file stem (default: llm_cd_audit_obs{obs})")

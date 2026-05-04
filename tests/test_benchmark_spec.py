@@ -92,6 +92,10 @@ class TestBenchmarkSpec(unittest.TestCase):
         self.assertTrue(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), summary))
         self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), anonymized_observational))
         self.assertFalse(adapters["CausalLLMData"].applies_to(BaselineSpec(name="CausalLLMData"), matrix))
+        self.assertTrue(adapters["CausalLLMDataNeural"].applies_to(BaselineSpec(name="CausalLLMDataNeural"), observational))
+        self.assertTrue(adapters["CausalLLMDataNeural"].applies_to(BaselineSpec(name="CausalLLMDataNeural"), anonymized_observational))
+        self.assertFalse(adapters["CausalLLMDataNeural"].applies_to(BaselineSpec(name="CausalLLMDataNeural"), summary))
+        self.assertFalse(adapters["CausalLLMDataNeural"].applies_to(BaselineSpec(name="CausalLLMDataNeural"), names_only))
 
     def test_takayama_defaults_to_logprob_capable_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -85,6 +85,10 @@ class BaselineSpec:
     max_new_tokens: int | None = None
     num_samples: int = 1
     edge_threshold: float = 0.5
+    causal_llm_epochs: int = 10
+    causal_llm_batch_size: int = 32
+    causal_llm_epsilon: float = 0.1
+    causal_llm_l1_lambda: float = 0.01
     takayama_backend: str = "pc"
     takayama_pattern: int = 2
     takayama_bootstrap_samples: int = 100
@@ -303,6 +307,10 @@ def _build_baseline(item: dict[str, Any]) -> BaselineSpec:
         max_new_tokens=item.get("max_new_tokens"),
         num_samples=int(item.get("num_samples", 1 if item.get("name") == "TakayamaSCP" else 5)),
         edge_threshold=float(item.get("edge_threshold", 0.5)),
+        causal_llm_epochs=int(item.get("causal_llm_epochs", 10)),
+        causal_llm_batch_size=int(item.get("causal_llm_batch_size", 32)),
+        causal_llm_epsilon=float(item.get("causal_llm_epsilon", 0.1)),
+        causal_llm_l1_lambda=float(item.get("causal_llm_l1_lambda", 0.01)),
         takayama_backend=str(item.get("takayama_backend", "pc")).strip().lower(),
         takayama_pattern=int(item.get("takayama_pattern", 2)),
         takayama_bootstrap_samples=int(item.get("takayama_bootstrap_samples", 100)),
