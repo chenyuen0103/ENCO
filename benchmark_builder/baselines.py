@@ -491,7 +491,7 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
             model_name = baseline.model or TAKAYAMA_DEFAULT_MODEL
         else:
             model_name = baseline.model or next((model.name for model in spec.models if model.enabled), spec.models[0].name)
-        expected_rows = 1 if self.method_name in NEURAL_CAUSAL_LLM_METHODS else num_prompts
+        expected_rows = num_prompts
         if _reuse_if_has_rows(out_csv, dry_run=dry_run, min_rows=expected_rows):
             return out_csv
         legacy_out_csv = _unseeded_variant_path(out_csv)
@@ -542,6 +542,8 @@ class ExternalLLMBaselineAdapter(BaselineAdapter):
                 self.method_name,
                 "--model_path",
                 str(checkpoint_path),
+                "--num_replicates",
+                str(num_prompts),
                 "--num_epochs",
                 str(baseline.causal_llm_epochs),
                 "--batch_size",

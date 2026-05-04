@@ -35,7 +35,7 @@ def _require_neural_deps():
     return torch, nn, optim, LinearRegression, LlamaConfig, LlamaModel, nx
 
 
-def _load_observational_array(graph: Any, sample_size_obs: int, seed: int) -> tuple[np.ndarray, list[str]]:
+def _load_observational_array(graph: Any, sample_size_obs: int, seed: int) -> tuple[np.ndarray, list[str], list[int] | None]:
     if sample_size_obs <= 0:
         raise SystemExit("CausalLLMDataNeural requires --sample_size_obs > 0.")
     variables = [str(v.name) for v in graph.variables]
@@ -45,10 +45,12 @@ def _load_observational_array(graph: Any, sample_size_obs: int, seed: int) -> tu
             raise SystemExit(
                 f"Requested sample_size_obs={sample_size_obs}, but dataset only exposes {arr.shape[0]} rows."
             )
-        return np.asarray(arr[:sample_size_obs], dtype=np.float32), variables
+        rng = np.random.default_rng(seed)
+        row_idx = rng.choice(arr.shape[0], size=sample_size_obs, replace=False)
+        return np.asarray(arr[row_idx], dtype=np.float32), variables, row_idx.astype(int).tolist()
     if hasattr(graph, "sample"):
         np.random.seed(seed)
-        return np.asarray(graph.sample(batch_size=sample_size_obs, as_array=True), dtype=np.float32), variables
+        return np.asarray(graph.sample(batch_size=sample_size_obs, as_array=True), dtype=np.float32), variables, None
     raise SystemExit("Graph object does not expose observational data or sampling.")
 
 
@@ -207,18 +209,18 @@ def _fit_predict_causal_llm(
     return prediction
 
 
-def _write_prediction_csv(
+def _prediction_row(
     *,
-    out_csv: Path,
     method: str,
     model_name: str,
     sample_size_obs: int,
     answer: np.ndarray,
     prediction: np.ndarray,
     metadata: dict[str, Any],
-) -> None:
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    row = {
+    replicate_index: int,
+    replicate_seed: int,
+) -> dict[str, Any]:
+    return {
         "method": method,
         "model": model_name,
         "provider": "local",
@@ -229,13 +231,39 @@ def _write_prediction_csv(
         "answer": json.dumps(np.asarray(answer, dtype=int).tolist(), ensure_ascii=False),
         "prediction": json.dumps(np.asarray(prediction, dtype=int).tolist(), ensure_ascii=False),
         "valid": 1,
-        "replicate_index": 0,
-        "replicate_seed": metadata.get("seed"),
+        "replicate_index": replicate_index,
+        "replicate_seed": replicate_seed,
     }
+
+
+def _write_prediction_rows(*, out_csv: Path, rows: list[dict[str, Any]]) -> None:
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "method",
+        "model",
+        "provider",
+        "naming_regime",
+        "obs_n",
+        "int_n",
+        "raw_response",
+        "answer",
+        "prediction",
+        "valid",
+        "replicate_index",
+        "replicate_seed",
+    ]
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerow(row)
+        writer.writerows(rows)
+
+
+def _replicate_checkpoint_path(model_path: Path | None, replicate_index: int, num_replicates: int) -> Path | None:
+    if model_path is None:
+        return None
+    if num_replicates <= 1:
+        return model_path
+    return model_path.with_name(f"{model_path.stem}_rep{replicate_index}{model_path.suffix}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,6 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method_name", default="CausalLLMDataNeural")
     parser.add_argument("--model_name", default="CausalDiscoveryLLM")
     parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--num_replicates", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epsilon", type=float, default=0.1)
@@ -259,46 +288,70 @@ def main() -> int:
     args = parse_args()
     if len(args.graph_files) > 1 and args.out_csv:
         raise SystemExit("--out_csv can only be used with a single --graph_files entry.")
+    if args.num_replicates <= 0:
+        raise SystemExit("--num_replicates must be > 0.")
     for graph_file in args.graph_files:
         graph_path = Path(graph_file).resolve()
         graph = load_causal_graph(graph_path)
-        data, _variables = _load_observational_array(graph, args.sample_size_obs, args.seed)
         answer = np.asarray(graph.adj_matrix).astype(int)
         np.fill_diagonal(answer, 0)
-        checkpoint = Path(args.model_path).resolve() if args.model_path else None
-        prediction = _fit_predict_causal_llm(
-            data,
-            seed=args.seed,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            epsilon=args.epsilon,
-            l1_lambda=args.l1_lambda,
-            model_path=checkpoint,
-        )
+        model_path = Path(args.model_path).resolve() if args.model_path else None
         out_csv = Path(args.out_csv) if args.out_csv else Path(args.out_dir) / graph_path.stem / (
             f"predictions_obs{args.sample_size_obs}_int0_{args.method_name}_seed{int(args.seed)}.csv"
         )
-        metadata = {
-            "source": "devharish1371 Causal-LLM Dag_generation and model_evaluation/causal_llm.py",
-            "implementation": "trainable frozen-LLaMA projection with acyclicity projection and regression pruning",
-            "seed": int(args.seed),
-            "num_epochs": int(args.num_epochs),
-            "batch_size": int(args.batch_size),
-            "epsilon": float(args.epsilon),
-            "l1_lambda": float(args.l1_lambda),
-            "sample_size_obs": int(args.sample_size_obs),
-            "checkpoint": str(checkpoint) if checkpoint else None,
-            "output_orientation": "transposed from upstream child-parent regression convention to repo parent-child adjacency convention",
-        }
-        _write_prediction_csv(
-            out_csv=out_csv,
-            method=args.method_name,
-            model_name=args.model_name,
-            sample_size_obs=args.sample_size_obs,
-            answer=answer,
-            prediction=prediction,
-            metadata=metadata,
-        )
+        rows: list[dict[str, Any]] = []
+        for replicate_index in range(int(args.num_replicates)):
+            replicate_seed = int(args.seed) + replicate_index * 1000
+            data, _variables, row_indices = _load_observational_array(graph, args.sample_size_obs, replicate_seed)
+            checkpoint = _replicate_checkpoint_path(model_path, replicate_index, int(args.num_replicates))
+            print(
+                f"[{args.method_name}] replicate {replicate_index + 1}/{args.num_replicates} "
+                f"start seed={replicate_seed}",
+                flush=True,
+            )
+            prediction = _fit_predict_causal_llm(
+                data,
+                seed=replicate_seed,
+                num_epochs=args.num_epochs,
+                batch_size=args.batch_size,
+                epsilon=args.epsilon,
+                l1_lambda=args.l1_lambda,
+                model_path=checkpoint,
+            )
+            metadata = {
+                "source": "devharish1371 Causal-LLM Dag_generation and model_evaluation/causal_llm.py",
+                "implementation": "trainable frozen-LLaMA projection with acyclicity projection and regression pruning",
+                "seed": replicate_seed,
+                "base_seed": int(args.seed),
+                "replicate_index": replicate_index,
+                "num_replicates": int(args.num_replicates),
+                "num_epochs": int(args.num_epochs),
+                "batch_size": int(args.batch_size),
+                "epsilon": float(args.epsilon),
+                "l1_lambda": float(args.l1_lambda),
+                "sample_size_obs": int(args.sample_size_obs),
+                "sampled_row_indices": row_indices,
+                "checkpoint": str(checkpoint) if checkpoint else None,
+                "output_orientation": "transposed from upstream child-parent regression convention to repo parent-child adjacency convention",
+            }
+            rows.append(
+                _prediction_row(
+                    method=args.method_name,
+                    model_name=args.model_name,
+                    sample_size_obs=args.sample_size_obs,
+                    answer=answer,
+                    prediction=prediction,
+                    metadata=metadata,
+                    replicate_index=replicate_index,
+                    replicate_seed=replicate_seed,
+                )
+            )
+            _write_prediction_rows(out_csv=out_csv, rows=rows)
+            print(
+                f"[{args.method_name}] replicate {replicate_index + 1}/{args.num_replicates} done; "
+                f"rows={len(rows)}/{args.num_replicates}",
+                flush=True,
+            )
         print(f"[{args.method_name}] wrote {out_csv.resolve()}")
     return 0
 
