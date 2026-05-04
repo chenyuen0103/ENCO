@@ -553,16 +553,33 @@ _REQUIRED_PER_ROW_COLUMNS = {
     "nhd_ratio",
 }
 
+_MINIMAL_PER_ROW_CACHE_COLUMNS = {
+    "format_ok",
+    "n_vars",
+}
+
 
 def _per_row_cache_is_current(csv_path: Path) -> bool:
     per_row_path = csv_path.with_suffix(csv_path.suffix + ".per_row.csv")
     if not per_row_path.exists() or per_row_path.stat().st_mtime < csv_path.stat().st_mtime:
         return False
     try:
-        columns = set(pd.read_csv(per_row_path, nrows=0).columns)
+        per_df = pd.read_csv(per_row_path)
     except Exception:
         return False
-    return _REQUIRED_PER_ROW_COLUMNS.issubset(columns)
+    columns = set(per_df.columns)
+    if _REQUIRED_PER_ROW_COLUMNS.issubset(columns):
+        return True
+
+    # Older evaluate.py versions did not write every derived metric column. If
+    # the cache has no valid graph rows, re-running only recreates the same
+    # all-null metrics, so treat the cache as complete enough to skip.
+    if not _MINIMAL_PER_ROW_CACHE_COLUMNS.issubset(columns):
+        return False
+    if per_df.empty:
+        return True
+    n_vars = pd.to_numeric(per_df["n_vars"], errors="coerce")
+    return not n_vars.notna().any()
 
 
 def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bool) -> None:
