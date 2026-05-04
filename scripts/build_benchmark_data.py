@@ -173,10 +173,7 @@ def main() -> int:
 
     fieldnames = [
         "dataset",
-        "bif_file",
         "config_index",
-        "config_name",
-        "prompt_basename",
         "prompt_style",
         "benchmark_view",
         "anonymize",
@@ -191,12 +188,9 @@ def main() -> int:
         "hist_mass_keep_frac",
         "data_idx",
         "shuffle_idx",
-        "given_edges",
         "prompt_text",
         "prompt_tokens_ref",
-        "prompt_sha256",
         "answer",
-        "answer_sha256",
     ]
 
     config_summaries: list[dict[str, Any]] = []
@@ -225,21 +219,9 @@ def main() -> int:
                 hist_mass_keep_frac,
             ) = config
 
-            config_name = _config_name(
-                prompt_style=prompt_style,
-                anonymize=anonymize,
-                obs_per_prompt=obs_per_prompt,
-                int_per_combo=int_per_combo,
-                row_order=row_order,
-                col_order=col_order,
-                reasoning_guidance=reasoning_guidance,
-                wrapper_mode=wrapper_mode,
-                append_format_hint=append_format_hint,
-                hist_mass_keep_frac=hist_mass_keep_frac,
-            )
             benchmark_view = "names_only" if (obs_per_prompt == 0 and int_per_combo == 0) else "evidence"
 
-            base_name, answer_obj, prompt_iter = EVAL._iter_prompts_for_config(
+            _base_name, answer_obj, prompt_iter = EVAL._iter_prompts_for_config(
                 bif_file=str(bif_file),
                 num_prompts=int(args.num_prompts),
                 shuffles_per_graph=int(shuffles_per_graph),
@@ -261,7 +243,6 @@ def main() -> int:
             )
 
             answer_json = json.dumps(answer_obj, ensure_ascii=False)
-            answer_sha256 = _sha256_text(answer_json)
             row_count = 0
 
             for row in prompt_iter:
@@ -272,10 +253,7 @@ def main() -> int:
                 writer.writerow(
                     {
                         "dataset": dataset,
-                        "bif_file": str(bif_file),
                         "config_index": config_index,
-                        "config_name": config_name,
-                        "prompt_basename": base_name,
                         "prompt_style": prompt_style,
                         "benchmark_view": benchmark_view,
                         "anonymize": int(bool(anonymize)),
@@ -290,12 +268,9 @@ def main() -> int:
                         "hist_mass_keep_frac": "" if hist_mass_keep_frac is None else hist_mass_keep_frac,
                         "data_idx": int(row["data_idx"]),
                         "shuffle_idx": int(row["shuffle_idx"]),
-                        "given_edges": row.get("given_edges", ""),
                         "prompt_text": prompt_text,
                         "prompt_tokens_ref": prompt_tokens_ref,
-                        "prompt_sha256": _sha256_text(prompt_text),
                         "answer": answer_json,
-                        "answer_sha256": answer_sha256,
                     }
                 )
                 row_count += 1
@@ -304,8 +279,6 @@ def main() -> int:
             config_summaries.append(
                 {
                     "config_index": config_index,
-                    "config_name": config_name,
-                    "prompt_basename": base_name,
                     "prompt_style": prompt_style,
                     "anonymize": bool(anonymize),
                     "obs_per_prompt": obs_per_prompt,
@@ -324,16 +297,15 @@ def main() -> int:
     manifest = {
         "schema_version": "benchmark_data/v1",
         "generator": "scripts/build_benchmark_data.py",
-        "compatibility_source": str(EVAL_SCRIPT),
+        "compatibility_source": "scripts/eval_cd_configs.py",
         "dataset": dataset,
-        "bif_file": str(bif_file),
-        "bif_file_sha256": _sha256_file(bif_file),
-        "config_file": str(config_file),
+        "graph_file_sha256": _sha256_file(bif_file),
+        "config_file": str(config_file.relative_to(REPO_ROOT)) if config_file.is_relative_to(REPO_ROOT) else config_file.name,
         "config_file_sha256": _sha256_file(config_file),
         "num_prompts": int(args.num_prompts),
         "seed": int(args.seed),
         "selected_config_indexes": sorted(selected_indexes) if selected_indexes is not None else None,
-        "output_csv": str(output_csv),
+        "output_csv": str(output_csv.relative_to(REPO_ROOT)) if output_csv.is_relative_to(REPO_ROOT) else output_csv.name,
         "output_csv_sha256": _sha256_file(output_csv),
         "total_rows": total_rows,
         "prompt_token_reference": {

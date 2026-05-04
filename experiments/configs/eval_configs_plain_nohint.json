@@ -1,6 +1,7 @@
-{ "config_defaults": {
-    "wrapper_mode": "chat",
-    "append_format_hint": true
+{
+  "config_defaults": {
+    "wrapper_mode": "plain",
+    "append_format_hint": false
   },
   "configs": [
     {

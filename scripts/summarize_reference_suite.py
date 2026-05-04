@@ -251,7 +251,7 @@ def index_graphs(graph_root: Path) -> dict[str, Path]:
 
 
 def resolve_source_graph(row: dict[str, str], dataset: str, graph_by_dataset: dict[str, Path]) -> Path | None:
-    raw_path = row.get("bif_file") or row.get("graph_file") or ""
+    raw_path = row.get("graph_file") or ""
     if raw_path:
         graph_path = Path(raw_path)
         if graph_path.exists():
@@ -290,10 +290,25 @@ def main() -> int:
             raise SystemExit(f"Missing source graph for dataset '{dataset}' under {graph_root}")
         graph_stats = parse_graph_stats(graph_path)
 
-        config_representatives: dict[str, dict[str, str]] = {}
+        config_representatives: dict[tuple[str, ...], dict[str, str]] = {}
         token_values: list[int] = []
         for row in rows:
-            config_representatives.setdefault(row["config_name"], row)
+            config_key = (
+                row.get("config_index", ""),
+                row.get("prompt_style", ""),
+                row.get("benchmark_view", ""),
+                row.get("anonymize", ""),
+                row.get("obs_per_prompt", ""),
+                row.get("int_per_combo", ""),
+                row.get("row_order", ""),
+                row.get("col_order", ""),
+                row.get("shuffles_per_graph", ""),
+                row.get("wrapper_mode", ""),
+                row.get("append_format_hint", ""),
+                row.get("reasoning_guidance", ""),
+                row.get("hist_mass_keep_frac", ""),
+            )
+            config_representatives.setdefault(config_key, row)
             token_value = token_count_for_row(row)
             if token_value is not None:
                 token_values.append(token_value)
