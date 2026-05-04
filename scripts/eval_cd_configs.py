@@ -99,6 +99,28 @@ def _extract_adjacency_from_response(text: str, *, fallback_variables: list[str]
     return None
 
 
+def _expected_matrix_size(answer_obj: dict[str, Any]) -> int | None:
+    variables = answer_obj.get("variables")
+    if isinstance(variables, list) and variables:
+        return len(variables)
+
+    adj = answer_obj.get("adjacency_matrix")
+    if isinstance(adj, list) and adj:
+        return len(adj)
+    return None
+
+
+def _right_shape(adj: Any, expected_n: int | None) -> int:
+    if adj is None or expected_n is None:
+        return 0
+    shape = getattr(adj, "shape", None)
+    if shape is not None:
+        return int(tuple(shape) == (expected_n, expected_n))
+    if not isinstance(adj, list) or len(adj) != expected_n:
+        return 0
+    return int(all(isinstance(row, list) and len(row) == expected_n for row in adj))
+
+
 def _format_ok(text: str) -> int:
     t = text or ""
     if FORMAT_RE.match(t):
@@ -770,6 +792,7 @@ def _run_model_for_config(
         "prediction",
         "valid",
         "format_ok",
+        "right_shape",
         "truncation_suspected",
         "prompt_tokens",
         "output_tokens",
@@ -794,6 +817,7 @@ def _run_model_for_config(
         variables_for_parse = answer_obj.get("variables")
         if not isinstance(variables_for_parse, list):
             variables_for_parse = None
+        expected_n = _expected_matrix_size(answer_obj)
 
         local_pending: list[dict[str, Any]] = []
         visible_vram_bytes = (
@@ -838,6 +862,7 @@ def _run_model_for_config(
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
             valid = 1 if adj is not None else 0
             format_ok = _format_ok(resp)
+            right_shape = _right_shape(adj, expected_n)
             error_type = "" if valid else _classify_error_type(resp)
             truncation_suspected = _truncation_suspected(
                 resp,
@@ -860,6 +885,7 @@ def _run_model_for_config(
                 "prediction": pred,
                 "valid": valid,
                 "format_ok": format_ok,
+                "right_shape": right_shape,
                 "truncation_suspected": truncation_suspected,
                 "prompt_tokens": prompt_tokens,
                 "output_tokens": output_tokens,

@@ -69,11 +69,13 @@ def _coerce_discrete_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 def _run_pc(df: pd.DataFrame, *, variant: str, ci_test: str, significance_level: float, max_cond_vars: int) -> np.ndarray:
     try:
-        from pgmpy.estimators import PC
-    except Exception as exc:
-        raise SystemExit("PC baseline requires `pgmpy`. Install it with `pip install pgmpy`.") from exc
-    est = PC(df)
-    model = est.estimate(
+        from pgmpy.causal_discovery import PC
+    except ImportError:
+        try:
+            from pgmpy.estimators import PC  # type: ignore[no-redef]
+        except ImportError as exc:
+            raise SystemExit("PC baseline requires `pgmpy`. Install it with `pip install pgmpy`.") from exc
+    est = PC(
         variant=variant,
         ci_test=ci_test,
         return_type="dag",
@@ -81,17 +83,21 @@ def _run_pc(df: pd.DataFrame, *, variant: str, ci_test: str, significance_level:
         max_cond_vars=max_cond_vars,
         show_progress=False,
     )
-    return _adjacency_from_edges(list(df.columns), list(model.edges()))
+    est.fit(df)
+    return _adjacency_from_edges(list(df.columns), list(est.causal_graph_.edges()))
 
 
 def _run_ges(df: pd.DataFrame, *, scoring_method: str, min_improvement: float) -> np.ndarray:
     try:
-        from pgmpy.estimators import GES
-    except Exception as exc:
-        raise SystemExit("GES baseline requires `pgmpy`. Install it with `pip install pgmpy`.") from exc
-    est = GES(df)
-    model = est.estimate(scoring_method=scoring_method, min_improvement=min_improvement, debug=False)
-    return _adjacency_from_edges(list(df.columns), list(model.edges()))
+        from pgmpy.causal_discovery import GES
+    except ImportError:
+        try:
+            from pgmpy.estimators import GES  # type: ignore[no-redef]
+        except ImportError as exc:
+            raise SystemExit("GES baseline requires `pgmpy`. Install it with `pip install pgmpy`.") from exc
+    est = GES(scoring_method=scoring_method, return_type="dag", min_improvement=min_improvement)
+    est.fit(df)
+    return _adjacency_from_edges(list(df.columns), list(est.causal_graph_.edges()))
 
 
 def _prediction_row(
