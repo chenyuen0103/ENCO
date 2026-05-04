@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "description": "Context-window metadata for ENCO experiment models.",
+  "defaults": {
+    "max_new_tokens": 4096,
+    "vllm_dtype": "bf16",
+    "vllm_gpu_mem_util": 0.85
+  },
+  "models": [
+    {
+      "model": "gpt-5-mini",
+      "provider": "openai",
+      "advertised_context_window_tokens": 400000,
+      "advertised_max_output_tokens": 128000,
+      "recommended_max_model_len": 262144,
+      "notes": "OpenAI API model; vLLM settings do not apply."
+    },
+    {
+      "model": "gpt-5.2-pro",
+      "provider": "openai",
+      "advertised_context_window_tokens": 400000,
+      "advertised_max_output_tokens": 128000,
+      "recommended_max_model_len": 262144,
+      "notes": "OpenAI API model; vLLM settings do not apply."
+    },
+    {
+      "model": "Qwen/Qwen3-4B-Thinking-2507",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 262144,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 262144,
+      "notes": "Qwen3 thinking model. The repo sweep has been using 128000 first."
+    },
+    {
+      "model": "meta-llama/Meta-Llama-3.1-8B",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 131072,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 131072,
+      "notes": "Base Llama 3.1 8B."
+    },
+    {
+      "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 131072,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 131072,
+      "notes": "Instruction-tuned Llama 3.1 8B."
+    },
+    {
+      "model": "Qwen/Qwen2.5-14B-Instruct-1M",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 1010000,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 262144,
+      "vllm_env": {
+        "VLLM_ATTENTION_BACKEND": "DUAL_CHUNK_FLASH_ATTN",
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+      },
+      "vllm_flags": [
+        "--vllm-enforce-eager"
+      ],
+      "notes": "Use 262144 as a conservative first rerun target for over-128k matrix prompts."
+    },
+    {
+      "model": "Qwen/Qwen2.5-7B-Instruct-1M",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 1010000,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 262144,
+      "vllm_env": {
+        "VLLM_ATTENTION_BACKEND": "DUAL_CHUNK_FLASH_ATTN",
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+      },
+      "vllm_flags": [
+        "--vllm-enforce-eager"
+      ],
+      "notes": "Use 262144 as a conservative first rerun target for over-128k matrix prompts."
+    },
+    {
+      "model": "meta-llama/Llama-3.1-70B-Instruct",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 131072,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 131072,
+      "recommended_tensor_parallel_size": 2,
+      "notes": "Large model; use GPUs 4,5 with tensor parallel size 2 in the current setup."
+    },
+    {
+      "model": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 262144,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 262144,
+      "recommended_tensor_parallel_size": 2,
+      "notes": "Qwen3 thinking MoE model. The repo sweep has been using 128000 first."
+    },
+    {
+      "model": "Qwen/Qwen2.5-72B-Instruct-AWQ",
+      "provider": "vllm",
+      "advertised_context_window_tokens": 131072,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 131072,
+      "recommended_tensor_parallel_size": 2,
+      "vllm_env": {
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+      },
+      "vllm_flags": [
+        "--vllm-enable-yarn",
+        "--vllm-yarn-factor 4.0",
+        "--vllm-yarn-original-max-position-embeddings 32768"
+      ],
+      "notes": "Model card advertises 131072 context with YaRN. This is not enough for the largest 152k-232k matrix prompts."
+    },
+    {
+      "model": "/home/yuen_chen/ENCO/experiments/checkpoints/qwen3_4b_cd_format_v5_rerun_2gpu/checkpoint-100_merged",
+      "provider": "vllm",
+      "base_model": "Qwen/Qwen3-4B-Thinking-2507",
+      "advertised_context_window_tokens": 262144,
+      "advertised_max_output_tokens": null,
+      "recommended_max_model_len": 262144,
+      "notes": "Local merged checkpoint based on Qwen/Qwen3-4B-Thinking-2507; uses the same context-window policy."
+    }
+  ],
+  "sources": {
+    "openai_model_context": "OpenAI model documentation / model pages",
+    "qwen3_context": "Qwen3 model cards",
+    "qwen2_5_1m_context": "Qwen2.5-1M model cards",
+    "qwen2_5_awq_context": "Qwen2.5 AWQ model cards",
+    "llama3_1_context": "Meta Llama 3.1 model cards"
+  }
+}

@@ -404,6 +404,26 @@ def build_yarn_hf_overrides(
     }
 
 
+def _patch_tokenizer_special_tokens_for_vllm() -> None:
+    """
+    vLLM 0.10.x reads `all_special_tokens_extended` while wrapping tokenizers.
+    Some Qwen2 tokenizer classes in current transformers expose
+    `all_special_tokens` but not that alias. Patch the base class so locally
+    cached/remote tokenizer subclasses inherit it too.
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase  # type: ignore
+    except Exception:
+        return
+    if hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+        return
+
+    def _all_special_tokens_extended(self):
+        return self.all_special_tokens
+
+    PreTrainedTokenizerBase.all_special_tokens_extended = property(_all_special_tokens_extended)  # type: ignore[attr-defined]
+
+
 def build_vllm_engine(
     model_name: str,
     *,
@@ -444,6 +464,7 @@ def build_vllm_engine(
         raise RuntimeError(
             "vLLM is required for provider 'vllm'. Install with: pip install vllm"
         ) from e
+    _patch_tokenizer_special_tokens_for_vllm()
 
     kwargs: Dict[str, Any] = {
         "model": model_name,

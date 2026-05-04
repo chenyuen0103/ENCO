@@ -33,9 +33,9 @@ SMALL_REAL_GRAPHS = [
     ("asia", "causal_graphs/real_data/small_graphs/asia.bif"),
     ("sachs", "causal_graphs/real_data/small_graphs/sachs.bif"),
     ("child", "causal_graphs/real_data/small_graphs/child.bif"),
+    ("alarm", "causal_graphs/real_data/small_graphs/alarm.bif"),
 ]
 LARGE_REAL_GRAPHS = [
-    ("alarm", "causal_graphs/real_data/small_graphs/alarm.bif"),
     ("diabetes", "causal_graphs/real_data/large_graphs/diabetes.bif"),
     ("pigs", "causal_graphs/real_data/large_graphs/pigs.bif"),
 ]

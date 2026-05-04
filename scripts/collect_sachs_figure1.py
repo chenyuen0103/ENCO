@@ -26,7 +26,7 @@ from experiments.evaluate import eval_pair
 OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
 SACHS_BIF = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"
 SACHS_SUMMARY_CSV = REPO_ROOT / "scripts" / "responses" / "sachs" / "sachs_summary.csv"
-DEFAULT_LLM_MODEL = "gpt-5-pro"
+DEFAULT_LLM_MODEL = "gpt-5.2-pro"
 
 
 def _parse_matrix(raw: Any) -> np.ndarray | None:
@@ -76,9 +76,9 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "data_only",
                 "baseline",
                 "anonymized",
-                1000,
+                5000,
                 m,
-                REPO_ROOT / f"experiments/responses/sachs/predictions_obs1000_int{m}_ENCO.csv",
+                REPO_ROOT / f"experiments/responses/sachs/predictions_obs5000_int{m}_ENCO.csv",
             )
         )
     for m in [0, 50, 100, 200]:
@@ -89,7 +89,7 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "mixed_information",
                 "summary",
                 "real",
-                1000,
+                5000,
                 m,
                 SACHS_SUMMARY_CSV,
             )
@@ -101,7 +101,7 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "mixed_information",
                 "summary",
                 "anonymized",
-                1000,
+                5000,
                 m,
                 SACHS_SUMMARY_CSV,
             )
@@ -124,9 +124,9 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "classical_observational",
                 "baseline",
                 "anonymized",
-                1000,
+                5000,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_PC.csv",
+                REPO_ROOT / "experiments/responses/sachs/predictions_obs5000_int0_PC.csv",
             ),
             (
                 "ges_anchor",
@@ -134,9 +134,9 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 "classical_observational",
                 "baseline",
                 "anonymized",
-                1000,
+                5000,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs1000_int0_GES.csv",
+                REPO_ROOT / "experiments/responses/sachs/predictions_obs5000_int0_GES.csv",
             ),
         ]
     )
@@ -283,6 +283,15 @@ def _metric_value(metrics: dict[str, Any], key: str) -> Any:
 
 def _available_models(rows: list[dict[str, Any]]) -> list[str]:
     return sorted({row["model"] for row in rows if row.get("dataset") == "sachs" and row.get("model")})
+
+
+def _format_missing_audit_row(row: dict[str, Any]) -> str:
+    return (
+        f"- {row['line_id']} {row['system']} {row['prompt_style']} {row['naming_regime']} "
+        f"N={row['obs_n']} M={row['int_n']}: valid={row['valid_prediction_rows']}/"
+        f"{row['minimum_required']} rows={row['rows']} exists={row['exists']} "
+        f"source={row['source_csv']}"
+    )
 
 
 def main() -> int:
@@ -561,11 +570,7 @@ def main() -> int:
     if missing:
         readme.append("Missing or under-replicated cells:")
         for row in missing:
-            readme.append(
-                f"- {row['line_id']} {row['system']} {row['prompt_style']} {row['naming_regime']} "
-                f"N={row['obs_n']} M={row['int_n']}: valid={row['valid_prediction_rows']} "
-                f"rows={row['rows']} exists={row['exists']}"
-            )
+            readme.append(_format_missing_audit_row(row))
     else:
         readme.append("All required Figure 1 cells meet the minimum replicate count.")
     readme.extend(["", "## Summary F1", ""])
@@ -580,7 +585,13 @@ def main() -> int:
 
     for path in ["figure1_per_run.csv", "figure1_summary.csv", "figure1_audit.csv", "README.md"]:
         print(out_dir / path)
-    print("ALL_REQUIRED_CELLS_PRESENT" if not missing else "UNDER_REPLICATED")
+    if missing:
+        print("UNDER_REPLICATED")
+        print("Missing or under-replicated cells:")
+        for row in missing:
+            print(_format_missing_audit_row(row))
+    else:
+        print("ALL_REQUIRED_CELLS_PRESENT")
     return 1 if missing and args.strict else 0
 
 
