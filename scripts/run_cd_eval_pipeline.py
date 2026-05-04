@@ -78,6 +78,85 @@ class ResponseMeta:
     give_steps: bool
 
 
+SUMMARY_OUTPUT_COLUMNS = [
+    "model",
+    "config",
+    "valid_rate",
+    "avg_F1",
+    "avg_shd",
+    "acyclic_rate",
+    "anonymize",
+    "append_format_hint",
+    "avg_FN",
+    "avg_FP",
+    "avg_TN",
+    "avg_TP",
+    "avg_accuracy",
+    "avg_accuracy_sd",
+    "avg_accuracy_se",
+    "avg_ancestor_accuracy",
+    "avg_ancestor_f1",
+    "avg_ancestor_precision",
+    "avg_ancestor_recall",
+    "avg_f1",
+    "avg_f1_sd",
+    "avg_f1_se",
+    "avg_orientation_FN",
+    "avg_orientation_TP",
+    "avg_orientation_accuracy",
+    "avg_orientation_eval_pairs",
+    "avg_precision",
+    "avg_precision_sd",
+    "avg_precision_se",
+    "avg_recall",
+    "avg_recall_sd",
+    "avg_recall_se",
+    "avg_shd_sd",
+    "avg_shd_se",
+    "avg_skeleton_accuracy",
+    "avg_skeleton_f1",
+    "avg_skeleton_precision",
+    "avg_skeleton_recall",
+    "avg_vstruct_f1",
+    "avg_vstruct_precision",
+    "avg_vstruct_recall",
+    "col_order",
+    "context_exceeded_any",
+    "context_exceeded_by_error_rows",
+    "context_exceeded_by_tokens_rows",
+    "context_window",
+    "dataset",
+    "evaluated",
+    "format_ok_rows",
+    "format_rate",
+    "format_scored_rows",
+    "give_steps",
+    "int_n",
+    "nhd_ratio_sd",
+    "nhd_sd",
+    "num_pred_edges",
+    "num_pred_edges_sd",
+    "num_pred_edges_se",
+    "num_rows",
+    "obs_n",
+    "parsed_model",
+    "prompt_style",
+    "prompt_tokens_missing_rows",
+    "prompt_tokens_rows",
+    "reasoning_guidance",
+    "response_csv",
+    "row_order",
+    "shuffles_per_graph",
+    "spread_n",
+    "true_num_edges",
+    "valid_rows",
+    "wrapper_mode",
+    "adj_present_rows",
+    "right_shape_rows",
+    "wrong_shape_rows",
+]
+
+
 def _repo_paths() -> tuple[Path, Path]:
     return REPO_ROOT, EXPERIMENTS_DIR
 
@@ -477,6 +556,40 @@ def _prompt_token_stats(csv_path: Path, *, context_window: int) -> dict[str, Any
     stats["context_exceeded_by_tokens_rows"] = int(exceed_tokens)
     stats["context_exceeded_by_error_rows"] = int(exceed_err)
     stats["context_exceeded_any"] = int((exceed_tokens > 0) or (exceed_err > 0))
+    return stats
+
+
+def _shape_validity_stats(csv_path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate response-level adjacency presence and shape-validity flags."""
+    stats: dict[str, Any] = {
+        "adj_present_rows": None,
+        "right_shape_rows": _safe_int(summary.get("valid_rows")),
+        "wrong_shape_rows": None,
+    }
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except Exception:
+        return stats
+
+    if not rows:
+        return stats
+
+    if any("adj_present" in row for row in rows):
+        stats["adj_present_rows"] = sum(1 for row in rows if _safe_int(row.get("adj_present")) == 1)
+    elif any("prediction" in row for row in rows):
+        stats["adj_present_rows"] = sum(1 for row in rows if str(row.get("prediction") or "").strip())
+
+    if any("right_shape" in row for row in rows):
+        stats["right_shape_rows"] = sum(1 for row in rows if _safe_int(row.get("right_shape")) == 1)
+
+    if any("error_type" in row for row in rows):
+        wrong_shape_rows = sum(1 for row in rows if str(row.get("error_type") or "").strip() == "wrong_shape")
+        stats["wrong_shape_rows"] = wrong_shape_rows if wrong_shape_rows > 0 else None
+    if stats["wrong_shape_rows"] is None and stats["adj_present_rows"] is not None and stats["right_shape_rows"] is not None:
+        stats["wrong_shape_rows"] = max(0, int(stats["adj_present_rows"]) - int(stats["right_shape_rows"]))
+
     return stats
 
 
@@ -1115,6 +1228,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         }
         row.update(summary)
         row.update(pt_stats)
+        row.update(_shape_validity_stats(csv_path, summary))
         _add_metric_spread_columns(row)
         _enrich_summary_row(row)
         summary_rows.append(row)
@@ -1153,15 +1267,11 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
         f"full_eval={full_eval_summary_count}"
     )
 
-    summary_csv = summary_dir / f"{args.dataset}_summary.csv"
+    summary_csv = summary_dir / "eval_summary.csv"
     if not dry_run:
         summary_dir.mkdir(parents=True, exist_ok=True)
-        fieldnames = _ordered_fieldnames(
-            summary_rows,
-            ["model", "config", "valid_rate", "avg_F1", "avg_shd"],
-        )
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=SUMMARY_OUTPUT_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             for r in summary_rows:
                 writer.writerow(r)

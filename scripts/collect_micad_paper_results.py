@@ -98,8 +98,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=[Path("experiments/responses_old"), Path("experiments/responses")],
         help=(
-            "Old response roots used only for GPT-5.2-Pro thinktags rows, "
-            "which are preferred when present."
+            "Old response roots used only for supplemental GPT-5.2-Pro thinktags rows. "
+            "Current scripts_eval_summary rows are preferred on ties."
         ),
     )
     parser.add_argument(
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inter", type=int, default=200, help="Primary interventional budget M.")
     parser.add_argument(
         "--dedup-policy",
-        choices=["max-valid", "best-f1", "first"],
+        choices=["max-valid", "best-valid-rate", "best-f1", "first"],
         default="max-valid",
         help="How to choose among duplicate source artifacts for one cell.",
     )
@@ -419,7 +419,6 @@ def load_response_summaries(
     ]
     df = df[keep_cols].copy()
     df = df[df["graph"].isin(GRAPH_ORDER)].copy()
-    df = df[df["mean_f1"].notna()].copy()
     df["method_display"] = df["method"].map(display_method)
     df["is_data_only"] = df["method"].isin(DATA_ONLY_METHODS)
     df["is_llm_model"] = df["method"].isin(MODEL_INFO_BY_METHOD)
@@ -438,7 +437,7 @@ def load_response_summaries(
         df = pd.concat([df, fallback], ignore_index=True, sort=False)
     llm_fallback = load_old_llm_fallbacks(llm_fallback_roots, df)
     if not llm_fallback.empty:
-        print(f"[info] Added {len(llm_fallback)} supplemental/preferred LLM rows from old response roots.")
+        print(f"[info] Added {len(llm_fallback)} supplemental LLM rows from old response roots.")
         df = pd.concat([df, llm_fallback], ignore_index=True, sort=False)
     return df
 
@@ -456,7 +455,6 @@ def load_metrics(path: Path, variant_contains: str | None) -> pd.DataFrame:
     for col in ["obs", "inter", "mean_f1", "mean_shd", "std_f1", "std_shd", "valid_rows", "n_rows"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df[df["mean_f1"].notna()].copy()
     df["condition"] = df["condition"].fillna(df.apply(infer_condition, axis=1))
     df["method_display"] = df["method"].map(display_method)
     df["is_data_only"] = df["method"].isin(DATA_ONLY_METHODS)
@@ -502,7 +500,7 @@ def source_priority(source_kind: object) -> int:
     if source == "old_baseline_summary":
         return 2
     if source == "preferred_old_llm_thinktags":
-        return 4
+        return 1
     if source == "old_llm_summary":
         return 1
     return 0
@@ -513,36 +511,42 @@ def canonicalize(df: pd.DataFrame, dedup_policy: str) -> pd.DataFrame:
     df["_source_priority"] = df.get("source_kind", "").map(source_priority)
     df["_valid_rows"] = df.get("valid_rows", 0).fillna(0)
     df["_n_rows"] = df.get("n_rows", 0).fillna(0)
+    df["_valid_rate"] = np.where(df["_n_rows"] > 0, df["_valid_rows"] / df["_n_rows"], np.nan)
     df["_path"] = df.get("path", "").fillna("").astype(str)
-    df["_preferred_old_thinktags"] = (
-        df.get("method", "").eq("gpt-5.2-pro")
-        & df.get("source_kind", "").eq("preferred_old_llm_thinktags")
-        & df.get("variant", "").fillna("").astype(str).str.contains("thinktags", case=False, na=False)
-    ).astype(int)
 
     group_cols = ["graph", "method", "obs", "inter", "condition"]
     rows = []
     for _, sub in df.groupby(group_cols, dropna=False, sort=False):
         if dedup_policy == "best-f1":
             chosen = sub.sort_values(
-                ["_preferred_old_thinktags", "mean_f1", "_valid_rows", "_source_priority", "_n_rows", "_path"],
+                ["mean_f1", "_valid_rows", "_source_priority", "_n_rows", "_path"],
+                ascending=[False, False, False, False, True],
+            ).iloc[0]
+        elif dedup_policy == "best-valid-rate":
+            chosen = sub.sort_values(
+                [
+                    "_valid_rate",
+                    "_valid_rows",
+                    "_source_priority",
+                    "mean_f1",
+                    "_n_rows",
+                    "_path",
+                ],
                 ascending=[False, False, False, False, False, True],
+                na_position="last",
             ).iloc[0]
         elif dedup_policy == "first":
-            chosen = sub.sort_values(
-                ["_preferred_old_thinktags", "_path"],
-                ascending=[False, True],
-            ).iloc[0]
+            chosen = sub.sort_values("_path").iloc[0]
         else:
             chosen = sub.sort_values(
-                ["_preferred_old_thinktags", "_valid_rows", "_source_priority", "_n_rows", "mean_f1", "_path"],
-                ascending=[False, False, False, False, False, True],
+                ["_valid_rows", "_source_priority", "_n_rows", "mean_f1", "_path"],
+                ascending=[False, False, False, False, True],
             ).iloc[0]
         rows.append(chosen)
     out = pd.DataFrame(rows).drop(
         columns=[
             c
-            for c in ["_source_priority", "_valid_rows", "_n_rows", "_path", "_preferred_old_thinktags"]
+            for c in ["_source_priority", "_valid_rows", "_n_rows", "_valid_rate", "_path"]
             if c in df
         ]
     )
@@ -749,6 +753,36 @@ def collect_classical_baselines(df: pd.DataFrame) -> pd.DataFrame:
     return rows.sort_values(["graph", "obs", "inter", "method"])
 
 
+def collect_selected_configs(canonical: pd.DataFrame) -> pd.DataFrame:
+    rows = canonical.copy()
+    rows["valid_rate"] = np.where(
+        pd.to_numeric(rows["n_rows"], errors="coerce").fillna(0) > 0,
+        pd.to_numeric(rows["valid_rows"], errors="coerce") / pd.to_numeric(rows["n_rows"], errors="coerce"),
+        np.nan,
+    )
+    cols = [
+        "graph",
+        "method",
+        "method_display",
+        "obs",
+        "inter",
+        "condition",
+        "semantic",
+        "format",
+        "valid_rows",
+        "n_rows",
+        "valid_rate",
+        "mean_f1",
+        "mean_shd",
+        "source_kind",
+        "variant",
+        "path",
+    ]
+    return rows[[col for col in cols if col in rows.columns]].sort_values(
+        ["graph", "method_display", "obs", "inter", "condition"]
+    )
+
+
 def write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -890,8 +924,10 @@ def main() -> None:
     contrasts = collect_contrast_metrics(cross, canonical, args.obs, args.inter)
     size_ladder = collect_model_size_ladder(cross, args.graph)
     classical = collect_classical_baselines(canonical)
+    selected_configs = collect_selected_configs(canonical)
 
     write_csv(canonical, args.out_dir / "canonical_condition_results.csv")
+    write_csv(selected_configs, args.out_dir / "paper_selected_configs.csv")
     write_csv(cross, args.out_dir / "paper_cross_graph_evidence_ladder.csv")
     write_csv(anon_cross, args.out_dir / "paper_cross_graph_evidence_ladder_anonymized.csv")
     write_csv(ladder, args.out_dir / "paper_headline_evidence_ladder.csv")
@@ -907,7 +943,7 @@ def main() -> None:
             {"key": "input", "value": input_source},
             {"key": "baseline_fallback_roots", "value": ", ".join(str(p) for p in args.baseline_fallback_roots)},
             {"key": "llm_fallback_roots", "value": ", ".join(str(p) for p in args.llm_fallback_roots)},
-            {"key": "preferred_old_thinktags_methods", "value": "gpt-5.2-pro"},
+            {"key": "old_thinktags_preferred", "value": "false"},
             {"key": "graph", "value": args.graph},
             {"key": "obs", "value": args.obs},
             {"key": "inter", "value": args.inter},

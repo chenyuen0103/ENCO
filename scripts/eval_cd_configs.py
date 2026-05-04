@@ -760,6 +760,10 @@ def _run_model_for_config(
 ) -> None:
     out_path = _default_response_path(responses_root, dataset, base_name + ".csv", model)
     completed, existing_rows = _load_completed(out_path, overwrite)
+    variables_for_parse = answer_obj.get("variables")
+    if not isinstance(variables_for_parse, list):
+        variables_for_parse = None
+    expected_n = len(variables_for_parse) if variables_for_parse is not None else None
 
     fieldnames = [
         "data_idx",
@@ -768,8 +772,10 @@ def _run_model_for_config(
         "given_edges",
         "raw_response",
         "prediction",
+        "adj_present",
         "valid",
         "format_ok",
+        "right_shape",
         "truncation_suspected",
         "prompt_tokens",
         "output_tokens",
@@ -777,11 +783,41 @@ def _run_model_for_config(
         "error_type",
     ]
 
+    def _normalize_validity_for_shape(row: dict[str, Any]) -> dict[str, Any]:
+        adj = None
+        prediction = str(row.get("prediction") or "").strip()
+        if prediction:
+            try:
+                parsed = json.loads(prediction)
+                if isinstance(parsed, list):
+                    adj = parsed
+            except Exception:
+                adj = None
+        if adj is None:
+            adj_arr = _extract_adjacency_from_response(str(row.get("raw_response") or ""), fallback_variables=variables_for_parse)
+            if adj_arr is not None:
+                adj = adj_arr.tolist()
+
+        adj_present = 1 if adj is not None else 0
+        right_shape = 0
+        if adj is not None and expected_n is not None and len(adj) == expected_n:
+            right_shape = int(all(isinstance(r, list) and len(r) == expected_n for r in adj))
+        row["adj_present"] = adj_present
+        row["right_shape"] = right_shape
+        row["valid"] = 1 if adj_present and right_shape else 0
+        if not row["valid"] and adj is not None:
+            row["error_type"] = "wrong_shape"
+        elif not row["valid"] and not row.get("error_type"):
+            row["error_type"] = _classify_error_type(str(row.get("raw_response") or ""))
+        elif row["valid"]:
+            row["error_type"] = ""
+        return row
+
     with out_path.open("w", encoding="utf-8", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in existing_rows:
-            writer.writerow(row)
+            writer.writerow(_normalize_validity_for_shape(row))
 
         wrote = 0
         skipped = 0
@@ -791,10 +827,6 @@ def _run_model_for_config(
             file=sys.stderr,
             flush=True,
         )
-        variables_for_parse = answer_obj.get("variables")
-        if not isinstance(variables_for_parse, list):
-            variables_for_parse = None
-
         local_pending: list[dict[str, Any]] = []
         visible_vram_bytes = (
             _visible_vram_bytes()
@@ -836,9 +868,17 @@ def _run_model_for_config(
             answer_text = _extract_answer_text(resp)
             adj = _extract_adjacency_from_response(resp, fallback_variables=variables_for_parse)
             pred = json.dumps(adj.tolist(), ensure_ascii=False) if adj is not None else ""
-            valid = 1 if adj is not None else 0
+            adj_present = 1 if adj is not None else 0
+            right_shape = (
+                1
+                if adj is not None
+                and expected_n is not None
+                and tuple(adj.shape) == (expected_n, expected_n)
+                else 0
+            )
+            valid = 1 if adj_present and right_shape else 0
             format_ok = _format_ok(resp)
-            error_type = "" if valid else _classify_error_type(resp)
+            error_type = "" if valid else ("wrong_shape" if adj is not None else _classify_error_type(resp))
             truncation_suspected = _truncation_suspected(
                 resp,
                 output_tokens=output_tokens,
@@ -858,8 +898,10 @@ def _run_model_for_config(
                 "given_edges": row.get("given_edges"),
                 "raw_response": resp,
                 "prediction": pred,
+                "adj_present": adj_present,
                 "valid": valid,
                 "format_ok": format_ok,
+                "right_shape": right_shape,
                 "truncation_suspected": truncation_suspected,
                 "prompt_tokens": prompt_tokens,
                 "output_tokens": output_tokens,

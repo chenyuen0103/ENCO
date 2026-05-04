@@ -14,6 +14,7 @@ set aimed at a top-tier benchmark paper:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 from pathlib import Path
 from typing import Iterable
@@ -88,9 +89,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--graph",
-        default="sachs",
+        default=None,
         choices=GRAPH_ORDER,
-        help="Primary graph used when --graphs is not provided. Kept for backward compatibility.",
+        help="Single graph to plot. Defaults to all available reference graphs.",
     )
     parser.add_argument(
         "--graphs",
@@ -121,7 +122,12 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_graphs(args: argparse.Namespace, available_graphs: Iterable[str]) -> list[str]:
     available = set(available_graphs)
-    requested = args.graphs if args.graphs is not None and len(args.graphs) > 0 else [args.graph]
+    if args.graphs is not None and len(args.graphs) > 0:
+        requested = args.graphs
+    elif args.graph is not None:
+        requested = [args.graph]
+    else:
+        requested = ["all"]
     if len(requested) == 1 and requested[0].lower() == "all":
         return [graph for graph in GRAPH_ORDER if graph in available]
 
@@ -188,12 +194,63 @@ def _stem(base: str, graph: str, *, legacy: bool) -> str:
     return base if legacy else f"{base}_{graph}"
 
 
+def expand_model_patterns(models: list[str], requested: list[str]) -> list[str]:
+    selected: list[str] = []
+    unmatched: list[str] = []
+    for token in requested:
+        patterns = [part.strip() for part in str(token).split(",") if part.strip()]
+        for pattern in patterns:
+            matches = [model for model in models if fnmatch.fnmatchcase(model, pattern)]
+            if not matches:
+                unmatched.append(pattern)
+                continue
+            for match in matches:
+                if match not in selected:
+                    selected.append(match)
+    if unmatched:
+        print(f"[warn] No models matched requested pattern(s): {', '.join(unmatched)}")
+    return selected
+
+
 def available_models(df: pd.DataFrame, requested: list[str] | None = None) -> list[str]:
     models = [str(model) for model in df["model"].dropna().unique()]
     if not requested:
         return models
-    requested_set = set(requested)
-    return [model for model in models if model in requested_set]
+    return expand_model_patterns(models, requested)
+
+
+def drop_models_without_valid_responses(
+    plot_df: pd.DataFrame,
+    selected_models: list[str],
+    condition_columns: list[str],
+    *,
+    graph: str,
+    figure_label: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Drop models with no valid parsed runs in any displayed condition."""
+    valid_cols = [
+        CONDITION_VALID_COLUMNS[cond]
+        for cond in condition_columns
+        if CONDITION_VALID_COLUMNS.get(cond) in plot_df.columns
+    ]
+    if valid_cols:
+        valid = plot_df[valid_cols].apply(pd.to_numeric, errors="coerce")
+        keep = valid.gt(0).any(axis=1)
+    else:
+        values = plot_df[condition_columns].apply(pd.to_numeric, errors="coerce")
+        keep = np.isfinite(values.to_numpy(dtype=float)).any(axis=1)
+
+    dropped = plot_df.loc[~keep, "model"].dropna().astype(str).tolist()
+    if dropped:
+        print(
+            f"[info] Dropping {len(dropped)} model(s) from {figure_label} "
+            f"for graph={graph} with no valid responses in displayed bars: "
+            + ", ".join(dropped)
+        )
+
+    filtered = plot_df.loc[keep].copy()
+    kept = set(filtered["model"].dropna().astype(str))
+    return filtered, [model for model in selected_models if model in kept]
 
 
 def plot_decisive_evidence_ladder(
@@ -209,17 +266,6 @@ def plot_decisive_evidence_ladder(
     graph_df = headline[headline["graph"].eq(graph)].copy() if "graph" in headline.columns else headline.copy()
     lead_models = available_models(graph_df, lead_models)
     plot_df = graph_df[graph_df["model"].isin(lead_models)].copy()
-    plot_df["model"] = pd.Categorical(plot_df["model"], categories=lead_models, ordered=True)
-    plot_df = plot_df.sort_values("model")
-    if plot_df.empty:
-        print(f"[warn] No evidence-ladder rows available for graph={graph}; skipping.")
-        return
-
-    x = np.arange(len(plot_df))
-    width = 0.26 if anonymized else 0.22
-    fig_width = max(7.2, 0.62 * len(plot_df) + 1.8)
-    fig, ax = plt.subplots(figsize=(fig_width, 3.0))
-    any_low_valid = False
     semantic = "anon" if anonymized else "real"
     condition_columns = (
         [f"{semantic}_summary_f1", f"{semantic}_matrix_f1"]
@@ -229,6 +275,25 @@ def plot_decisive_evidence_ladder(
     missing = [col for col in condition_columns if col not in plot_df.columns]
     if missing:
         raise ValueError(f"Evidence-ladder table missing required columns for Figure 1: {missing}")
+    plot_df, lead_models = drop_models_without_valid_responses(
+        plot_df,
+        lead_models,
+        condition_columns,
+        graph=graph,
+        figure_label="Figure 1" + (" anonymized" if anonymized else ""),
+    )
+    plot_df["model"] = pd.Categorical(plot_df["model"], categories=lead_models, ordered=True)
+    plot_df = plot_df.sort_values("model")
+    if plot_df.empty:
+        suffix = " anonymized" if anonymized else ""
+        print(f"[warn] No evidence-ladder{suffix} rows with valid responses available for graph={graph}; skipping.")
+        return
+
+    x = np.arange(len(plot_df))
+    width = 0.26 if anonymized else 0.22
+    fig_width = max(7.2, 0.62 * len(plot_df) + 1.8)
+    fig, ax = plt.subplots(figsize=(fig_width, 3.0))
+    any_low_valid = False
     for idx, cond in enumerate(condition_columns):
         offset = (idx - (len(condition_columns) - 1) / 2) * width
         vals = plot_df[cond].map(finite_or_nan).to_numpy()
@@ -510,64 +575,87 @@ def plot_contrast_bars(
     plt.close(fig)
 
 
-def best_cross_graph_model(cross: pd.DataFrame, preferred: list[str] | None) -> str:
-    preferred = preferred or []
-    score = {}
-    cols = ["names_only_f1", "real_summary_f1", "real_matrix_f1", "best_data_only_f1"]
-    for model, sub in cross.groupby("model"):
-        graph_count = sub[sub[cols].notna().any(axis=1)]["graph"].nunique()
-        cell_count = int(sub[cols].notna().sum().sum())
-        preference = len(preferred) - preferred.index(model) if model in preferred else 0
-        score[model] = (graph_count, cell_count, preference)
-    if not score:
-        raise ValueError("No models found in cross-graph data.")
-    return max(score, key=score.get)
-
-
-def plot_cross_graph_profiles(
+def plot_graph_model_profiles(
     cross: pd.DataFrame,
     out_dir: Path,
     formats: list[str],
-    model: str,
-    graphs: list[str],
+    graph: str,
+    selected_models: list[str] | None,
     *,
+    legacy_stem: bool,
     anonymized: bool = False,
 ) -> None:
-    sub = cross[cross.model.eq(model)].copy()
+    sub = cross[cross.graph.eq(graph)].copy()
     if sub.empty:
-        raise ValueError(f"No cross-graph rows found for model {model!r}")
+        print(f"[warn] No Figure 4 rows available for graph={graph}; skipping.")
+        return
+    selected_models = available_models(sub, selected_models)
+    sub = sub[sub["model"].isin(selected_models)].copy()
     semantic = "anon" if anonymized else "real"
-    cols = ["names_only_f1", f"{semantic}_summary_f1", f"{semantic}_matrix_f1", "best_data_only_f1"]
-    labels = ["Names", "Anon. summary" if anonymized else "Summary", "Anon. matrix" if anonymized else "Matrix", "Classical"]
+    cols = ["names_only_f1", f"{semantic}_summary_f1", f"{semantic}_matrix_f1"]
+    labels = ["Names", "Anon. summary" if anonymized else "Summary", "Anon. matrix" if anonymized else "Matrix"]
     missing = [col for col in cols if col not in sub.columns]
     if missing:
         raise ValueError(f"Cross-graph table missing required columns for Figure 4: {missing}")
-    pivot = sub.set_index("graph").reindex(graphs)[cols]
+    sub, selected_models = drop_models_without_valid_responses(
+        sub,
+        selected_models,
+        cols,
+        graph=graph,
+        figure_label="Figure 4" + (" anonymized" if anonymized else ""),
+    )
+    if sub.empty:
+        suffix = " anonymized" if anonymized else ""
+        print(f"[warn] No Figure 4{suffix} rows with valid responses available for graph={graph}; skipping.")
+        return
+    pivot = sub.set_index("model").reindex(selected_models)[cols]
     mat = pivot.to_numpy(dtype=float)
     if not np.isfinite(mat).any():
         suffix = " anonymized" if anonymized else ""
-        print(f"[warn] No Figure 4{suffix} values available for model={model}; skipping.")
+        print(f"[warn] No Figure 4{suffix} values available for graph={graph}; skipping.")
         return
 
-    fig, ax = plt.subplots(figsize=(5.8, 3.0))
+    models = [model for model in selected_models if model in pivot.index and np.isfinite(pivot.loc[model].to_numpy(dtype=float)).any()]
+    fig_height = 3.5 if len(models) <= 10 else 3.9
+    fig, ax = plt.subplots(figsize=(6.7, fig_height))
     x = np.arange(len(cols))
-    palette = ["#4e79a7", "#59a14f", "#f28e2b", "#b07aa1"]
-    for graph, color in zip(graphs, palette):
-        vals = pivot.loc[graph].to_numpy(dtype=float)
+    palette = plt.get_cmap("tab10")
+    for idx, model in enumerate(models):
+        vals = pivot.loc[model].to_numpy(dtype=float)
         if not np.isfinite(vals).any():
             continue
-        ax.plot(x, vals, marker="o", linewidth=1.4, markersize=4.0, color=color, label=graph.capitalize())
-        for xpos, val in zip(x, vals):
-            if np.isfinite(val):
-                ax.text(xpos, val + 0.025, f"{val:.2f}", ha="center", va="bottom", fontsize=6.7, color=color)
+        ax.plot(
+            x,
+            vals,
+            marker="o",
+            linewidth=1.35,
+            markersize=4.0,
+            color=palette(idx % 10),
+            alpha=0.94,
+            label=model,
+        )
 
     ax.set_xticks(x, labels)
     ax.set_ylim(0, 1.08)
     ax.set_ylabel("Directed-edge F1")
-    ax.set_title(f"{model} ({'anonymized' if anonymized else 'real names'})", fontsize=9, pad=4)
-    ax.grid(axis="y", alpha=0.18, linewidth=0.6)
-    ax.legend(frameon=False, ncol=2, fontsize=7, loc="lower left", bbox_to_anchor=(0.0, 1.01))
-    stem = "fig4_cross_graph_matched_controls_anonymized" if anonymized else "fig4_cross_graph_matched_controls"
+    ax.set_title(f"{graph.capitalize()}: model evidence-use profiles" + (" (anonymized)" if anonymized else ""), fontsize=9, pad=5)
+    ax.grid(axis="y", alpha=0.20, linewidth=0.55)
+    ax.spines["left"].set_visible(False)
+    ax.tick_params(axis="x", labelsize=8)
+    ax.tick_params(axis="y", labelsize=7.5, length=0)
+    ax.legend(
+        frameon=False,
+        ncol=2,
+        fontsize=6.5,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.02),
+        borderaxespad=0,
+        handlelength=1.6,
+    )
+    fig.subplots_adjust(left=0.10, right=0.66, bottom=0.16, top=0.88)
+    stem = _stem("fig4_cross_graph_matched_controls", graph, legacy=legacy_stem)
+    if anonymized:
+        stem = f"{stem}_anonymized"
     save_figure(fig, out_dir, stem, formats)
     plt.close(fig)
 
@@ -607,14 +695,14 @@ def write_latex_includes(out_dir: Path) -> None:
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.95\linewidth]{experiments/out/micad_paper/figures/fig4_cross_graph_matched_controls.pdf}
-  \caption{Optional appendix coverage profile for one representative model. Each line holds a graph fixed and traces performance as the exposed information changes from names-only to data-bearing prompts and the classical reference. Sparse entries indicate cells that should be completed before using this as a main-paper cross-graph claim.}
+  \caption{Optional appendix evidence-use profile on one graph. Each line is a model, and the x-axis traces the exposed information from names-only to summary statistics to raw matrix rows. Sparse line segments indicate missing matched cells.}
   \label{fig:cross_graph_matched_controls}
 \end{figure}
 
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.95\linewidth]{experiments/out/micad_paper/figures/fig4_cross_graph_matched_controls_anonymized.pdf}
-  \caption{Anonymized companion to the cross-graph coverage profile. The data-bearing points use anonymized summaries and matrices while preserving the names-only and classical reference points.}
+  \caption{Anonymized companion to the evidence-use profile. Each line is a model; the data-bearing points use anonymized summaries and matrices while preserving the names-only reference point.}
   \label{fig:cross_graph_matched_controls_anonymized}
 \end{figure}
 """
@@ -673,10 +761,24 @@ def main() -> None:
             contrast_models,
             legacy_stem=legacy_stem,
         )
+        plot_graph_model_profiles(
+            cross,
+            out_dir,
+            args.formats,
+            graph,
+            args.lead_models,
+            legacy_stem=legacy_stem,
+        )
+        plot_graph_model_profiles(
+            cross,
+            out_dir,
+            args.formats,
+            graph,
+            args.lead_models,
+            legacy_stem=legacy_stem,
+            anonymized=True,
+        )
 
-    cross_model = best_cross_graph_model(cross, args.lead_models)
-    plot_cross_graph_profiles(cross, out_dir, args.formats, model=cross_model, graphs=graphs)
-    plot_cross_graph_profiles(cross, out_dir, args.formats, model=cross_model, graphs=graphs, anonymized=True)
     write_latex_includes(out_dir)
 
 
