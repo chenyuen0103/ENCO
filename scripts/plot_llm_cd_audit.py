@@ -270,9 +270,9 @@ def plot(methods: list[MethodRow],
 
     fig_h = max(2.35, 0.34 * n + 1.0)
     fig, axes = plt.subplots(1, 2, figsize=(FIG_WIDTH, fig_h), sharey=True)
-    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.84, bottom=0.30)
+    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.82, bottom=0.30)
     if title:
-        fig.suptitle(title, x=0.58, y=1.04, fontsize=BASE_FONT + 0.8, fontweight="bold")
+        fig.suptitle(title, x=0.58, y=0.95, fontsize=BASE_FONT + 0.8, fontweight="bold")
 
     panels = [
         ("F1",  [m.f1  for m in methods], f1_refs,  None, True),
@@ -360,7 +360,7 @@ def plot(methods: list[MethodRow],
     fig.legend(handles=legend_handles, loc="upper center",
                ncol=5, frameon=False, columnspacing=0.8,
                handlelength=1.6, handletextpad=0.4,
-               bbox_to_anchor=(0.58, 0.94))
+               bbox_to_anchor=(0.58, 0.90))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -385,7 +385,7 @@ def main() -> int:
     parser.add_argument("--formats",  nargs="+", default=["pdf", "png"],
                         choices=["pdf", "png", "svg"])
     parser.add_argument("--title", default=None,
-                        help="Figure title (default: Sachs LLM-CD audit at obs={obs})")
+                        help='Figure title (default: "LLM-based CD on Sachs")')
     args = parser.parse_args()
 
     basename = args.basename or f"llm_cd_audit_obs{args.obs}"
@@ -395,7 +395,7 @@ def main() -> int:
                    out_dir=args.out_dir,
                    basename=basename,
                    formats=args.formats,
-                   title=args.title or f"Sachs LLM-CD audit at obs={args.obs}")
+                   title=args.title or "LLM-based CD on Sachs")
     for p in written:
         print(p)
     return 0
