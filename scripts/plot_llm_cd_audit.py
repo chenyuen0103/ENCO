@@ -270,9 +270,9 @@ def plot(methods: list[MethodRow],
 
     fig_h = max(2.35, 0.34 * n + 1.0)
     fig, axes = plt.subplots(1, 2, figsize=(FIG_WIDTH, fig_h), sharey=True)
-    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.78, bottom=0.30)
+    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.84, bottom=0.30)
     if title:
-        fig.suptitle(title, x=0.58, y=1.08, fontsize=BASE_FONT + 0.8, fontweight="bold")
+        fig.suptitle(title, x=0.58, y=1.04, fontsize=BASE_FONT + 0.8, fontweight="bold")
 
     panels = [
         ("F1",  [m.f1  for m in methods], f1_refs,  None, True),
@@ -342,8 +342,8 @@ def plot(methods: list[MethodRow],
 
     # ── legend ────────────────────────────────────────────────────────────────
     legend_handles = [
-        Line2D([0], [0], color=COL_LLM,     marker="o", markersize=4.8, linewidth=0,
-               label="LLM-CD"),
+        # Line2D([0], [0], color=COL_LLM,     marker="o", markersize=4.8, linewidth=0,
+        #        label="LLM-CD"),
         Line2D([0], [0], color=COL_SEMANTIC, marker="o", markersize=4.8, linewidth=0,
                label="Semantic-only"),
         Line2D([0], [0], color=ref_styles["PC"]["color"],
@@ -360,7 +360,7 @@ def plot(methods: list[MethodRow],
     fig.legend(handles=legend_handles, loc="upper center",
                ncol=5, frameon=False, columnspacing=0.8,
                handlelength=1.6, handletextpad=0.4,
-               bbox_to_anchor=(0.58, 0.99))
+               bbox_to_anchor=(0.58, 0.94))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
