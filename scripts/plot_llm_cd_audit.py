@@ -33,16 +33,25 @@ FIG_WIDTH = 5.5
 BASE_FONT = 7.5
 
 # ── display labels ────────────────────────────────────────────────────────────
-DISPLAY = {
-    "JiralerspongBFS":      "BFS (Jiralerspong et al. (2023))",
-    "JiralerspongPairwise": "Pairwise (Long et al. (2022))",
-    "TakayamaSCP":          "SCP (Takayama et al. (2023))",
-    # "CausalLLMData":        "CausalLLM + Data (Roy et al. (2024))",
-    "CausalLLMTrainableData": "CausalLLM + Data (Roy et al. (2024))",
-    # "CausalLLMDataNeural":  "CausalLLM  + Data (Roy et al. (2024))",
-    "CausalLLMPrompt":      "CausalLLM (Roy et al. (2024))",
-}
+# DISPLAY = {
+#     "JiralerspongBFS":      "BFS (Jiralerspong et al. (2023))",
+#     "JiralerspongPairwise": "Pairwise (Long et al. (2022))",
+#     "TakayamaSCP":          "SCP (Takayama et al. (2023))",
+#     # "CausalLLMData":        "CausalLLM + Data (Roy et al. (2024))",
+#     "CausalLLMTrainableData": "CausalLLM + Data (Roy et al. (2024))",
+#     # "CausalLLMDataNeural":  "CausalLLM  + Data (Roy et al. (2024))",
+#     "CausalLLMPrompt":      "CausalLLM (Roy et al. (2024))",
+# }
 
+DISPLAY = {
+    "JiralerspongBFS":      "BFS",
+    "JiralerspongPairwise": "Pairwise",
+    "TakayamaSCP":          "SCP",
+    # "CausalLLMData":        "CausalLLM + Data (Roy et al. (2024))",
+    "CausalLLMTrainableData": "CausalLLM + Data",
+    # "CausalLLMDataNeural":  "CausalLLM  + Data (Roy et al. (2024))",
+    "CausalLLMPrompt":      "CausalLLM",
+}
 
 # ── colours (consistent with existing paper figures) ─────────────────────────
 COL_LLM      = "#0072B2"   # blue  – LLM-CD methods
@@ -225,7 +234,8 @@ def plot(methods: list[MethodRow],
          obs: int,
          out_dir: Path,
          basename: str,
-         formats: list[str]) -> list[Path]:
+         formats: list[str],
+         title: str | None) -> list[Path]:
 
     _configure_matplotlib()
     import matplotlib.pyplot as plt
@@ -260,7 +270,9 @@ def plot(methods: list[MethodRow],
 
     fig_h = max(2.35, 0.34 * n + 1.0)
     fig, axes = plt.subplots(1, 2, figsize=(FIG_WIDTH, fig_h), sharey=True)
-    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.84, bottom=0.30)
+    fig.subplots_adjust(left=0.24, right=0.99, wspace=0.08, top=0.78, bottom=0.30)
+    if title:
+        fig.suptitle(title, x=0.58, y=1.08, fontsize=BASE_FONT + 0.8, fontweight="bold")
 
     panels = [
         ("F1",  [m.f1  for m in methods], f1_refs,  None, True),
@@ -348,7 +360,7 @@ def plot(methods: list[MethodRow],
     fig.legend(handles=legend_handles, loc="upper center",
                ncol=5, frameon=False, columnspacing=0.8,
                handlelength=1.6, handletextpad=0.4,
-               bbox_to_anchor=(0.58, 0.995))
+               bbox_to_anchor=(0.58, 0.99))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -372,6 +384,8 @@ def main() -> int:
                         help="Output file stem (default: llm_cd_audit_obs{obs})")
     parser.add_argument("--formats",  nargs="+", default=["pdf", "png"],
                         choices=["pdf", "png", "svg"])
+    parser.add_argument("--title", default=None,
+                        help="Figure title (default: Sachs LLM-CD audit at obs={obs})")
     args = parser.parse_args()
 
     basename = args.basename or f"llm_cd_audit_obs{args.obs}"
@@ -380,7 +394,8 @@ def main() -> int:
                    obs=args.obs,
                    out_dir=args.out_dir,
                    basename=basename,
-                   formats=args.formats)
+                   formats=args.formats,
+                   title=args.title or f"Sachs LLM-CD audit at obs={args.obs}")
     for p in written:
         print(p)
     return 0
