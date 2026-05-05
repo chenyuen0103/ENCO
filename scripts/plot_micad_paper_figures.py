@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -28,7 +29,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 GRAPH_ORDER = ["cancer", "earthquake", "asia", "sachs"]
+SEMANTIC_SCALING_GRAPHS = ["cancer", "asia", "sachs", "child", "alarm"]
+SEMANTIC_SCALING_LABELS = {
+    "cancer": "Cancer",
+    "asia": "Asia",
+    "sachs": "Sachs",
+    "child": "Child",
+    "alarm": "Alarm",
+}
 CONDITION_COLUMNS = ["names_only_f1", "real_summary_f1", "real_matrix_f1"]
 CONDITION_ERROR_COLUMNS = {
     "names_only_f1": "names_only_f1_se",
@@ -669,6 +679,201 @@ def plot_graph_model_profiles(
     plt.close(fig)
 
 
+def _node_count_from_bif(graph: str) -> float:
+    bif_path = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / f"{graph}.bif"
+    if not bif_path.exists():
+        return np.nan
+    text = bif_path.read_text(encoding="utf-8", errors="ignore")
+    return float(len(re.findall(r"^\s*variable\s+([^\s{]+)", text, flags=re.M)))
+
+
+def _gpt52_names_only_from_eval_summary(graph: str) -> dict[str, object] | None:
+    candidates = [
+        REPO_ROOT / "experiments" / "responses" / graph / "eval_summary.csv",
+        REPO_ROOT / "scripts" / "responses" / graph / "eval_summary.csv",
+        REPO_ROOT / "responses" / graph / "eval_summary.csv",
+    ]
+    rows: list[dict[str, object]] = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            print(f"[warn] Could not read {path}: {exc}")
+            continue
+        if "model" not in df.columns:
+            continue
+        model_mask = df["model"].astype(str).str.lower().eq("gpt-5.2-pro")
+        if "prompt_style" in df.columns:
+            names_mask = df["prompt_style"].astype(str).eq("names_only")
+        elif "is_names_only" in df.columns:
+            names_mask = pd.to_numeric(df["is_names_only"], errors="coerce").fillna(0).astype(int).eq(1)
+        else:
+            names_mask = pd.Series(False, index=df.index)
+        sub = df.loc[model_mask & names_mask].copy()
+        if sub.empty:
+            continue
+        for _, row in sub.iterrows():
+            f1 = finite_or_nan(row.get("avg_f1", row.get("avg_F1", np.nan)))
+            if not np.isfinite(f1):
+                continue
+            rows.append(
+                {
+                    "graph": graph,
+                    "nodes": _node_count_from_bif(graph),
+                    "f1": f1,
+                    "se": finite_or_nan(row.get("avg_f1_se", 0.0)),
+                    "valid": finite_or_nan(row.get("valid_rows", np.nan)),
+                    "n": finite_or_nan(row.get("num_rows", np.nan)),
+                    "source": str(path),
+                }
+            )
+    if not rows:
+        return None
+    # Prefer summaries with explicit SE/valid-rate metadata, then higher valid count.
+    rows.sort(
+        key=lambda r: (
+            np.isfinite(float(r["se"])),
+            np.isfinite(float(r["valid"])),
+            float(r["valid"]) if np.isfinite(float(r["valid"])) else -1.0,
+        ),
+        reverse=True,
+    )
+    return rows[0]
+
+
+def collect_gpt52_names_only_scaling(cross: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for graph in SEMANTIC_SCALING_GRAPHS:
+        row: dict[str, object] | None = None
+        if {"graph", "method", "names_only_f1"}.issubset(cross.columns):
+            sub = cross[
+                cross["graph"].astype(str).eq(graph)
+                & cross["method"].astype(str).str.lower().eq("gpt-5.2-pro")
+            ]
+            if not sub.empty:
+                src = sub.iloc[0]
+                f1 = finite_or_nan(src.get("names_only_f1", np.nan))
+                if np.isfinite(f1):
+                    row = {
+                        "graph": graph,
+                        "nodes": _node_count_from_bif(graph),
+                        "f1": f1,
+                        "se": finite_or_nan(src.get("names_only_f1_se", 0.0)),
+                        "valid": finite_or_nan(src.get("names_only_valid_rows", np.nan)),
+                        "n": finite_or_nan(src.get("names_only_n_rows", np.nan)),
+                        "source": "paper_cross_graph_evidence_ladder.csv",
+                    }
+        if row is None:
+            row = _gpt52_names_only_from_eval_summary(graph)
+        if row is None:
+            print(f"[warn] Missing GPT-5.2 Pro names-only result for graph={graph}; omitting from scaling figure.")
+            continue
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("nodes").reset_index(drop=True)
+    for col in ("nodes", "f1", "se", "valid", "n"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def plot_gpt52_names_only_scaling(
+    cross: pd.DataFrame,
+    out_dir: Path,
+    formats: list[str],
+) -> None:
+    plot_df = collect_gpt52_names_only_scaling(cross)
+    if plot_df.empty:
+        print("[warn] No GPT-5.2 Pro names-only rows available for semantic-scaling figure; skipping.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_path = out_dir / "fig_rq1_gpt52_name_only_scaling.csv"
+    plot_df.to_csv(data_path, index=False)
+    print(f"[write] {data_path}")
+
+    fig, ax = plt.subplots(figsize=(3.35, 2.18))
+    ax.axhline(1.0, color="#9a9a9a", lw=0.7, ls=(0, (3, 2)), zorder=1)
+
+    full_valid = plot_df["valid"].fillna(0).ge(plot_df["n"].fillna(np.inf))
+    low_valid = ~full_valid
+    err = plot_df["se"].fillna(0.0)
+
+    ax.errorbar(
+        plot_df.loc[full_valid, "nodes"],
+        plot_df.loc[full_valid, "f1"],
+        yerr=err.loc[full_valid],
+        fmt="o",
+        color="#2f6f9f",
+        markerfacecolor="#2f6f9f",
+        markeredgecolor="white",
+        markeredgewidth=0.5,
+        markersize=4.6,
+        capsize=2.3,
+        capthick=0.75,
+        elinewidth=0.75,
+        zorder=3,
+    )
+    if low_valid.any():
+        ax.errorbar(
+            plot_df.loc[low_valid, "nodes"],
+            plot_df.loc[low_valid, "f1"],
+            yerr=err.loc[low_valid],
+            fmt="o",
+            color="#2f6f9f",
+            markerfacecolor="white",
+            markeredgecolor="#2f6f9f",
+            markeredgewidth=1.05,
+            markersize=4.7,
+            capsize=2.3,
+            capthick=0.75,
+            elinewidth=0.75,
+            zorder=4,
+        )
+
+    label_offsets = {
+        "cancer": (-0.95, -0.062, "top"),
+        "asia": (0.95, -0.062, "top"),
+        "sachs": (0.0, 0.043, "bottom"),
+        "child": (0.0, 0.043, "bottom"),
+        "alarm": (0.0, 0.043, "bottom"),
+    }
+    for _, row in plot_df.iterrows():
+        graph = str(row["graph"])
+        dx, dy, va = label_offsets.get(graph, (0.0, 0.043, "bottom"))
+        label = f"{SEMANTIC_SCALING_LABELS.get(graph, graph.capitalize())}\n{row['f1']:.2f}"
+        if np.isfinite(row["valid"]) and np.isfinite(row["n"]) and row["valid"] < row["n"]:
+            label += f"\n({int(row['valid'])}/{int(row['n'])})"
+        ax.text(
+            row["nodes"] + dx,
+            row["f1"] + dy,
+            label,
+            ha="center",
+            va=va,
+            fontsize=6.4,
+            color="#222222",
+        )
+
+    x_max = max(40.0, float(plot_df["nodes"].max()) + 2.5)
+    ax.set_xlim(2.2, x_max)
+    ax.set_ylim(0.43, 1.05)
+    ax.set_xticks([int(v) for v in plot_df["nodes"].dropna().tolist()])
+    ax.set_yticks([0.5, 0.7, 0.9, 1.0])
+    ax.set_xlabel("# nodes")
+    ax.set_ylabel("Name-only directed-edge F1")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.6, alpha=0.85)
+    ax.grid(axis="x", color="#eeeeee", linewidth=0.5, alpha=0.5)
+    ax.tick_params(width=0.8, length=2.5)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_linewidth(0.8)
+    fig.tight_layout(pad=0.35)
+    save_figure(fig, out_dir, "fig_rq1_gpt52_name_only_scaling", formats)
+    plt.close(fig)
+
+
 def write_latex_includes(out_dir: Path) -> None:
     text = r"""
 % Generated by scripts/plot_micad_paper_figures.py
@@ -700,6 +905,13 @@ def write_latex_includes(out_dir: Path) -> None:
   \caption{Contrastive information-use metrics. Bars are matched F1 differences grouped by the question they answer: whether observational data alone helps from $N=0$ to $N=5000$ at $M=0$, whether interventional data alone helps from $M=0$ to $M=200$ at $N=0$, whether matrix rows beat summaries, and whether real names matter.}
   \label{fig:information_use_contrasts}
 \end{figure*}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.5\textwidth]{experiments/out/micad_paper/figures/fig_rq1_gpt52_name_only_scaling.pdf}
+  \caption{GPT-5.2 Pro name-only recovery across graph sizes. Filled points mark fully valid parsed runs; the open point marks a condition with fewer than five valid parsed runs. Semantic priors solve the smallest graphs but are insufficient for reliable recovery on larger networks.}
+  \label{fig:gpt52_name_only_scaling}
+\end{figure}
 
 \begin{figure}[t]
   \centering
@@ -788,6 +1000,7 @@ def main() -> None:
             anonymized=True,
         )
 
+    plot_gpt52_names_only_scaling(cross, out_dir, args.formats)
     write_latex_includes(out_dir)
 
 
