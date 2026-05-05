@@ -1,0 +1,136 @@
+{
+  "name": "sachs_obs_sweep_int0",
+  "role": "supporting",
+  "dataset": "sachs",
+  "bif_file": "causal_graphs/real_data/small_graphs/sachs.bif",
+  "model": "gpt-5.2-pro",
+  "seed": 42,
+  "num_prompts": 5,
+  "temperature": 0.0,
+  "shuffles_per_graph": 1,
+  "prompt_cells": [
+    {
+      "style": "summary",
+      "obs_per_prompt": 100,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 100,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 500,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 500,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 1000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": false,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    },
+    {
+      "style": "summary",
+      "obs_per_prompt": 5000,
+      "int_per_combo": 0,
+      "anonymize": true,
+      "row_order": "random",
+      "col_order": "original",
+      "causal_rules": false,
+      "give_steps": false,
+      "def_int": false,
+      "intervene_vars": "all"
+    }
+  ],
+  "names_only": {
+    "enabled": true,
+    "col_order": "original"
+  },
+  "baselines": [
+    {
+      "name": "PC",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "seed": 42,
+      "pc_variant": "stable",
+      "pc_ci_test": "chi_square",
+      "pc_significance_level": 0.01,
+      "pc_max_cond_vars": 5
+    },
+    {
+      "name": "GES",
+      "enabled": true,
+      "scope": "observational",
+      "library": "pgmpy",
+      "seed": 42,
+      "ges_scoring_method": "bic-d",
+      "ges_min_improvement": 1e-6
+    }
+  ],
+  "notes": "Sachs observational-budget sweep at fixed M=0 for Figure 1. Includes names-only N=0, real/anonymized summary prompts for N>0, and PC/GES observational baselines over five seeds."
+}

@@ -156,6 +156,18 @@ SUMMARY_OUTPUT_COLUMNS = [
     "wrong_shape_rows",
 ]
 
+RESTORE_CONSENSUS_SUMMARY_FIELDS = any(
+    col.startswith("consensus_")
+    or col
+    in {
+        "brier",
+        "brier_skeleton",
+        "nhd_consensus",
+        "nhd_ratio_consensus",
+    }
+    for col in SUMMARY_OUTPUT_COLUMNS
+)
+
 
 def _repo_paths() -> tuple[Path, Path]:
     return REPO_ROOT, EXPERIMENTS_DIR
@@ -719,6 +731,7 @@ def step_evaluate(args: argparse.Namespace, *, experiments_dir: Path, dry_run: b
             str(args.tau),
             "--summary-csv",
             str(summary_csv),
+            "--summary-columns-only",
         ]
         _run(cmd, cwd=experiments_dir, dry_run=dry_run)
 
@@ -1122,7 +1135,11 @@ def _cached_summary_from_per_row(csv_path: Path, *, tau: float) -> Optional[dict
         })
 
     consensus_path = csv_path.with_suffix(csv_path.suffix + f".consensus_tau{tau:.2f}.json")
-    if consensus_path.exists() and consensus_path.stat().st_mtime >= csv_path.stat().st_mtime:
+    if (
+        RESTORE_CONSENSUS_SUMMARY_FIELDS
+        and consensus_path.exists()
+        and consensus_path.stat().st_mtime >= csv_path.stat().st_mtime
+    ):
         try:
             import numpy as np
             from evaluate import brier_edgewise, brier_skeleton, eval_pair, nhd, nhd_baseline
@@ -1202,6 +1219,7 @@ def step_analyze(args: argparse.Namespace, *, experiments_dir: Path, dry_run: bo
                 tau=args.tau,
                 write_artifacts=False,
                 verbose=False,
+                summary_columns_only=True,
             )["summary"]
         else:
             cached_summary_count += 1

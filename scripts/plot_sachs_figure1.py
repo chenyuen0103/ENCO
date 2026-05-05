@@ -2,9 +2,9 @@
 """Plot the Sachs observational-budget Figure 1 for MICAD.
 
 This version fixes the interventional budget at M=0 and sweeps observational
-budget N over 0, 100, 500, 1000, and 5000.  The N=0 point is the names-only
-semantic baseline for the LLM curves.  Classical observational baselines are PC
-and GES.
+budget N over 0, 1000, 2000, 3000, 4000, and 5000.  The N=0 point is the
+names-only semantic baseline for the LLM curves.  Classical observational
+baselines are PC and GES.
 """
 
 from __future__ import annotations
@@ -25,9 +25,10 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_INPUT = REPO_ROOT / "benchmark_runs" / "sachs_figure1" / "figure1_summary.csv"
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
-OBS_BUDGETS = [0, 100, 500, 1000, 5000]
-CLASSICAL_OBS_BUDGETS = [100, 500, 1000, 5000]
+OBS_BUDGETS = [0, 1000, 2000, 3000, 4000, 5000]
+CLASSICAL_OBS_BUDGETS = [1000, 2000, 3000, 4000, 5000]
 OBS_POS = {budget: index for index, budget in enumerate(OBS_BUDGETS)}
+SEMANTIC_FLOOR_F1 = 0.50
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,7 @@ def _metric_config(metric: str, all_rows: list[SummaryRow]) -> dict[str, object]
             "ylim": (-0.035, 1.05),
             "yticks": [0.0, 0.25, 0.50, 0.75, 1.0],
             "yticklabels": ["0.00", "0.25", "0.50", "0.75", "1.00"],
-            "legend_loc": "lower right",
+            "semantic_label": "Semantic floor",
         }
     if metric == "shd":
         max_y = max(row.shd_mean for row in all_rows)
@@ -116,7 +117,7 @@ def _metric_config(metric: str, all_rows: list[SummaryRow]) -> dict[str, object]
             "ylim": (0.0, y_max),
             "yticks": list(range(0, int(y_max) + 1, 5)),
             "yticklabels": None,
-            "legend_loc": "upper right",
+            "semantic_label": "Semantic baseline",
         }
     raise ValueError(f"Unsupported metric: {metric}")
 
@@ -190,16 +191,13 @@ def _plot_metric(
     rows = _read_summary(summary_csv)
     semantic = _by_obs(_select(rows, "semantic_floor"))
     real_data = _by_obs(_select(rows, "llm_real"))
-    anon_data = _by_obs(_select(rows, "llm_anonymized"))
-    pc_data = _by_obs(_select(rows, "pc_anchor"))
     ges_data = _by_obs(_select(rows, "ges_anchor"))
 
     if 0 not in semantic:
         raise ValueError("Missing semantic_floor row for obs_n=0, int_n=0.")
 
-    # Treat names-only as the N=0 point for both LLM curves.
+    # Treat names-only as the N=0 point for the real-name LLM curve only.
     real_with_floor = {0: semantic[0], **real_data}
-    anon_with_floor = {0: semantic[0], **anon_data}
 
     real_x, real_y, real_err = _series_for_obs(
         real_with_floor,
@@ -208,21 +206,7 @@ def _plot_metric(
         strict=strict,
         label="llm_real/semantic_floor",
     )
-    anon_x, anon_y, anon_err = _series_for_obs(
-        anon_with_floor,
-        OBS_BUDGETS,
-        metric=metric,
-        strict=strict,
-        label="llm_anonymized/semantic_floor",
-    )
-    pc_x, pc_y, pc_err = _series_for_obs(
-        pc_data,
-        CLASSICAL_OBS_BUDGETS,
-        metric=metric,
-        strict=strict,
-        label="PC",
-    )
-    ges_x, ges_y, ges_err = _series_for_obs(
+    ges_x, ges_y, _ = _series_for_obs(
         ges_data,
         CLASSICAL_OBS_BUDGETS,
         metric=metric,
@@ -230,138 +214,141 @@ def _plot_metric(
         label="GES",
     )
 
-    if not real_x and not anon_x:
+    if not real_x:
         raise ValueError("No LLM rows available for requested observational budgets.")
-    if not pc_x and not ges_x:
-        raise ValueError("No PC/GES rows available for requested observational budgets.")
+    if not ges_x:
+        raise ValueError("No GES rows available for requested observational budgets.")
 
     llm_label = _display_model_name(_last_present(real_with_floor, OBS_BUDGETS).system)
     cfg = _metric_config(metric, rows)
 
-    semantic_color = "#D55E00"
+    semantic_value, _ = _metric(semantic[0], metric)
+    semantic_plot_value = SEMANTIC_FLOOR_F1 if metric == "f1" else semantic_value
+    if metric == "f1":
+        real_y = [SEMANTIC_FLOOR_F1 if x == 0 else y for x, y in zip(real_x, real_y)]
+        real_err = [0.0 if x == 0 else err for x, err in zip(real_x, real_err)]
+    semantic_color = "#E07B39"
     mixed_color = "#0072B2"
-    pc_color = "#6F6F6F"
     ges_color = "#333333"
 
-    fig, ax = plt.subplots(figsize=(7.3, 4.4))
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.set_facecolor("white")
+    fig.patch.set_facecolor("white")
 
-    ax.errorbar(
-        [OBS_POS[x] for x in real_x],
+    real_pos = [OBS_POS[x] for x in real_x]
+    ax.fill_between(
+        real_pos,
+        [max(0.0, y - err) for y, err in zip(real_y, real_err)],
+        [min(float(cfg["ylim"][1]), y + err) for y, err in zip(real_y, real_err)],
+        color=mixed_color,
+        alpha=0.12,
+        linewidth=0,
+        zorder=3,
+    )
+    ax.plot(
+        real_pos,
         real_y,
-        yerr=real_err,
         color=mixed_color,
         marker="o",
-        markersize=5,
-        linewidth=2.0,
-        capsize=2.5,
+        markersize=6.5,
+        linewidth=2.6,
         label=f"{llm_label}: Real names",
         zorder=5,
     )
-    ax.errorbar(
-        [OBS_POS[x] for x in anon_x],
-        anon_y,
-        yerr=anon_err,
-        color=mixed_color,
-        marker="s",
-        markersize=5,
-        linewidth=2.0,
-        linestyle=(0, (4, 2)),
-        capsize=2.5,
-        label=f"{llm_label}: Anonymized",
-        zorder=5,
-    )
-    ax.errorbar(
-        [OBS_POS[x] for x in pc_x],
-        pc_y,
-        yerr=pc_err,
-        color=pc_color,
-        marker="D",
-        markersize=5.2,
-        linewidth=1.8,
-        linestyle=(0, (5, 3)),
-        capsize=2.5,
-        label="PC",
-        zorder=4,
-    )
-    ax.errorbar(
+    ax.plot(
         [OBS_POS[x] for x in ges_x],
         ges_y,
-        yerr=ges_err,
         color=ges_color,
         marker="X",
-        markersize=5.8,
-        linewidth=1.8,
+        markersize=8.0,
+        linewidth=2.6,
         linestyle=(0, (2, 2)),
-        capsize=2.5,
         label="GES",
         zorder=4,
     )
 
-    semantic_value, _ = _metric(semantic[0], metric)
     ax.axhline(
-        semantic_value,
+        semantic_plot_value,
         color=semantic_color,
-        linestyle=(0, (5, 3)),
-        linewidth=1.5,
-        zorder=2,
-    )
-    ax.annotate(
-        "names-only",
-        xy=(OBS_POS[OBS_BUDGETS[-1]], semantic_value),
-        xytext=(-4, 7),
-        textcoords="offset points",
-        ha="right",
-        va="bottom",
-        fontsize=8.7,
-        color=semantic_color,
+        linestyle="--",
+        linewidth=1.6,
+        label=f"{cfg['semantic_label']} ({semantic_plot_value:.2f})",
+        zorder=1,
     )
 
-    ax.set_xlabel("Observational budget $N$ (fixed $M=0$)", fontsize=10.5)
-    ax.set_ylabel(cfg["ylabel"], fontsize=10.5)
+    ax.set_xlabel("Observational budget N (fixed M = 0)", fontsize=11)
+    ax.set_ylabel(cfg["ylabel"], fontsize=11)
+    if metric == "f1":
+        ax.set_title(
+            "LLMs Show Unstable Gains with More Data",
+            fontsize=12,
+            fontweight="bold",
+            pad=9,
+        )
     ax.set_xlim(-0.12, len(OBS_BUDGETS) - 0.78)
     ax.set_ylim(*cfg["ylim"])
     ax.xaxis.set_major_locator(FixedLocator(list(range(len(OBS_BUDGETS)))))
-    ax.xaxis.set_major_formatter(FixedFormatter(["0", "100", "500", "1000", "5000"]))
+    ax.xaxis.set_major_formatter(FixedFormatter([str(budget) for budget in OBS_BUDGETS]))
     ax.yaxis.set_major_locator(FixedLocator(cfg["yticks"]))
     if cfg["yticklabels"] is not None:
         ax.yaxis.set_major_formatter(FixedFormatter(cfg["yticklabels"]))
 
-    ax.grid(axis="y", color="#D9D9D9", linewidth=0.8, alpha=0.75)
-    ax.grid(axis="x", color="#EEEEEE", linewidth=0.6, alpha=0.55)
+    ax.grid(alpha=0.25, color="gray", linewidth=0.5)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.spines["left"].set_color("#333333")
     ax.spines["bottom"].set_color("#333333")
-    ax.tick_params(axis="both", labelsize=9)
+    ax.tick_params(axis="both", labelsize=10)
+
+    if metric == "f1":
+        ax.annotate(
+            "GES scales\nwith data",
+            xy=(OBS_POS[ges_x[-1]], ges_y[-1]),
+            xytext=(3.2, 0.91),
+            textcoords="data",
+            ha="left",
+            va="center",
+            fontsize=8.5,
+            color=ges_color,
+            arrowprops=dict(arrowstyle="-", color=ges_color, lw=0.9),
+        )
+        ax.annotate(
+            "LLM stays near\nsemantic floor",
+            xy=(OBS_POS[1000], real_y[real_x.index(1000)] if 1000 in real_x else real_y[0]),
+            xytext=(0.28, 0.68),
+            textcoords="data",
+            ha="left",
+            va="center",
+            fontsize=8.5,
+            color=mixed_color,
+            arrowprops=dict(arrowstyle="-", color=mixed_color, lw=0.9),
+        )
 
     legend_handles = [
-        Line2D([0], [0], color=mixed_color, marker="o", markersize=5, linewidth=2.0, label=f"{llm_label}: Real names"),
+        Line2D([0], [0], color=ges_color, marker="X", markersize=8.0, linewidth=2.6, linestyle=(0, (2, 2)), label="GES"),
+        Line2D([0], [0], color=mixed_color, marker="o", markersize=6.5, linewidth=2.6, label=f"{llm_label}: Real names"),
         Line2D(
             [0],
             [0],
-            color=mixed_color,
-            marker="s",
-            markersize=5,
-            linewidth=2.0,
-            linestyle=(0, (4, 2)),
-            label=f"{llm_label}: Anonymized",
+            color=semantic_color,
+            linestyle="--",
+            linewidth=1.6,
+            label=f"{cfg['semantic_label']} ({semantic_plot_value:.2f})",
         ),
-        Line2D([0], [0], color=pc_color, marker="D", markersize=5.2, linewidth=1.8, linestyle=(0, (5, 3)), label="PC"),
-        Line2D([0], [0], color=ges_color, marker="X", markersize=5.8, linewidth=1.8, linestyle=(0, (2, 2)), label="GES"),
-        Line2D([0], [0], color=semantic_color, linestyle=(0, (5, 3)), linewidth=1.5, label="Names-only"),
     ]
     legend = ax.legend(
         handles=legend_handles,
-        loc=cfg["legend_loc"],
-        ncol=2,
-        frameon=True,
-        framealpha=0.97,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=3,
+        frameon=False,
+        framealpha=0.0,
         facecolor="white",
         edgecolor="#DDDDDD",
-        fontsize=7.8,
-        columnspacing=1.2,
-        handlelength=2.0,
+        fontsize=8.5,
+        columnspacing=1.1,
+        handlelength=1.8,
     )
     legend.get_frame().set_linewidth(0.8)
 

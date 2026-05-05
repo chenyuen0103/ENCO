@@ -1,0 +1,39 @@
+{
+  "config_defaults": {
+    "prompt_style": "summary",
+    "int_per_combo": 0,
+    "wrapper_mode": "plain",
+    "append_format_hint": false,
+    "row_order": "random",
+    "col_order": "original",
+    "shuffles_per_graph": 1,
+    "reasoning_guidance": "concise",
+    "num_prompts": 1
+  },
+  "configs": [
+    {
+      "obs_per_prompt": 2000,
+      "anonymize": false
+    },
+    {
+      "obs_per_prompt": 2000,
+      "anonymize": true
+    },
+    {
+      "obs_per_prompt": 3000,
+      "anonymize": false
+    },
+    {
+      "obs_per_prompt": 3000,
+      "anonymize": true
+    },
+    {
+      "obs_per_prompt": 4000,
+      "anonymize": false
+    },
+    {
+      "obs_per_prompt": 4000,
+      "anonymize": true
+    }
+  ]
+}

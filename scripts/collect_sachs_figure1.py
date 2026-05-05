@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -26,7 +27,10 @@ from experiments.evaluate import eval_pair
 OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
 SACHS_BIF = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / "sachs.bif"
 SACHS_SUMMARY_CSV = REPO_ROOT / "scripts" / "responses" / "sachs" / "sachs_summary.csv"
+SACHS_RESPONSES_DIR = REPO_ROOT / "scripts" / "responses" / "sachs"
 DEFAULT_LLM_MODEL = "gpt-5.2-pro"
+OBS_SWEEP_BUDGETS = [1000, 2000, 3000, 4000, 5000]
+LLM_MAX_RUNS = 3
 
 
 def _parse_matrix(raw: Any) -> np.ndarray | None:
@@ -81,7 +85,33 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 REPO_ROOT / f"experiments/responses/sachs/predictions_obs5000_int{m}_ENCO.csv",
             )
         )
-    for m in [0, 50, 100, 200]:
+    for n in OBS_SWEEP_BUDGETS:
+        cells.append(
+            (
+                "llm_real",
+                llm_model,
+                "mixed_information",
+                "summary",
+                "real",
+                n,
+                0,
+                SACHS_SUMMARY_CSV,
+            )
+        )
+        cells.append(
+            (
+                "llm_anonymized",
+                llm_model,
+                "mixed_information",
+                "summary",
+                "anonymized",
+                n,
+                0,
+                SACHS_SUMMARY_CSV,
+            )
+        )
+
+    for m in [50, 100, 200]:
         cells.append(
             (
                 "llm_real",
@@ -118,28 +148,33 @@ def _required_cells(llm_model: str) -> list[tuple[str, str, str, str, str, int, 
                 0,
                 SACHS_SUMMARY_CSV,
             ),
+        ]
+    )
+    for n in OBS_SWEEP_BUDGETS:
+        cells.append(
             (
                 "pc_anchor",
                 "PC",
                 "classical_observational",
                 "baseline",
                 "anonymized",
-                5000,
+                n,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs5000_int0_PC.csv",
-            ),
+                REPO_ROOT / f"experiments/responses/sachs/predictions_obs{n}_int0_PC.csv",
+            )
+        )
+        cells.append(
             (
                 "ges_anchor",
                 "GES",
                 "classical_observational",
                 "baseline",
                 "anonymized",
-                5000,
+                n,
                 0,
-                REPO_ROOT / "experiments/responses/sachs/predictions_obs5000_int0_GES.csv",
-            ),
-        ]
-    )
+                REPO_ROOT / f"experiments/responses/sachs/predictions_obs{n}_int0_GES.csv",
+            )
+        )
     return cells
 
 
@@ -148,6 +183,22 @@ def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return []
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def _count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open(newline="", encoding="utf-8") as handle:
+        return sum(1 for _ in csv.DictReader(handle))
+
+
+def _resolve_prediction_csv(path: Path) -> Path:
+    if path.suffix != ".csv":
+        return path
+    seeded_path = path.with_name(f"{path.stem}_seed42{path.suffix}")
+    if seeded_path.exists() and _count_csv_rows(seeded_path) > _count_csv_rows(path):
+        return seeded_path
+    return path
 
 
 def _int_field(row: dict[str, Any], key: str, default: int = 0) -> int:
@@ -175,6 +226,30 @@ def _candidate_rank(row: dict[str, Any]) -> tuple[int, int, int, int, str]:
         _int_field(row, "num_rows", 0),
         int("_p5_" in response_csv or "_p5" in response_csv),
         response_csv,
+    )
+
+
+def _prompt_count_from_name(path: Path) -> int:
+    match = re.search(r"(?:^|_)p(\d+)(?:_|$)", path.name)
+    return int(match.group(1)) if match else 0
+
+
+def _raw_response_candidate_rank(row: dict[str, Any]) -> tuple[int, int, int, str]:
+    source_csv = row.get("source_csv", "")
+    return (
+        _int_field(row, "n_valid", 0),
+        _int_field(row, "num_rows", 0),
+        _prompt_count_from_name(Path(source_csv)),
+        source_csv,
+    )
+
+
+def _collected_summary_rank(row: dict[str, Any]) -> tuple[int, int, str]:
+    source_csv = row.get("source_csv", "")
+    return (
+        _int_field(row, "n_valid", 0),
+        _prompt_count_from_name(Path(source_csv)),
+        source_csv,
     )
 
 
@@ -249,6 +324,127 @@ def _summary_output_row(
         "shd_mean": _float_or_blank(row.get("avg_shd")),
         "shd_sd": _float_or_blank(row.get("avg_shd_sd")),
     }
+
+
+def _matches_raw_response_csv(
+    path: Path,
+    *,
+    system: str,
+    prompt_style: str,
+    naming: str,
+    obs_n: int,
+    int_n: int,
+) -> bool:
+    name = path.name
+    if not name.endswith(f"_{system}.csv"):
+        return False
+    if prompt_style == "names_only":
+        return name.startswith("responses_names_only_")
+
+    prefix = f"responses_obs{obs_n}_int{int_n}_"
+    if not name.startswith(prefix):
+        return False
+    if f"_{prompt_style}_" not in name:
+        return False
+    has_anon = "_anon_" in name
+    if naming == "anonymized" and not has_anon:
+        return False
+    if naming != "anonymized" and has_anon:
+        return False
+    return True
+
+
+def _raw_response_summary_row(
+    path: Path,
+    *,
+    line_id: str,
+    system: str,
+    info_class: str,
+    prompt_style: str,
+    naming: str,
+    obs_n: int,
+    int_n: int,
+) -> dict[str, Any] | None:
+    rows = _read_csv_rows(path)
+    f1_values: list[float] = []
+    shd_values: list[float] = []
+    valid = 0
+    for row in rows:
+        row_answer = _parse_matrix(row.get("answer"))
+        pred = _parse_matrix(row.get("prediction"))
+        if pred is None:
+            pred = _parse_matrix(row.get("raw_response"))
+        if row_answer is None or pred is None or pred.shape != row_answer.shape:
+            continue
+        metrics = eval_pair(row_answer, pred)
+        valid += 1
+        if metrics.get("f1") is not None:
+            f1_values.append(float(metrics["f1"]))
+        if metrics.get("shd") is not None:
+            shd_values.append(float(metrics["shd"]))
+        if valid >= LLM_MAX_RUNS:
+            break
+
+    if valid <= 0:
+        return None
+    n, f1_mean, f1_sd, f1_se, f1_ci95 = _stats(f1_values)
+    _, shd_mean, shd_sd, _, _ = _stats(shd_values)
+    return {
+        "line_id": line_id,
+        "system": system,
+        "information_class": info_class,
+        "prompt_style": prompt_style,
+        "naming_regime": naming,
+        "obs_n": obs_n,
+        "int_n": int_n,
+        "source_csv": _source_csv(path),
+        "n_valid": n,
+        "num_rows": len(rows),
+        "f1_mean": f1_mean,
+        "f1_sd": f1_sd,
+        "f1_se": f1_se,
+        "f1_ci95_halfwidth": f1_ci95,
+        "shd_mean": shd_mean,
+        "shd_sd": shd_sd,
+    }
+
+
+def _find_raw_response_summary_row(
+    *,
+    system: str,
+    line_id: str,
+    info_class: str,
+    prompt_style: str,
+    naming: str,
+    obs_n: int,
+    int_n: int,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for path in sorted(SACHS_RESPONSES_DIR.glob("responses_*.csv")):
+        if not _matches_raw_response_csv(
+            path,
+            system=system,
+            prompt_style=prompt_style,
+            naming=naming,
+            obs_n=obs_n,
+            int_n=int_n,
+        ):
+            continue
+        row = _raw_response_summary_row(
+            path,
+            line_id=line_id,
+            system=system,
+            info_class=info_class,
+            prompt_style=prompt_style,
+            naming=naming,
+            obs_n=obs_n,
+            int_n=int_n,
+        )
+        if row is not None:
+            candidates.append(row)
+    if not candidates:
+        return None
+    return max(candidates, key=_raw_response_candidate_rank)
 
 
 def _stats(values: list[float]) -> tuple[int, float | str, float | str, float | str, float | str]:
@@ -330,6 +526,8 @@ def main() -> int:
     for line_id, system, info_class, prompt_style, naming, obs_n, int_n, path in _required_cells(args.model):
         if path == SACHS_SUMMARY_CSV:
             path = sachs_summary_csv
+        else:
+            path = _resolve_prediction_csv(path)
         rows: list[dict[str, Any]] = []
         valid = 0
         minimum = 1 if line_id in {"enco_ceiling", "enco_observational", "pc_anchor", "ges_anchor"} else 3
@@ -342,9 +540,9 @@ def main() -> int:
                 obs_n=obs_n,
                 int_n=int_n,
             )
-            valid = _int_field(summary_row, "valid_rows", 0) if summary_row else 0
+            selected_summary_rows: list[dict[str, Any]] = []
             if summary_row:
-                imported_summary_rows.append(
+                selected_summary_rows.append(
                     _summary_output_row(
                         summary_row,
                         line_id=line_id,
@@ -354,8 +552,31 @@ def main() -> int:
                         naming=naming,
                         obs_n=obs_n,
                         int_n=int_n,
-                        source_csv=_source_csv(path),
+                        source_csv=_source_csv(Path(summary_row.get("response_csv") or path)),
                     )
+                )
+            raw_summary_row = _find_raw_response_summary_row(
+                system=system,
+                line_id=line_id,
+                info_class=info_class,
+                prompt_style=prompt_style,
+                naming=naming,
+                obs_n=obs_n,
+                int_n=int_n,
+            )
+            if raw_summary_row is not None:
+                # Prefer raw response CSVs so GPT points are consistently capped
+                # at the same number of valid runs, even when sachs_summary.csv
+                # contains older p5 aggregates.
+                selected_summary_row = raw_summary_row
+            else:
+                selected_summary_row = (
+                    max(selected_summary_rows, key=_collected_summary_rank) if selected_summary_rows else None
+                )
+            valid = _int_field(selected_summary_row, "n_valid", 0) if selected_summary_row else 0
+            if selected_summary_row:
+                imported_summary_rows.append(
+                    {key: value for key, value in selected_summary_row.items() if key != "num_rows"}
                 )
             audit_rows.append(
                 {
@@ -365,9 +586,15 @@ def main() -> int:
                     "naming_regime": naming,
                     "obs_n": obs_n,
                     "int_n": int_n,
-                    "source_csv": _source_csv(path),
-                    "exists": int(path.exists()),
-                    "rows": _int_field(summary_row, "num_rows", 0) if summary_row else 0,
+                    "source_csv": selected_summary_row.get("source_csv", _source_csv(path))
+                    if selected_summary_row
+                    else _source_csv(path),
+                    "exists": int(path.exists() or selected_summary_row is not None),
+                    "rows": _int_field(
+                        selected_summary_row or {},
+                        "num_rows",
+                        _int_field(summary_row, "num_rows", 0) if summary_row else 0,
+                    ),
                     "valid_prediction_rows": valid,
                     "minimum_required": minimum,
                     "meets_minimum": int(valid >= minimum),

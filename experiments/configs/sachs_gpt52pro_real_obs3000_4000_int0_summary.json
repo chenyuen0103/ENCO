@@ -1,0 +1,21 @@
+{
+  "config_defaults": {
+    "prompt_style": "summary",
+    "int_per_combo": 0,
+    "wrapper_mode": "plain",
+    "append_format_hint": false,
+    "anonymize": false,
+    "row_order": "random",
+    "col_order": "original",
+    "shuffles_per_graph": 1,
+    "reasoning_guidance": "concise"
+  },
+  "configs": [
+    {
+      "obs_per_prompt": 3000
+    },
+    {
+      "obs_per_prompt": 4000
+    }
+  ]
+}

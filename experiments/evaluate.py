@@ -1002,6 +1002,7 @@ def evaluate_response_csv(
     prob_plot: Optional[Path] = None,
     write_artifacts: bool = True,
     verbose: bool = True,
+    summary_columns_only: bool = False,
 ) -> Dict[str, Any]:
     def _log(msg: str) -> None:
         if verbose:
@@ -1290,7 +1291,7 @@ def evaluate_response_csv(
     brier = None
     brier_skel = None
 
-    if pred_mats_all:
+    if pred_mats_all and not summary_columns_only:
         P, Var, Ent, WL, WH, K = edge_stability(pred_mats_all)
         consensus_adj = consensus_from_P(P, tau=tau)
         n = consensus_adj.shape[0]
@@ -1439,23 +1440,26 @@ def evaluate_response_csv(
         "var_num_pred_edges_ci95_high": edges_ci[1],
     })
 
+    nhd_mean, nhd_sd, nhd_iqr, nhd_ci = _mean_std_iqr_ci(nhd_list)
+    nhd_ratio_mean, nhd_ratio_sd, nhd_ratio_iqr, nhd_ratio_ci = _mean_std_iqr_ci(nhd_ratio_list)
+    summary.update({
+        "nhd_mean": nhd_mean,
+        "nhd_sd": nhd_sd,
+        "nhd_iqr": nhd_iqr,
+        "nhd_ci95_low": nhd_ci[0],
+        "nhd_ci95_high": nhd_ci[1],
+        "nhd_ratio_mean": nhd_ratio_mean,
+        "nhd_ratio_sd": nhd_ratio_sd,
+        "nhd_ratio_iqr": nhd_ratio_iqr,
+        "nhd_ratio_ci95_low": nhd_ratio_ci[0],
+        "nhd_ratio_ci95_high": nhd_ratio_ci[1],
+    })
+
     if P is not None:
-        nhd_mean, nhd_sd, nhd_iqr, nhd_ci = _mean_std_iqr_ci(nhd_list)
-        nhd_ratio_mean, nhd_ratio_sd, nhd_ratio_iqr, nhd_ratio_ci = _mean_std_iqr_ci(nhd_ratio_list)
         summary.update({
             "consensus_tau": float(tau),
             "consensus_K": int(K),
             "consensus_num_edges": int(consensus_num_edges),
-            "nhd_mean": nhd_mean,
-            "nhd_sd": nhd_sd,
-            "nhd_iqr": nhd_iqr,
-            "nhd_ci95_low": nhd_ci[0],
-            "nhd_ci95_high": nhd_ci[1],
-            "nhd_ratio_mean": nhd_ratio_mean,
-            "nhd_ratio_sd": nhd_ratio_sd,
-            "nhd_ratio_iqr": nhd_ratio_iqr,
-            "nhd_ratio_ci95_low": nhd_ratio_ci[0],
-            "nhd_ratio_ci95_high": nhd_ratio_ci[1],
             "nhd_consensus": nhd_consensus,
             "nhd_ratio_consensus": nhd_ratio_consensus,
         })
@@ -1473,7 +1477,28 @@ def evaluate_response_csv(
                 "consensus_ancestor_f1": consensus_metrics["ancestor_f1"],
             })
 
-    _log("=== Global metrics (averages per row) + consensus ===")
+    if summary_columns_only:
+        for key in list(summary):
+            if (
+                key.startswith("consensus_")
+                or key in {
+                    "brier",
+                    "brier_skeleton",
+                    "given_edges",
+                    "given_edge_count",
+                    "given_edge_frac",
+                    "nhd_consensus",
+                    "nhd_ratio_consensus",
+                    "nhd_mean",
+                    "nhd_ratio_mean",
+                }
+                or key.endswith("_iqr")
+                or key.endswith("_ci95_low")
+                or key.endswith("_ci95_high")
+            ):
+                summary.pop(key, None)
+
+    _log("=== Global metrics (averages per row) ===" if summary_columns_only else "=== Global metrics (averages per row) + consensus ===")
     if verbose:
         for k, v in summary.items():
             print(f"{k}: {v}")
@@ -1514,6 +1539,14 @@ def main():
         action="store_true",
         help="If set, also write the legacy <csv>.summary.json sidecar.",
     )
+    ap.add_argument(
+        "--summary-columns-only",
+        action="store_true",
+        help=(
+            "Fast mode for run_cd_eval_pipeline: compute only metrics needed for the "
+            "final eval_summary.csv/cache, skipping consensus/Brier/probability-plot artifacts."
+        ),
+    )
     ap.add_argument("--tau", type=float, default=0.7,
                     help="Consensus threshold; include edge if selection prob >= tau.")
     ap.add_argument("--consensus-json", default=None,
@@ -1538,6 +1571,7 @@ def main():
             prob_plot=(Path(args.prob_plot) if args.prob_plot else None),
             write_artifacts=True,
             verbose=True,
+            summary_columns_only=args.summary_columns_only,
         )
     except FileNotFoundError as exc:
         raise SystemExit(str(exc))
@@ -1576,7 +1610,7 @@ def main():
         df_out.to_csv(out_path, index=False)
         print(f"Appended summary row to: {out_path}")
 
-    metric_keys = [
+    full_metric_keys = [
         "format_ok",
         "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1",
         "shd", "acyclic",
@@ -1588,6 +1622,17 @@ def main():
         "ancestor_accuracy", "ancestor_precision", "ancestor_recall", "ancestor_f1",
         "nhd", "nhd_ratio",
     ]
+    summary_cache_metric_keys = [
+        "format_ok",
+        "n_vars", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1",
+        "shd", "acyclic",
+        "skeleton_accuracy", "skeleton_precision", "skeleton_recall", "skeleton_f1",
+        "orient_eval_pairs", "orient_tp", "orient_fn", "orient_acc",
+        "vstruct_precision", "vstruct_recall", "vstruct_f1",
+        "ancestor_accuracy", "ancestor_precision", "ancestor_recall", "ancestor_f1",
+        "nhd", "nhd_ratio",
+    ]
+    metric_keys = summary_cache_metric_keys if args.summary_columns_only else full_metric_keys
 
     if args.inplace:
         for row, m in zip(rows, per_row_metrics):
