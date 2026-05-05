@@ -34,12 +34,13 @@ BASE_FONT = 7.5
 
 # ── display labels ────────────────────────────────────────────────────────────
 DISPLAY = {
-    "JiralerspongBFS":      "Jiralerspong BFS",
-    "JiralerspongPairwise": "Long Pairwise",
-    "TakayamaSCP":          "Takayama SCP",
-    "CausalLLMData":        "Roy CausalLLM + Data (prompt)",
-    "CausalLLMDataNeural":  "Roy CausalLLM neural",
-    "CausalLLMPrompt":      "Roy CausalLLM",
+    "JiralerspongBFS":      "BFS (Jiralerspong et al. (2023))",
+    "JiralerspongPairwise": "Pairwise (Long et al. (2022))",
+    "TakayamaSCP":          "SCP (Takayama et al. (2023))",
+    # "CausalLLMData":        "CausalLLM + Data (Roy et al. (2024))",
+    "CausalLLMTrainableData": "CausalLLM + Data (Roy et al. (2024))",
+    # "CausalLLMDataNeural":  "CausalLLM  + Data (Roy et al. (2024))",
+    "CausalLLMPrompt":      "CausalLLM (Roy et al. (2024))",
 }
 
 
@@ -96,6 +97,21 @@ def _mean_per_row_metrics(path: Path) -> tuple[float, float] | None:
     )
 
 
+def _direct_prediction_metrics(path: Path) -> tuple[float, float] | None:
+    if not path.exists():
+        return None
+    from benchmark_builder.evaluation import direct_csv_summary
+    from benchmark_builder.schema import EvaluatorSpec
+
+    summary = direct_csv_summary(
+        response_csv=path,
+        evaluator=EvaluatorSpec(answer_col="answer", pred_col="prediction"),
+    )
+    if summary.get("avg_f1") in (None, "") or summary.get("avg_shd") in (None, ""):
+        return None
+    return float(summary["avg_f1"]), float(summary["avg_shd"])
+
+
 def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, float]]:
     """Return (method_rows, f1_refs, shd_refs) for the given obs budget."""
 
@@ -132,8 +148,9 @@ def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, fl
         # All-pairs LLM querying follows the early pairwise LLM-CD pattern of
         # Long et al. (2022); the implementation reuses the historical method
         # key for backward-compatible result lookup.
-        ("JiralerspongPairwise", llm_base,   dict(obs_n=obs, naming_regime="real"),  True),
-        ("CausalLLMData",        llm_base,   dict(obs_n=obs, naming_regime="real"),  True),
+        ("JiralerspongPairwise", llm_base,   dict(obs_n=obs, naming_regime="real"),  False),
+        ("CausalLLMData",        llm_base,   dict(obs_n=obs, naming_regime="real"),  False),
+        ("CausalLLMTrainableData", [],       dict(obs_n=obs, naming_regime="real"),  False),
     ]
 
     methods: list[MethodRow] = []
@@ -147,6 +164,22 @@ def load_data(obs: int) -> tuple[list[MethodRow], dict[str, float], dict[str, fl
                 / "responses"
                 / "sachs"
                 / f"predictions_obs{obs}_int0_JiralerspongPairwise_seed42.csv.per_row.csv"
+            )
+            if per_row_metrics is None:
+                per_row_metrics = _direct_prediction_metrics(
+                    REPO_ROOT
+                    / "experiments"
+                    / "responses"
+                    / "sachs"
+                    / f"predictions_obs{obs}_int0_JiralerspongPairwise_seed42.csv"
+                )
+        if row is None and name == "CausalLLMTrainableData":
+            per_row_metrics = _direct_prediction_metrics(
+                REPO_ROOT
+                / "experiments"
+                / "responses"
+                / "sachs"
+                / f"predictions_obs{obs}_int0_CausalLLMTrainableData_seed42.csv"
             )
         if row is None:
             # Try obs=1000 fallback only for methods that don't have an obs-specific run,
@@ -247,9 +280,30 @@ def plot(methods: list[MethodRow],
             dot_color = COL_SEMANTIC if m.kind == "floor" else COL_LLM
             ax.plot([0, val], [y, y], color=COL_STEM, linewidth=0.9, zorder=2)
             ax.plot(val, y, "o", color=dot_color, markersize=4.8, zorder=3)
-            offset = 0.03 * x_max
-            ax.text(val + offset, y, f"{val:.2f}",
-                    va="center", ha="left", fontsize=BASE_FONT - 0.5, color=dot_color)
+            offset = 0.035 * x_max
+            label_x = val + offset
+            label_y = y
+            label_ha = "left"
+            if metric == "SHD":
+                ref_gap = min(abs(val - ref_val) for ref_val in refs.values())
+                if ref_gap < 0.08 * x_max and val - offset > 0:
+                    label_x = val - 1.55 * offset
+                    label_ha = "right"
+                if m.kind == "floor":
+                    label_y = y + 0.24
+                elif ref_gap < 0.08 * x_max:
+                    label_y = y - 0.18
+            ax.text(
+                label_x,
+                label_y,
+                f"{val:.2f}",
+                va="center",
+                ha=label_ha,
+                fontsize=BASE_FONT - 0.5,
+                color=dot_color,
+                zorder=4,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.78, pad=0.25),
+            )
 
         ax.set_xlim(0, x_max * 1.2)
         ax.set_ylim(-0.6, n - 0.4)

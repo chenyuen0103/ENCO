@@ -1,0 +1,16 @@
+{ "config_defaults": {
+    "wrapper_mode": "chat",
+    "append_format_hint": true
+  },
+  "configs": [
+    {
+      "prompt_style": "summary",
+      "obs_per_prompt": 0,
+      "int_per_combo": 0,
+      "row_order": "random",
+      "col_order": "random",
+      "anonymize": false,
+      "reasoning_guidance": "concise"
+    }
+  ]
+}

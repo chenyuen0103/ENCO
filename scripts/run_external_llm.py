@@ -54,7 +54,14 @@ except ModuleNotFoundError:
     )
 
 
-METHODS = {"TakayamaSCP", "JiralerspongBFS", "JiralerspongPairwise", "CausalLLMPrompt", "CausalLLMData"}
+METHODS = {
+    "TakayamaSCP",
+    "JiralerspongBFS",
+    "JiralerspongPairwise",
+    "CausalLLMPrompt",
+    "CausalLLMData",
+    "CausalLLMTrainableData",
+}
 
 _PAIRWISE_INIT_PROMPTS: dict[str, dict[str, str]] = {
     "neuropathic": {
@@ -258,6 +265,178 @@ def _aggregate_sampled_dags(mats: list[np.ndarray], threshold: float) -> np.ndar
     return _greedy_dag_from_weights(weights, threshold=threshold)
 
 
+def _standardize_numeric_data(data: np.ndarray) -> np.ndarray:
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a 2D data array, got shape {arr.shape}.")
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    mean = arr.mean(axis=0, keepdims=True)
+    std = arr.std(axis=0, keepdims=True)
+    std[std < 1e-6] = 1.0
+    return (arr - mean) / std
+
+
+def _prune_causal_llm_scores_by_linear_coef(
+    scores: np.ndarray,
+    data: np.ndarray,
+    *,
+    edge_threshold: float = 0.5,
+    max_edges: int | None = None,
+) -> np.ndarray:
+    """Prune candidate src->dst scores using linear-regression coefficients.
+
+    This follows the upstream CausalLLM data baseline's pruning idea, but keeps
+    this repo's adjacency convention: rows are sources, columns are targets.
+    """
+    from sklearn.linear_model import LinearRegression
+
+    score_arr = np.asarray(scores, dtype=float)
+    data_arr = _standardize_numeric_data(data)
+    if score_arr.ndim != 2 or score_arr.shape[0] != score_arr.shape[1]:
+        raise ValueError(f"Expected square score matrix, got shape {score_arr.shape}.")
+    n = score_arr.shape[0]
+    if data_arr.shape[1] != n:
+        raise ValueError(f"Data has {data_arr.shape[1]} variables, but scores are {n}x{n}.")
+    np.fill_diagonal(score_arr, 0.0)
+
+    coef_weights = np.zeros((n, n), dtype=float)
+    reg = LinearRegression()
+    for dst in range(n):
+        parent_mask = score_arr[:, dst] > float(edge_threshold)
+        parent_mask[dst] = False
+        parent_indices = np.where(parent_mask)[0]
+        if len(parent_indices) == 0:
+            continue
+        reg.fit(data_arr[:, parent_indices], data_arr[:, dst])
+        for src, coef in zip(parent_indices, reg.coef_):
+            coef_weights[src, dst] = abs(float(coef))
+
+    positives = coef_weights[coef_weights > 0.0]
+    if positives.size == 0:
+        return _empty_dag(n)
+    keep = max(1, min(int(max_edges if max_edges is not None else n), positives.size))
+    cutoff = np.sort(positives)[::-1][keep - 1]
+    selected = np.where(coef_weights >= cutoff, coef_weights, 0.0)
+    np.fill_diagonal(selected, 0.0)
+    return _greedy_dag_from_weights(selected, threshold=1e-12)
+
+
+class CausalLLMTrainableData:
+    """Cleaned implementation of the upstream trainable CausalLLM data baseline."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int | None = None,
+        *,
+        model_path: str | Path | None = None,
+        hidden_size: int = 512,
+        intermediate_size: int = 1024,
+        num_hidden_layers: int = 8,
+        num_attention_heads: int = 8,
+        learning_rate: float = 2e-5,
+        l1_lambda: float = 0.01,
+        device: str | None = None,
+    ) -> None:
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        from transformers import LlamaConfig, LlamaModel
+
+        if int(num_attention_heads) <= 0 or int(num_hidden_layers) <= 0:
+            raise ValueError("num_attention_heads and num_hidden_layers must be positive.")
+        if int(hidden_size) % int(num_attention_heads) != 0:
+            raise ValueError("hidden_size must be divisible by num_attention_heads.")
+        self.torch = torch
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim if output_dim is not None else input_dim * input_dim)
+        self.model_path = Path(model_path) if model_path else None
+        self.l1_lambda = float(l1_lambda)
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        output_dim_local = self.output_dim
+
+        class _Backbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                config = LlamaConfig(
+                    hidden_size=int(hidden_size),
+                    intermediate_size=int(intermediate_size),
+                    num_hidden_layers=int(num_hidden_layers),
+                    num_attention_heads=int(num_attention_heads),
+                    max_position_embeddings=512,
+                    vocab_size=32000,
+                )
+                self.llama = LlamaModel(config)
+                for param in self.llama.parameters():
+                    param.requires_grad = False
+                self.input_projection = nn.Linear(int(input_dim), config.hidden_size)
+                self.output_projection = nn.Linear(config.hidden_size, int(output_dim_local))
+
+            def forward(self, x: Any) -> Any:
+                x = self.input_projection(x.to(torch.float32))
+                outputs = self.llama(inputs_embeds=x)
+                return self.output_projection(outputs.last_hidden_state)
+
+        self.model = _Backbone().to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=float(learning_rate))
+        self.criterion = nn.BCELoss()
+        if self.model_path and self.model_path.exists():
+            self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            self.model.eval()
+
+    def learn(self, data: np.ndarray, *, num_epochs: int = 10, batch_size: int = 32, epsilon: float = 0.1, seed: int = 0) -> None:
+        data_arr = _standardize_numeric_data(data)
+        if data_arr.shape[1] != self.input_dim:
+            raise ValueError(f"Data has {data_arr.shape[1]} variables, expected {self.input_dim}.")
+        torch = self.torch
+        rng = np.random.default_rng(seed)
+        torch.manual_seed(int(seed))
+        self.model.train()
+        for _epoch in range(max(1, int(num_epochs))):
+            for _ in range(max(1, int(batch_size))):
+                row = data_arr[int(rng.integers(data_arr.shape[0]))]
+                state = torch.tensor(row, dtype=torch.float32, device=self.device).view(1, 1, self.input_dim)
+                logits = self.model(state).view(-1)
+                probs = torch.sigmoid(logits)
+                if rng.random() < float(epsilon):
+                    random_probs = torch.rand_like(probs)
+                    probs = probs + (random_probs - probs).detach()
+                target = torch.zeros_like(probs)
+                loss = self.criterion(probs, target)
+                if self.l1_lambda > 0:
+                    l1_norm = sum(param.abs().sum() for param in self.model.parameters() if param.requires_grad)
+                    loss = loss + self.l1_lambda * l1_norm
+                self.optimizer.zero_grad()
+                loss.backward()
+                for param in self.model.parameters():
+                    if param.requires_grad and param.grad is not None:
+                        param.grad.data.clamp_(-1.0, 1.0)
+                self.optimizer.step()
+        if self.model_path:
+            self.model_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(self.model.state_dict(), self.model_path)
+
+    def causal_scores(self, data: np.ndarray) -> np.ndarray:
+        data_arr = _standardize_numeric_data(data)
+        torch = self.torch
+        src = torch.tensor(data_arr.mean(axis=0), dtype=torch.float32, device=self.device).view(1, 1, self.input_dim)
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(src).view(self.input_dim, self.input_dim)
+            scores = torch.sigmoid(logits).detach().cpu().numpy()
+        np.fill_diagonal(scores, 0.0)
+        return scores
+
+    def causal_matrix(self, data: np.ndarray, *, edge_threshold: float = 0.5, max_edges: int | None = None) -> np.ndarray:
+        scores = self.causal_scores(data)
+        return _prune_causal_llm_scores_by_linear_coef(
+            scores,
+            data,
+            edge_threshold=edge_threshold,
+            max_edges=max_edges,
+        )
+
+
 def _call_model(
     *,
     prompt: str,
@@ -410,12 +589,108 @@ def _build_data_prompt(
     return variables, answer_obj, prompt_text
 
 
+# -- CausalLLM dataset-specific prompts (Roy et al. 2023) ----------------------
+# Exact prompt from the paper's repo for the Sachs signaling network.
+# Capitalisation differences (p38/P38, PLCg/Plcg, pIP3/PIP3) are resolved by
+# case-insensitive matching at parse time.
+SACHS_CAUSAL_LLM_PROMPT = """\
+You are an *intelligent causal discovery agent* tasked with mapping how signaling molecules interact in the Sachs dataset to form a causal signaling network. These molecules influence one another through biochemical processes like activation, inhibition, or enzymatic transformation, ultimately leading to downstream cellular responses.
+
+### **Important Rules:**
+- Each signaling molecule may have *multiple incoming edges* to reflect how upstream molecules influence its activity.
+- Some molecules act as *critical intermediaries* (e.g., converting signals or amplifying responses) and may have both *incoming and outgoing edges*.
+- The causal DAG should faithfully represent known causal relationships in the Sachs dataset based on experimental data and biological knowledge.
+
+### **Features:**
+
+1. **Akt**: A kinase involved in cell survival pathways, regulating processes like metabolism, proliferation, and apoptosis.
+2. **Erk**: Extracellular signal-regulated kinase, part of the MAP kinase pathway, essential for cell division and differentiation.
+3. **Jnk**: c-Jun N-terminal kinase, associated with stress response and apoptosis signaling.
+4. **p38**: A stress-activated protein kinase involved in responses to inflammation and environmental stress.
+5. **PIP2**: Phosphatidylinositol 4,5-bisphosphate, a phospholipid precursor involved in signal transduction and membrane dynamics.
+6. **PIP3**: Phosphatidylinositol 3,4,5-trisphosphate, generated by PI3K and a key regulator of Akt signaling.
+7. **PKA**: Protein kinase A, a cAMP-dependent kinase that regulates metabolic and gene transcription processes.
+8. **PKC**: Protein kinase C, involved in regulating various cellular functions, including gene expression and membrane signaling.
+9. **PLCg**: Phospholipase C gamma, an enzyme that hydrolyzes PIP2 into IP3 and DAG, key molecules in calcium signaling.
+10. **Raf**: A kinase that acts upstream of MEK and Erk in the MAPK/ERK signaling pathway, influencing cell growth and survival.
+11. **pIP3**: Phosphorylated inositol triphosphate, linked to calcium signaling and involved in cellular communication.
+
+---
+
+### **Output Example:**
+
+### **Step 1: Finding the Edges**
+
+Here are the identified edges, focusing on how the signaling molecules influence one another:
+
+1. **Edge (PIP2 → PIP3):** PIP2 is phosphorylated by PI3K to form PIP3, marking a key step in activating the Akt signaling pathway.
+2.........
+..
+.
+.
+
+---
+
+### **Step 2: Reflect back on each edge to see if it matches Domain Knowledge and give the finalized set of edges.**
+
+---
+
+**Output format:**
+Provide a list of edges in the format specified above. For example:
+```
+1. (A, B) : Explanation of why A causes B.
+2. (C, D) : Explanation of why C causes D.
+...
+```\
+"""
+
+# Lookup: dataset stem → dataset-specific prompt (only Sachs so far)
+_CAUSAL_LLM_PROMPTS: dict[str, str] = {
+    "sachs": SACHS_CAUSAL_LLM_PROMPT,
+}
+
+
 def _semantic_full_graph_prompt(prompt_text: str) -> str:
     return (
         "Infer the full directed acyclic causal graph in one step using only the variable names and domain semantics.\n"
         "Prefer a sparse DAG and avoid indirect edges when possible.\n\n"
         + prompt_text
     )
+
+
+def _parse_causal_llm_two_step(raw: str, variables: list[str]) -> np.ndarray:
+    """Parse the two-step Roy et al. output; keep only edges confirmed in both steps.
+
+    Step 1 uses arrow notation  (A → B) or (A -> B).
+    Step 2 uses comma notation  (A, B).
+    An edge is accepted iff it appears in both steps (case-insensitive variable match).
+    """
+    name_to_idx: dict[str, int] = {v.lower(): i for i, v in enumerate(variables)}
+
+    def _idx(name: str) -> int | None:
+        return name_to_idx.get(name.lower())
+
+    # Step 1 — arrow edges anywhere in the full output
+    step1: set[tuple[int, int]] = set()
+    for src, tgt in re.findall(r'\((\w+)\s*(?:→|->)\s*(\w+)\)', raw):
+        si, ti = _idx(src), _idx(tgt)
+        if si is not None and ti is not None and si != ti:
+            step1.add((si, ti))
+
+    # Step 2 — comma edges in the text after the "Step 2" heading
+    parts = re.split(r'step\s*2', raw, flags=re.IGNORECASE)
+    step2_text = parts[1] if len(parts) > 1 else ""
+    step2: set[tuple[int, int]] = set()
+    for src, tgt in re.findall(r'\((\w+),\s*(\w+)\)', step2_text):
+        si, ti = _idx(src), _idx(tgt)
+        if si is not None and ti is not None and si != ti:
+            step2.add((si, ti))
+
+    n = len(variables)
+    adj = np.zeros((n, n), dtype=int)
+    for edge in step1 & step2:
+        adj[edge[0], edge[1]] = 1
+    return adj
 
 
 def _new_previous_edges() -> dict[str, dict[str, list[str]]]:
@@ -652,7 +927,16 @@ def _run_causal_llm_prompt(
         seed=seed,
         anonymize=anonymize,
     )
-    prompt = _semantic_full_graph_prompt(base_prompt)
+    # Use dataset-specific Roy et al. prompt when available (real names only).
+    # Fall back to generic semantic prompt for anonymized runs or unknown datasets.
+    dataset_key = graph_path.stem.lower()
+    if not anonymize and dataset_key in _CAUSAL_LLM_PROMPTS:
+        prompt = _CAUSAL_LLM_PROMPTS[dataset_key]
+        use_two_step_parser = True
+    else:
+        prompt = _semantic_full_graph_prompt(base_prompt)
+        use_two_step_parser = False
+
     raw = _call_model(
         prompt=prompt,
         model_name=model_name,
@@ -661,9 +945,12 @@ def _run_causal_llm_prompt(
         max_new_tokens=max_new_tokens,
         hf_pipe=hf_pipe,
     )
-    adj = extract_adjacency_matrix(raw, fallback_variables=variables)
-    if adj is None:
-        adj = _empty_dag(len(variables))
+    if use_two_step_parser:
+        adj = _parse_causal_llm_two_step(raw, variables)
+    else:
+        adj = extract_adjacency_matrix(raw, fallback_variables=variables)
+        if adj is None:
+            adj = _empty_dag(len(variables))
     return np.asarray(adj, dtype=int), variables, [raw]
 
 
@@ -1054,6 +1341,70 @@ def _run_causal_llm_data(
     return np.asarray(adj, dtype=int), variables, [raw]
 
 
+def _run_causal_llm_trainable_data(
+    *,
+    graph_path: Path,
+    sample_size_obs: int,
+    sample_size_inters: int,
+    seed: int,
+    num_epochs: int,
+    batch_size: int,
+    epsilon: float,
+    edge_threshold: float,
+    hidden_size: int,
+    num_hidden_layers: int,
+    num_attention_heads: int,
+    learning_rate: float,
+    l1_lambda: float,
+) -> tuple[np.ndarray, list[str], list[str]]:
+    if sample_size_inters != 0:
+        raise ValueError("CausalLLMTrainableData is observational-only to match the upstream implementation.")
+    obs, variables = _load_observational_array(graph_path, sample_size_obs=sample_size_obs, seed=seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+    except Exception:
+        pass
+    model = CausalLLMTrainableData(
+        input_dim=len(variables),
+        output_dim=len(variables) * len(variables),
+        hidden_size=hidden_size,
+        intermediate_size=max(hidden_size * 2, hidden_size),
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        learning_rate=learning_rate,
+        l1_lambda=l1_lambda,
+    )
+    model.learn(obs, num_epochs=num_epochs, batch_size=batch_size, epsilon=epsilon, seed=seed)
+    prediction = np.asarray(
+        model.causal_matrix(obs, edge_threshold=edge_threshold, max_edges=len(variables)),
+        dtype=int,
+    )
+    np.fill_diagonal(prediction, 0)
+    raw = json.dumps(
+        {
+            "implementation": "CausalLLMTrainableData",
+            "source": "devharish1371 Causal-LLM Dag_generation and model_evaluation/causal_llm.py",
+            "sample_size_obs": int(sample_size_obs),
+            "sample_size_inters": int(sample_size_inters),
+            "seed": int(seed),
+            "num_epochs": int(num_epochs),
+            "batch_size": int(batch_size),
+            "epsilon": float(epsilon),
+            "edge_threshold": float(edge_threshold),
+            "hidden_size": int(hidden_size),
+            "num_hidden_layers": int(num_hidden_layers),
+            "num_attention_heads": int(num_attention_heads),
+            "learning_rate": float(learning_rate),
+            "l1_lambda": float(l1_lambda),
+        },
+        ensure_ascii=False,
+    )
+    return prediction, variables, [raw]
+
+
 def _write_prediction_csv(
     *,
     out_csv: Path,
@@ -1139,6 +1490,14 @@ def main() -> int:
     parser.add_argument("--num_prompts", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--edge_threshold", type=float, default=0.5)
+    parser.add_argument("--causal_llm_epochs", type=int, default=10)
+    parser.add_argument("--causal_llm_batch_size", type=int, default=32)
+    parser.add_argument("--causal_llm_epsilon", type=float, default=0.1)
+    parser.add_argument("--causal_llm_hidden_size", type=int, default=512)
+    parser.add_argument("--causal_llm_layers", type=int, default=8)
+    parser.add_argument("--causal_llm_heads", type=int, default=8)
+    parser.add_argument("--causal_llm_lr", type=float, default=2e-5)
+    parser.add_argument("--causal_llm_l1", type=float, default=0.01)
     parser.add_argument("--prompt_mode", choices=["names_only", "summary", "summary_joint"], default="names_only")
     parser.add_argument("--naming_regime", choices=["real", "anonymized", "names_only"], default="real")
     args = parser.parse_args()
@@ -1167,8 +1526,16 @@ def main() -> int:
         raise SystemExit("CausalLLMData expects --prompt_mode summary.")
     if args.method == "CausalLLMData" and args.naming_regime == "names_only":
         raise SystemExit("CausalLLMData does not support --naming_regime names_only.")
+    if args.method == "CausalLLMTrainableData" and args.prompt_mode != "summary":
+        raise SystemExit("CausalLLMTrainableData expects --prompt_mode summary.")
+    if args.method == "CausalLLMTrainableData" and args.sample_size_inters != 0:
+        raise SystemExit("CausalLLMTrainableData is observational-only in the upstream implementation.")
+    if args.method == "CausalLLMTrainableData" and args.naming_regime == "names_only":
+        raise SystemExit("CausalLLMTrainableData does not support --naming_regime names_only.")
+    if args.method == "CausalLLMTrainableData" and args.causal_llm_hidden_size % args.causal_llm_heads != 0:
+        raise SystemExit("--causal_llm_hidden_size must be divisible by --causal_llm_heads.")
 
-    provider = _resolve_provider(args.provider, args.model)
+    provider = "local" if args.method == "CausalLLMTrainableData" else _resolve_provider(args.provider, args.model)
     hf_pipe = None
     if provider == "hf":
         hf_pipe = build_hf_pipeline(args.model)
@@ -1270,6 +1637,22 @@ def main() -> int:
                     seed=seed_i,
                     anonymize=anonymize,
                     hf_pipe=hf_pipe,
+                )
+            elif args.method == "CausalLLMTrainableData":
+                prediction, _variables, raw_responses = _run_causal_llm_trainable_data(
+                    graph_path=graph_path,
+                    sample_size_obs=args.sample_size_obs,
+                    sample_size_inters=args.sample_size_inters,
+                    seed=seed_i,
+                    num_epochs=args.causal_llm_epochs,
+                    batch_size=args.causal_llm_batch_size,
+                    epsilon=args.causal_llm_epsilon,
+                    edge_threshold=args.edge_threshold,
+                    hidden_size=args.causal_llm_hidden_size,
+                    num_hidden_layers=args.causal_llm_layers,
+                    num_attention_heads=args.causal_llm_heads,
+                    learning_rate=args.causal_llm_lr,
+                    l1_lambda=args.causal_llm_l1,
                 )
             else:
                 raise SystemExit(f"Unsupported method: {args.method}")

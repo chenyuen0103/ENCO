@@ -18,6 +18,7 @@ from experiments.run_external_llm_baselines import (
     _extract_name_list,
     _extract_pairwise_choice,
     _pairwise_prompt,
+    _prune_causal_llm_scores_by_linear_coef,
     _project_dag,
 )
 
@@ -48,6 +49,13 @@ class TestExternalLLMBaselines(unittest.TestCase):
             np.array([[0, 0], [1, 0]], dtype=int),
         ]
         dag = _aggregate_sampled_dags(mats, threshold=0.5)
+        self.assertEqual(dag.tolist(), [[0, 1], [0, 0]])
+
+    def test_causal_llm_coef_pruning_uses_source_target_orientation(self) -> None:
+        x = np.arange(20, dtype=float)
+        data = np.column_stack([x, 2.0 * x + 1.0])
+        scores = np.array([[0.0, 0.9], [0.1, 0.0]], dtype=float)
+        dag = _prune_causal_llm_scores_by_linear_coef(scores, data, edge_threshold=0.5, max_edges=1)
         self.assertEqual(dag.tolist(), [[0, 1], [0, 0]])
 
     def test_bfs_initial_messages_match_reference_prompts(self) -> None:
@@ -273,6 +281,53 @@ class TestExternalLLMBaselines(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["raw_response"] for row in rows], ["r0", "r1"])
+
+    def test_run_causal_llm_trainable_data_uses_local_model(self) -> None:
+        class FakeCausalLLM:
+            instances = []
+
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+                self.learn_kwargs = None
+                FakeCausalLLM.instances.append(self)
+
+            def learn(self, data, **kwargs) -> None:
+                self.data = np.asarray(data)
+                self.learn_kwargs = kwargs
+
+            def causal_matrix(self, data, **kwargs):
+                self.matrix_kwargs = kwargs
+                return np.array([[0, 1], [0, 0]], dtype=int)
+
+        with mock.patch.dict(
+            external._run_causal_llm_trainable_data.__globals__,
+            {
+                "_load_observational_array": mock.Mock(
+                    return_value=(np.array([[0.0, 1.0], [1.0, 2.0]], dtype=float), ["A", "B"])
+                ),
+                "CausalLLMTrainableData": FakeCausalLLM,
+            },
+        ):
+            adj, variables, raw = external._run_causal_llm_trainable_data(
+                graph_path=Path("/tmp/sachs.bif"),
+                sample_size_obs=100,
+                sample_size_inters=0,
+                seed=7,
+                num_epochs=3,
+                batch_size=4,
+                epsilon=0.2,
+                edge_threshold=0.6,
+                hidden_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                learning_rate=1e-3,
+                l1_lambda=0.0,
+            )
+        self.assertEqual(variables, ["A", "B"])
+        self.assertEqual(adj.tolist(), [[0, 1], [0, 0]])
+        self.assertEqual(FakeCausalLLM.instances[0].kwargs["input_dim"], 2)
+        self.assertEqual(FakeCausalLLM.instances[0].learn_kwargs["num_epochs"], 3)
+        self.assertIn("CausalLLMTrainableData", raw[0])
 
 
 if __name__ == "__main__":
