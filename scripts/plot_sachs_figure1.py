@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Plot the Sachs falsifiability-target figure for the MICAD paper."""
+"""Plot the Sachs observational-budget Figure 1 for MICAD.
+
+This version fixes the interventional budget at M=0 and sweeps observational
+budget N over 0, 100, 500, 1000, and 5000.  The N=0 point is the names-only
+semantic baseline for the LLM curves.  Classical observational baselines are PC
+and GES.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +25,9 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_INPUT = REPO_ROOT / "benchmark_runs" / "sachs_figure1" / "figure1_summary.csv"
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmark_runs" / "sachs_figure1"
-MAX_PLOTTED_INTERVENTIONS = 200
+OBS_BUDGETS = [0, 100, 500, 1000, 5000]
+CLASSICAL_OBS_BUDGETS = [100, 500, 1000, 5000]
+OBS_POS = {budget: index for index, budget in enumerate(OBS_BUDGETS)}
 
 
 @dataclass(frozen=True)
@@ -36,11 +44,20 @@ class SummaryRow:
     shd_ci95_halfwidth: float
 
 
+def _configure_matplotlib() -> None:
+    if not os.getenv("MPLCONFIGDIR"):
+        mpl_dir = Path("/tmp") / f"matplotlib_{os.getuid()}"
+        mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+
+
 def _read_summary(path: Path) -> list[SummaryRow]:
     rows: list[SummaryRow] = []
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for raw in reader:
+            n_valid = int(float(raw["n_valid"]))
+            shd_sd = float(raw.get("shd_sd") or 0.0)
             rows.append(
                 SummaryRow(
                     line_id=str(raw["line_id"]),
@@ -48,92 +65,58 @@ def _read_summary(path: Path) -> list[SummaryRow]:
                     naming_regime=str(raw["naming_regime"]),
                     obs_n=int(float(raw["obs_n"])),
                     int_n=int(float(raw["int_n"])),
-                    n_valid=int(float(raw["n_valid"])),
+                    n_valid=n_valid,
                     f1_mean=float(raw["f1_mean"]),
                     f1_ci95_halfwidth=float(raw.get("f1_ci95_halfwidth") or 0.0),
                     shd_mean=float(raw["shd_mean"]),
-                    shd_ci95_halfwidth=(
-                        1.96
-                        * float(raw.get("shd_sd") or 0.0)
-                        / math.sqrt(max(int(float(raw["n_valid"])), 1))
-                    ),
+                    shd_ci95_halfwidth=1.96 * shd_sd / math.sqrt(max(n_valid, 1)),
                 )
             )
     return rows
 
 
-def _select(rows: Iterable[SummaryRow], line_id: str) -> list[SummaryRow]:
-    return sorted((row for row in rows if row.line_id == line_id), key=lambda row: (row.int_n, row.obs_n))
+def _select(rows: Iterable[SummaryRow], line_id: str, *, int_n: int = 0) -> list[SummaryRow]:
+    return sorted(
+        (row for row in rows if row.line_id == line_id and row.int_n == int_n),
+        key=lambda row: row.obs_n,
+    )
 
 
-def _single(rows: Iterable[SummaryRow], line_id: str) -> SummaryRow:
-    matches = _select(rows, line_id)
-    if len(matches) != 1:
-        raise ValueError(f"Expected exactly one `{line_id}` row, found {len(matches)}.")
-    return matches[0]
+def _by_obs(rows: Iterable[SummaryRow]) -> dict[int, SummaryRow]:
+    result: dict[int, SummaryRow] = {}
+    for row in rows:
+        if row.obs_n in result:
+            raise ValueError(f"Duplicate row for {row.line_id} at obs_n={row.obs_n}, int_n={row.int_n}.")
+        result[row.obs_n] = row
+    return result
 
 
-def _values(rows: list[SummaryRow], metric: str) -> tuple[list[int], list[float], list[float]]:
+def _metric(row: SummaryRow, metric: str) -> tuple[float, float]:
     if metric == "f1":
-        return (
-            [row.int_n for row in rows],
-            [row.f1_mean for row in rows],
-            [row.f1_ci95_halfwidth for row in rows],
-        )
+        return row.f1_mean, row.f1_ci95_halfwidth
     if metric == "shd":
-        return (
-            [row.int_n for row in rows],
-            [row.shd_mean for row in rows],
-            [row.shd_ci95_halfwidth for row in rows],
-        )
+        return row.shd_mean, row.shd_ci95_halfwidth
     raise ValueError(f"Unsupported metric: {metric}")
 
 
-def _value(row: SummaryRow, metric: str) -> float:
-    if metric == "f1":
-        return row.f1_mean
-    if metric == "shd":
-        return row.shd_mean
-    raise ValueError(f"Unsupported metric: {metric}")
-
-
-def _metric_config(metric: str, floor: SummaryRow, rows: list[SummaryRow]) -> dict[str, object]:
+def _metric_config(metric: str, all_rows: list[SummaryRow]) -> dict[str, object]:
     if metric == "f1":
         return {
             "ylabel": "F1",
             "ylim": (-0.035, 1.05),
             "yticks": [0.0, 0.25, 0.50, 0.75, 1.0],
             "yticklabels": ["0.00", "0.25", "0.50", "0.75", "1.00"],
-            "semantic_label": "",
-            "legend_semantic": f"Semantic-Only ({floor.f1_mean:.2f})",
-            "lower_region": (0.0, floor.f1_mean),
-            "upper_region": (floor.f1_mean, 1.0),
-            "bad_region_label": "Below Semantic-Only:\nNo mixed-information gain",
-            "bad_region_xy": (145, floor.f1_mean * 0.44),
-            "gap_label": "Headroom:\nENCO - LLM",
-            "better": "higher",
-            "legend_loc": "lower left",
-            "legend_bbox": (0.01, 0.02),
+            "legend_loc": "lower right",
         }
-
     if metric == "shd":
-        max_y = max(_value(row, "shd") for row in rows)
-        y_max = max(24.0, math.ceil((max_y + 1.0) / 2.0) * 2.0)
+        max_y = max(row.shd_mean for row in all_rows)
+        y_max = max(22.0, math.ceil((max_y + 1.0) / 2.0) * 2.0)
         return {
             "ylabel": "SHD",
             "ylim": (0.0, y_max),
-            "yticks": [0, 5, 10, 15, 20] if y_max <= 22 else list(range(0, int(y_max) + 1, 5)),
+            "yticks": list(range(0, int(y_max) + 1, 5)),
             "yticklabels": None,
-            "semantic_label": "Semantic-only baseline",
-            "legend_semantic": f"Semantic baseline ({floor.shd_mean:.1f})",
-            "lower_region": (0.0, floor.shd_mean),
-            "upper_region": (floor.shd_mean, y_max),
-            "bad_region_label": "Above baseline:\nworse than semantic-only",
-            "bad_region_xy": (145, floor.shd_mean + (y_max - floor.shd_mean) * 0.42),
-            "gap_label": "Gap:\nLLM - ENCO",
-            "better": "lower",
             "legend_loc": "upper right",
-            "legend_bbox": (0.99, 0.99),
         }
     raise ValueError(f"Unsupported metric: {metric}")
 
@@ -156,208 +139,196 @@ def _display_model_name(model: str) -> str:
     return model
 
 
-def _configure_matplotlib() -> None:
-    if not os.getenv("MPLCONFIGDIR"):
-        mpl_dir = Path("/tmp") / f"matplotlib_{os.getuid()}"
-        mpl_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+def _series_for_obs(
+    row_map: dict[int, SummaryRow],
+    budgets: list[int],
+    *,
+    metric: str,
+    strict: bool,
+    label: str,
+) -> tuple[list[int], list[float], list[float]]:
+    missing = [budget for budget in budgets if budget not in row_map]
+    if missing:
+        print(f"[warn] Missing {label} rows for obs budgets {missing} at int_n=0.", file=sys.stderr)
+    if strict and missing:
+        raise ValueError(f"Missing {label} rows for obs budgets {missing} at int_n=0.")
+    xs: list[int] = []
+    ys: list[float] = []
+    yerr: list[float] = []
+    for budget in budgets:
+        row = row_map.get(budget)
+        if row is None:
+            continue
+        value, err = _metric(row, metric)
+        xs.append(budget)
+        ys.append(value)
+        yerr.append(err)
+    return xs, ys, yerr
 
 
-def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[str], metric: str) -> list[Path]:
+def _last_present(row_map: dict[int, SummaryRow], budgets: list[int]) -> SummaryRow:
+    for budget in reversed(budgets):
+        if budget in row_map:
+            return row_map[budget]
+    raise ValueError("No rows available for requested budgets.")
+
+
+def _plot_metric(
+    summary_csv: Path,
+    out_dir: Path,
+    basename: str,
+    formats: list[str],
+    metric: str,
+    *,
+    strict: bool,
+) -> list[Path]:
     _configure_matplotlib()
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.ticker import FixedLocator, FixedFormatter
 
     rows = _read_summary(summary_csv)
-    enco = [row for row in _select(rows, "enco_ceiling") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
-    real = [row for row in _select(rows, "llm_real") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
-    anon = [row for row in _select(rows, "llm_anonymized") if row.int_n <= MAX_PLOTTED_INTERVENTIONS]
-    floor = _single(rows, "semantic_floor")
-    pc = _single(rows, "pc_anchor")
-    ges = _single(rows, "ges_anchor")
+    semantic = _by_obs(_select(rows, "semantic_floor"))
+    real_data = _by_obs(_select(rows, "llm_real"))
+    anon_data = _by_obs(_select(rows, "llm_anonymized"))
+    pc_data = _by_obs(_select(rows, "pc_anchor"))
+    ges_data = _by_obs(_select(rows, "ges_anchor"))
 
-    if not enco or not real or not anon:
-        raise ValueError("Summary CSV must contain ENCO, llm_real, and llm_anonymized rows.")
-    llm_label = _display_model_name(real[0].system)
-    cfg = _metric_config(metric, floor, rows)
-    floor_y = _value(floor, metric)
-    pc_y = _value(pc, metric)
-    ges_y = _value(ges, metric)
+    if 0 not in semantic:
+        raise ValueError("Missing semantic_floor row for obs_n=0, int_n=0.")
+
+    # Treat names-only as the N=0 point for both LLM curves.
+    real_with_floor = {0: semantic[0], **real_data}
+    anon_with_floor = {0: semantic[0], **anon_data}
+
+    real_x, real_y, real_err = _series_for_obs(
+        real_with_floor,
+        OBS_BUDGETS,
+        metric=metric,
+        strict=strict,
+        label="llm_real/semantic_floor",
+    )
+    anon_x, anon_y, anon_err = _series_for_obs(
+        anon_with_floor,
+        OBS_BUDGETS,
+        metric=metric,
+        strict=strict,
+        label="llm_anonymized/semantic_floor",
+    )
+    pc_x, pc_y, pc_err = _series_for_obs(
+        pc_data,
+        CLASSICAL_OBS_BUDGETS,
+        metric=metric,
+        strict=strict,
+        label="PC",
+    )
+    ges_x, ges_y, ges_err = _series_for_obs(
+        ges_data,
+        CLASSICAL_OBS_BUDGETS,
+        metric=metric,
+        strict=strict,
+        label="GES",
+    )
+
+    if not real_x and not anon_x:
+        raise ValueError("No LLM rows available for requested observational budgets.")
+    if not pc_x and not ges_x:
+        raise ValueError("No PC/GES rows available for requested observational budgets.")
+
+    llm_label = _display_model_name(_last_present(real_with_floor, OBS_BUDGETS).system)
+    cfg = _metric_config(metric, rows)
 
     semantic_color = "#D55E00"
     mixed_color = "#0072B2"
-    data_color = "#111111"
-    anchor_color = "#6F6F6F"
-    below_floor_fill = "#F3C78A"
-    target_fill = "#B9D9EC"
+    pc_color = "#6F6F6F"
+    ges_color = "#333333"
 
-    fig, ax = plt.subplots(figsize=(7.3, 4.65))
+    fig, ax = plt.subplots(figsize=(7.3, 4.4))
     ax.set_facecolor("white")
 
-    all_m = sorted({row.int_n for row in enco + real + anon} | {0})
-    x_min, x_max = -20, min(max(all_m), MAX_PLOTTED_INTERVENTIONS) + 32
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(*cfg["ylim"])
-
-    lower_region = cfg["lower_region"]
-    upper_region = cfg["upper_region"]
-    if cfg["better"] == "higher":
-        ax.axhspan(*lower_region, color=below_floor_fill, alpha=0.13, zorder=0)
-        ax.axhspan(*upper_region, color=target_fill, alpha=0.07, zorder=0)
-    else:
-        ax.axhspan(*lower_region, color=target_fill, alpha=0.07, zorder=0)
-        ax.axhspan(*upper_region, color=below_floor_fill, alpha=0.13, zorder=0)
-
-    ax.axhline(
-        floor_y,
-        color=semantic_color,
-        linestyle=(0, (5, 3)),
-        linewidth=1.8,
-        zorder=2,
-    )
-
-    enco_x, enco_y, _ = _values(enco, metric)
-    real_x, real_y, _ = _values(real, metric)
-    anon_x, anon_y, _ = _values(anon, metric)
-
-    ax.plot(
-        enco_x,
-        enco_y,
-        color=data_color,
-        marker="o",
-        markersize=5.5,
-        linewidth=2.4,
-        zorder=4,
-    )
-    ax.plot(
-        real_x,
+    ax.errorbar(
+        [OBS_POS[x] for x in real_x],
         real_y,
+        yerr=real_err,
         color=mixed_color,
         marker="o",
         markersize=5,
         linewidth=2.0,
+        capsize=2.5,
+        label=f"{llm_label}: Real names",
         zorder=5,
     )
-    ax.plot(
-        anon_x,
+    ax.errorbar(
+        [OBS_POS[x] for x in anon_x],
         anon_y,
+        yerr=anon_err,
         color=mixed_color,
         marker="s",
         markersize=5,
         linewidth=2.0,
         linestyle=(0, (4, 2)),
+        capsize=2.5,
+        label=f"{llm_label}: Anonymized",
         zorder=5,
     )
+    ax.errorbar(
+        [OBS_POS[x] for x in pc_x],
+        pc_y,
+        yerr=pc_err,
+        color=pc_color,
+        marker="D",
+        markersize=5.2,
+        linewidth=1.8,
+        linestyle=(0, (5, 3)),
+        capsize=2.5,
+        label="PC",
+        zorder=4,
+    )
+    ax.errorbar(
+        [OBS_POS[x] for x in ges_x],
+        ges_y,
+        yerr=ges_err,
+        color=ges_color,
+        marker="X",
+        markersize=5.8,
+        linewidth=1.8,
+        linestyle=(0, (2, 2)),
+        capsize=2.5,
+        label="GES",
+        zorder=4,
+    )
 
-    ax.scatter([0], [pc_y], marker="D", s=34, color=anchor_color, zorder=6)
-    ax.scatter([0], [ges_y], marker="X", s=42, color=anchor_color, zorder=6)
-    ax.annotate(
-        "PC",
-        xy=(0, pc_y),
-        xytext=(-9, 0),
-        textcoords="offset points",
-        ha="right",
-        va="center",
-        fontsize=8.5,
-        color=anchor_color,
+    semantic_value, _ = _metric(semantic[0], metric)
+    ax.axhline(
+        semantic_value,
+        color=semantic_color,
+        linestyle=(0, (5, 3)),
+        linewidth=1.5,
+        zorder=2,
     )
     ax.annotate(
-        "GES",
-        xy=(0, ges_y),
-        xytext=(-9, 0),
+        "names-only",
+        xy=(OBS_POS[OBS_BUDGETS[-1]], semantic_value),
+        xytext=(-4, 7),
         textcoords="offset points",
         ha="right",
-        va="center",
-        fontsize=8.5,
-        color=anchor_color,
-    )
-
-    ax.annotate(
-        cfg["semantic_label"],
-        xy=(132, floor_y),
-        xytext=(0, 8),
-        textcoords="offset points",
-        ha="left",
-        va="center",
-        fontsize=8.8,
+        va="bottom",
+        fontsize=8.7,
         color=semantic_color,
     )
-    ax.annotate(
-        cfg["bad_region_label"],
-        xy=cfg["bad_region_xy"],
-        ha="center",
-        va="center",
-        fontsize=8.8,
-        color="#6B4B20",
-    )
-    headroom_x = 176
-    llm_reference_y = max(real_y[-1], anon_y[-1]) if cfg["better"] == "higher" else min(real_y[-1], anon_y[-1])
-    headroom_mid_y = (enco_y[-1] + llm_reference_y) * 0.5
-    ax.annotate(
-        "",
-        xy=(headroom_x, enco_y[-1]),
-        xytext=(headroom_x, llm_reference_y),
-        arrowprops=dict(arrowstyle="<->", color=data_color, lw=1.1),
-    )
-    ax.annotate(
-        cfg["gap_label"],
-        xy=(headroom_x, headroom_mid_y),
-        xytext=(-7, 0),
-        textcoords="offset points",
-        ha="right",
-        va="center",
-        fontsize=8.9,
-        color=data_color,
-        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.88),
-    )
 
-    def _endpoint_label(
-        xs: list[int],
-        ys: list[float],
-        *,
-        text: str,
-        color: str,
-        dx: float,
-        dy: float,
-        ha: str = "left",
-        linestyle: str = "solid",
-        marker: str = "o",
-    ) -> None:
-        ax.annotate(
-            text,
-            xy=(xs[-1], ys[-1]),
-            xytext=(dx, dy),
-            textcoords="offset points",
-            arrowprops=dict(arrowstyle="-", color=color, lw=0.9, shrinkA=2, shrinkB=2),
-            ha=ha,
-            va="center",
-            fontsize=8.9,
-            color=color,
-            bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.9),
-        )
-        ax.plot(
-            [xs[-1], xs[-1] + 0.001],
-            [ys[-1], ys[-1]],
-            color=color,
-            linestyle=linestyle,
-            marker=marker,
-            markersize=0,
-            alpha=0.0,
-        )
-
-    _endpoint_label(enco_x, enco_y, text="ENCO", color=data_color, dx=8, dy=0)
-
-    ax.set_xlabel("Intervention budget $M$ (LLM curves at fixed $N=1000$)", fontsize=10.5)
+    ax.set_xlabel("Observational budget $N$ (fixed $M=0$)", fontsize=10.5)
     ax.set_ylabel(cfg["ylabel"], fontsize=10.5)
-    ax.xaxis.set_major_locator(FixedLocator([0, 50, 100, 200]))
-    ax.xaxis.set_major_formatter(FixedFormatter(["0", "50", "100", "200"]))
+    ax.set_xlim(-0.12, len(OBS_BUDGETS) - 0.78)
+    ax.set_ylim(*cfg["ylim"])
+    ax.xaxis.set_major_locator(FixedLocator(list(range(len(OBS_BUDGETS)))))
+    ax.xaxis.set_major_formatter(FixedFormatter(["0", "100", "500", "1000", "5000"]))
     ax.yaxis.set_major_locator(FixedLocator(cfg["yticks"]))
     if cfg["yticklabels"] is not None:
         ax.yaxis.set_major_formatter(FixedFormatter(cfg["yticklabels"]))
 
     ax.grid(axis="y", color="#D9D9D9", linewidth=0.8, alpha=0.75)
-    ax.grid(axis="x", color="#EEEEEE", linewidth=0.6, alpha=0.5)
+    ax.grid(axis="x", color="#EEEEEE", linewidth=0.6, alpha=0.55)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.spines["left"].set_color("#333333")
@@ -365,17 +336,24 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     ax.tick_params(axis="both", labelsize=9)
 
     legend_handles = [
-        Line2D([0], [0], color=data_color, marker="o", markersize=5.5, linewidth=2.4, label="ENCO"),
-        Line2D([0], [0], color=mixed_color, marker="o", markersize=5, linewidth=2.0, label=f"{llm_label}: Real Names"),
-        Line2D([0], [0], color=mixed_color, marker="s", markersize=5, linewidth=2.0, linestyle=(0, (4, 2)), label=f"{llm_label}: Anonymized"),
-        Line2D([0], [0], color=semantic_color, linestyle=(0, (5, 3)), linewidth=1.8, label=cfg["legend_semantic"]),
-        Line2D([0], [0], marker="D", markersize=6.5, color=anchor_color, linewidth=0, label="PC"),
-        Line2D([0], [0], marker="X", markersize=7, color=anchor_color, linewidth=0, label="GES"),
+        Line2D([0], [0], color=mixed_color, marker="o", markersize=5, linewidth=2.0, label=f"{llm_label}: Real names"),
+        Line2D(
+            [0],
+            [0],
+            color=mixed_color,
+            marker="s",
+            markersize=5,
+            linewidth=2.0,
+            linestyle=(0, (4, 2)),
+            label=f"{llm_label}: Anonymized",
+        ),
+        Line2D([0], [0], color=pc_color, marker="D", markersize=5.2, linewidth=1.8, linestyle=(0, (5, 3)), label="PC"),
+        Line2D([0], [0], color=ges_color, marker="X", markersize=5.8, linewidth=1.8, linestyle=(0, (2, 2)), label="GES"),
+        Line2D([0], [0], color=semantic_color, linestyle=(0, (5, 3)), linewidth=1.5, label="Names-only"),
     ]
     legend = ax.legend(
         handles=legend_handles,
         loc=cfg["legend_loc"],
-        bbox_to_anchor=cfg["legend_bbox"],
         ncol=2,
         frameon=True,
         framealpha=0.97,
@@ -387,24 +365,15 @@ def _plot_metric(summary_csv: Path, out_dir: Path, basename: str, formats: list[
     )
     legend.get_frame().set_linewidth(0.8)
 
-    # fig.text(
-    #     0.5,
-    #     0.02,
-    #     # "Caption note: at M=0, ENCO collapses to the observational-only setting; this point is omitted from the plotted ENCO curve.",
-    #     ha="center",
-    #     va="bottom",
-    #     fontsize=8.0,
-    #     color="#333333",
-    # )
-    fig.tight_layout(rect=(0, 0.055, 1, 1))
+    fig.tight_layout()
     written = _write_formats(fig, out_dir, basename, formats)
     plt.close(fig)
     return written
 
 
-def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str]) -> list[Path]:
-    written = _plot_metric(summary_csv, out_dir, basename, formats, metric="f1")
-    written.extend(_plot_metric(summary_csv, out_dir, f"{basename}_shd", formats, metric="shd"))
+def plot(summary_csv: Path, out_dir: Path, basename: str, formats: list[str], *, strict: bool) -> list[Path]:
+    written = _plot_metric(summary_csv, out_dir, basename, formats, metric="f1", strict=strict)
+    written.extend(_plot_metric(summary_csv, out_dir, f"{basename}_shd", formats, metric="shd", strict=strict))
     return written
 
 
@@ -412,11 +381,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--summary-csv", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--basename", default="sachs_figure1_falsifiability_target")
+    parser.add_argument("--basename", default="sachs_figure1_obs_sweep_int0")
     parser.add_argument("--formats", nargs="+", default=["pdf", "png", "svg"], choices=["pdf", "png", "svg"])
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail if any requested obs budget is missing for LLM, PC, or GES.",
+    )
     args = parser.parse_args()
 
-    written = plot(args.summary_csv, args.out_dir, args.basename, args.formats)
+    written = plot(args.summary_csv, args.out_dir, args.basename, args.formats, strict=args.strict)
     for path in written:
         print(path)
     return 0
