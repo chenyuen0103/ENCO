@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / f"matplotlib-{os.getuid()}"))
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -258,7 +259,10 @@ def semantic_only_rows(df: pd.DataFrame, graphs: list[str], models: list[str]) -
 
 def read_best_configs(path: Path) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(f"Best-config CSV not found: {path}")
+        raise FileNotFoundError(
+            f"Best-config CSV not found: {path}. "
+            "Generate it first with: python scripts/collect_best_prompt_configs.py"
+        )
     df = pd.read_csv(path)
     required = {
         "graph",

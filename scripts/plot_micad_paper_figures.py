@@ -995,7 +995,7 @@ def write_latex_includes(out_dir: Path) -> None:
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig3_information_use_contrasts.pdf}
-  \caption{Matched information-use contrasts. Bars report directed-edge F1 differences: observational or interventional evidence versus names-only prompting, matrix rows versus summaries at the primary budget, and real versus anonymized variable names at the primary budget. Rows require enough valid parsed runs in each matched source cell.}
+  \caption{Matched information-use contrasts. Bars report directed-edge F1 differences: observational or interventional evidence versus names-only prompting, matrix rows versus summaries at the primary budget, and real versus anonymized variable names at the primary budget. Rows require enough valid parsed runs in each matched source cell. This display filter keeps the visualization uncluttered; incomplete model rows are omitted from the plot rather than interpreted as zero or negative effects.}
   \label{fig:information_use_contrasts}
 \end{figure*}
 

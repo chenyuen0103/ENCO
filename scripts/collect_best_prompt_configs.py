@@ -5,6 +5,7 @@ Default scope matches the paper audit:
   - current and legacy <graph>/eval_summary.csv files
   - 10 base paper LLMs only
   - obs_n <= 5000 and int_n <= 200
+  - summary/matrix data prompts must use p5
   - sachs_old excluded
 
 For each group
@@ -41,6 +42,7 @@ PER_GRAPH_BEST_NAME = "best_prompt_configs_by_valid_rate.csv"
 PER_GRAPH_TOP_VALID_NAME = "top_valid_rate_prompt_configs.csv"
 DEFAULT_MAX_OBS = 5000
 DEFAULT_MAX_INT = 200
+DEFAULT_DATA_PROMPT_COUNT = 5
 
 PAPER_MODEL_ORDER = [
     "GPT-5 Mini",
@@ -141,6 +143,12 @@ def parse_args() -> argparse.Namespace:
         help="Drop rows with int_n greater than this value. Use a negative value to disable.",
     )
     parser.add_argument(
+        "--data-prompt-count",
+        type=int,
+        default=DEFAULT_DATA_PROMPT_COUNT,
+        help="For summary/matrix prompts, keep only response files tagged with this p-count. Use negative to disable.",
+    )
+    parser.add_argument(
         "--no-per-graph",
         action="store_true",
         help="Only write combined outputs; do not write per-graph CSVs under scripts/responses/<graph>/.",
@@ -178,6 +186,13 @@ def f1_series(df: pd.DataFrame) -> pd.Series:
     f1 = numeric_series(df, "avg_f1")
     alt = numeric_series(df, "avg_F1")
     return f1.where(f1.notna(), alt)
+
+
+def infer_prompt_count(basename: object) -> int | pd.NA:
+    match = re.search(r"(?:^|_)p(?P<count>\d+)(?:_|$)", str(basename))
+    if not match:
+        return pd.NA
+    return int(match.group("count"))
 
 
 def normalize_stem_for_parse(stem: str) -> str:
@@ -272,7 +287,13 @@ def read_eval_summaries(roots: Iterable[Path], graphs: set[str] | None, include_
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-def normalize_rows(raw: pd.DataFrame, paper_models_only: bool, max_obs: int, max_int: int) -> pd.DataFrame:
+def normalize_rows(
+    raw: pd.DataFrame,
+    paper_models_only: bool,
+    max_obs: int,
+    max_int: int,
+    data_prompt_count: int,
+) -> pd.DataFrame:
     out = pd.DataFrame(index=raw.index)
     out["graph"] = text_series(raw, "dataset")
     out["graph_dir"] = text_series(raw, "graph_dir")
@@ -288,6 +309,7 @@ def normalize_rows(raw: pd.DataFrame, paper_models_only: bool, max_obs: int, max
     out["config"] = text_series(raw, "config")
     out["response_csv"] = text_series(raw, "response_csv")
     out["response_basename"] = out["response_csv"].map(lambda value: Path(value).name if value else "")
+    out["prompt_count"] = out["response_basename"].map(infer_prompt_count).astype("Int64")
     out["summary_path"] = text_series(raw, "summary_path")
     out["response_root"] = text_series(raw, "response_root")
 
@@ -352,6 +374,10 @@ def normalize_rows(raw: pd.DataFrame, paper_models_only: bool, max_obs: int, max
         & out["prompt_config_key"].ne("")
     )
     out = out[keep].copy()
+
+    if data_prompt_count >= 0:
+        is_data_prompt = out["prompt_style"].isin(["summary", "matrix"])
+        out = out[(~is_data_prompt) | out["prompt_count"].eq(data_prompt_count)].copy()
 
     dedup_cols = ["graph", "model", "obs_n", "int_n", "prompt_style", "anonymize", "prompt_config_key"]
     out = (
@@ -421,6 +447,7 @@ def output_columns(df: pd.DataFrame) -> list[str]:
         "int_n",
         "prompt_style",
         "anonymize",
+        "prompt_count",
         "selection_rule",
         "prompt_config_count",
         "num_top_valid_rate_configs",
@@ -491,6 +518,7 @@ def main() -> None:
         paper_models_only=not args.all_models,
         max_obs=args.max_obs,
         max_int=args.max_int,
+        data_prompt_count=args.data_prompt_count,
     )
     top_valid = select_top_valid_configs(rows)
     best = select_best_from_top_valid(rows, top_valid)
