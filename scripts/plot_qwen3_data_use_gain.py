@@ -54,6 +54,16 @@ from plot_qwen3_finetuned_ladder import (
 LOW_VALID_THRESHOLD = 0.60
 
 
+MODEL_ALIASES = {
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200":
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged",
+}
+
+
+def canonical_model_id(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
+
+
 @dataclass(frozen=True)
 class SelectedScore:
     model: str
@@ -220,28 +230,29 @@ def choose_best(scores: list[SelectedScore]) -> SelectedScore | None:
 
 def collect_selected(args: argparse.Namespace, graphs: list[str]) -> dict[tuple[str, str, str], SelectedScore]:
     candidates: dict[tuple[str, str, str], list[SelectedScore]] = defaultdict(list)
-    requested_models = set(args.models or [])
+    requested_models = {canonical_model_id(model) for model in args.models or []}
     for path in args.responses_dir.glob("*/*.csv.per_row.csv"):
         parsed = parse_response_file(path, args.responses_dir)
         if parsed is None or parsed.graph not in graphs:
             continue
+        model = canonical_model_id(parsed.model)
 
-        if parsed.model == BASE_MODEL:
+        if model == BASE_MODEL:
             pass
         elif requested_models:
-            if parsed.model not in requested_models:
+            if model not in requested_models:
                 continue
         elif not is_qwen3_4b_finetune(parsed.model):
             continue
 
         if names_allowed(parsed.config, args):
-            score = score_file(parsed.model, parsed.graph, "names_only", parsed.config, parsed.path, args.metric)
+            score = score_file(model, parsed.graph, "names_only", parsed.config, parsed.path, args.metric)
         elif data_allowed(parsed.config, args):
-            score = score_file(parsed.model, parsed.graph, "data", parsed.config, parsed.path, args.metric)
+            score = score_file(model, parsed.graph, "data", parsed.config, parsed.path, args.metric)
         else:
             score = None
         if score is not None:
-            candidates[(parsed.model, parsed.graph, score.slot)].append(score)
+            candidates[(model, parsed.graph, score.slot)].append(score)
 
     selected: dict[tuple[str, str, str], SelectedScore] = {}
     for key, scores in candidates.items():
@@ -405,7 +416,7 @@ def best_details_by_graph(details: list[DetailRow], graphs: list[str]) -> list[D
 def shared_model_details(details: list[DetailRow], graphs: list[str], requested_model: str) -> tuple[str, list[DetailRow]]:
     by_model_graph: dict[tuple[str, str], DetailRow] = {(row.model, row.graph): row for row in details}
     if requested_model != "best":
-        model = requested_model
+        model = canonical_model_id(requested_model)
         rows = [by_model_graph[(model, graph)] for graph in graphs if (model, graph) in by_model_graph]
         if not rows:
             raise SystemExit(f"No complete contrasts found for shared FT model: {model}")
