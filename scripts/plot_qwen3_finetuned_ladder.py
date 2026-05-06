@@ -26,6 +26,7 @@ if not os.environ.get("MPLCONFIGDIR"):
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.patches import Patch
 
 
@@ -33,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESPONSES_DIR = REPO_ROOT / "scripts" / "responses"
 DEFAULT_OUT_DIR = REPO_ROOT / "experiments" / "out" / "qwen3_posttraining_maintext"
 BASE_MODEL = "Qwen3-4B-Thinking-2507"
+BASE_MODEL_ALIASES = {BASE_MODEL, "Qwen3-4B", "Qwen/Qwen3-4B-Thinking-2507"}
 GRAPH_ORDER = ["cancer", "earthquake", "asia", "sachs"]
 GRAPH_LABELS = {
     "cancer": "Cancer",
@@ -115,6 +117,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--responses-dir", type=Path, default=DEFAULT_RESPONSES_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--best-configs-csv",
+        type=Path,
+        default=None,
+        help="Optional best_prompt_configs_by_valid_rate.csv to use instead of scanning per-row response files.",
+    )
     parser.add_argument("--graphs", nargs="*", default=GRAPH_ORDER, help="Graphs to average, or 'all'.")
     parser.add_argument("--obs", type=budget_arg, default="all")
     parser.add_argument("--inter", type=budget_arg, default="all")
@@ -126,6 +134,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
     )
     parser.add_argument("--models", nargs="*", default=None, help="Optional exact model ids to include.")
+    parser.add_argument("--include-base", action="store_true", help="Include the base Qwen3-4B model in the ladder.")
     parser.add_argument("--top-models", type=int, default=0, help="Keep only the top N models by best ladder score.")
     parser.add_argument("--formats", nargs="*", default=["pdf", "png"], choices=["pdf", "png", "svg"])
     return parser.parse_args()
@@ -215,9 +224,15 @@ def parse_response_file(path: Path, responses_dir: Path) -> ParsedFile | None:
 
 def is_qwen3_4b_finetune(model: str) -> bool:
     lower = model.lower()
-    if model == BASE_MODEL:
+    if model in BASE_MODEL_ALIASES:
         return False
     return "qwen3_4b" in lower or "grpo_from_qwen3_4b" in lower
+
+
+def canonical_model_id(model: str) -> str:
+    if model in BASE_MODEL_ALIASES:
+        return BASE_MODEL
+    return model
 
 
 def budget_from_config(config: str) -> tuple[int, int] | None:
@@ -296,7 +311,7 @@ def score_file(parsed: ParsedFile, condition: str, metric: str) -> FileScore | N
         return None
     return FileScore(
         graph=parsed.graph,
-        model=parsed.model,
+        model=canonical_model_id(parsed.model),
         condition=condition,
         config=parsed.config,
         value=mean(values),
@@ -323,21 +338,102 @@ def choose_best(scores: list[FileScore]) -> FileScore | None:
 
 def collect_best_files(args: argparse.Namespace, graphs: list[str], conditions: list[str]) -> list[FileScore]:
     candidates: dict[tuple[str, str, str], list[FileScore]] = defaultdict(list)
-    requested_models = set(args.models or [])
+    requested_models = {canonical_model_id(model) for model in args.models or []}
     for path in args.responses_dir.glob("*/*.csv.per_row.csv"):
         parsed = parse_response_file(path, args.responses_dir)
         if parsed is None or parsed.graph not in graphs:
             continue
-        if requested_models and parsed.model not in requested_models:
+        model = canonical_model_id(parsed.model)
+        if requested_models and model not in requested_models:
             continue
-        if not is_qwen3_4b_finetune(parsed.model):
+        if model == BASE_MODEL:
+            if not args.include_base and not requested_models:
+                continue
+        elif not is_qwen3_4b_finetune(parsed.model):
             continue
         for condition in conditions:
             if config_allowed(parsed.config, condition, args):
                 score = score_file(parsed, condition, args.metric)
                 if score is not None:
-                    candidates[(parsed.model, condition, parsed.graph)].append(score)
+                    candidates[(model, condition, parsed.graph)].append(score)
                 break
+
+    selected: list[FileScore] = []
+    for key in sorted(candidates):
+        best = choose_best(candidates[key])
+        if best is not None:
+            selected.append(best)
+    return selected
+
+
+def _best_config_path(path: str | float | None, response_basename: str) -> Path:
+    if path is not None and not (isinstance(path, float) and math.isnan(path)) and str(path):
+        return Path(str(path))
+    return Path(str(response_basename))
+
+
+def collect_best_config_rows(args: argparse.Namespace, graphs: list[str], conditions: list[str]) -> list[FileScore]:
+    if args.best_configs_csv is None:
+        return []
+    csv_path = args.best_configs_csv if args.best_configs_csv.is_absolute() else REPO_ROOT / args.best_configs_csv
+    df = pd.read_csv(csv_path)
+    requested_models = {canonical_model_id(model) for model in args.models or []}
+    candidates: dict[tuple[str, str, str], list[FileScore]] = defaultdict(list)
+
+    for _, row in df.iterrows():
+        graph = str(row.get("graph", "")).lower()
+        if graph not in graphs:
+            continue
+        condition = str(row.get("prompt_style", ""))
+        if condition not in conditions:
+            continue
+        model = canonical_model_id(str(row.get("model_raw") or row.get("model") or ""))
+        if requested_models and model not in requested_models:
+            continue
+        if model == BASE_MODEL:
+            if not args.include_base and not requested_models:
+                continue
+        elif not is_qwen3_4b_finetune(model):
+            continue
+        if args.prompt_style != "all":
+            wrapper = str(row.get("wrapper_mode", "") or "")
+            hint = int(float(row.get("append_format_hint", 0) or 0))
+            found_prompt_style = "wrapchat-fmthint" if wrapper == "chat" and hint else "wrapchat" if wrapper == "chat" else "fmthint" if hint else "plain"
+            if found_prompt_style != args.prompt_style:
+                continue
+        if condition != "names_only":
+            anonymize = int(float(row.get("anonymize", 0) or 0))
+            if args.anonymization == "real" and anonymize:
+                continue
+            if args.anonymization == "anon" and not anonymize:
+                continue
+            obs = int(float(row.get("obs_n", 0)))
+            inter = int(float(row.get("int_n", 0)))
+            if args.obs is not None and obs != args.obs:
+                continue
+            if args.inter is not None and inter != args.inter:
+                continue
+
+        valid_rows = int(float(row.get("valid_rows", 0) or 0))
+        total_rows = int(float(row.get("num_rows", 0) or 0))
+        valid_rate = row.get("valid_rate", math.nan)
+        if not total_rows and math.isfinite(float(valid_rate or math.nan)):
+            total_rows = 1
+            valid_rows = int(round(float(valid_rate)))
+        value = finite_float(str(row.get("avg_f1", "")))
+        if value is None:
+            value = 0.0
+        score = FileScore(
+            graph=graph,
+            model=model,
+            condition=condition,
+            config=str(row.get("config", "")),
+            value=value,
+            valid_rows=valid_rows,
+            total_rows=total_rows,
+            path=_best_config_path(row.get("response_csv"), str(row.get("response_basename", ""))),
+        )
+        candidates[(model, condition, graph)].append(score)
 
     selected: list[FileScore] = []
     for key in sorted(candidates):
@@ -382,6 +478,8 @@ def summarize(selected: list[FileScore], graphs: list[str], conditions: list[str
 
 
 def model_display_name(model: str) -> str:
+    if model == BASE_MODEL:
+        return "Base Qwen3-4B"
     replacements = [
         ("grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_", "GRPO CD no-cancer "),
         ("grpo_from_qwen3_4b_sft_mix_guide_v2_lenfix_2gpu_", "GRPO SFT mix v2 "),
@@ -433,8 +531,10 @@ def prompt_slug(args: argparse.Namespace) -> str:
 
 def output_stem(args: argparse.Namespace) -> str:
     top = "" if args.top_models <= 0 else f"_top{args.top_models}"
+    source = "_bestconfigs" if args.best_configs_csv is not None else ""
+    base = "_withbase" if args.include_base else ""
     return (
-        f"qwen3_finetuned_evidence_ladder_{args.metric}_{args.anonymization}_"
+        f"qwen3_candidate_evidence_ladder{source}{base}_{args.metric}_{args.anonymization}_"
         f"{budget_slug(args)}{prompt_slug(args)}{top}"
     )
 
@@ -547,7 +647,8 @@ def plot_ladder(rows: list[SummaryScore], args: argparse.Namespace, graphs: list
     ax.set_ylim(0, y_upper)
     graph_label = ", ".join(GRAPH_LABELS[graph] for graph in graphs)
     prompt = "" if args.prompt_style == "all" else f", {prompt_style_label(args.prompt_style)} prompts"
-    title = f"Fine-tuned Qwen3-4B evidence ladder ({args.anonymization}, {budget_label(args)}{prompt})"
+    source = "best configs" if args.best_configs_csv is not None else "best per-row files"
+    title = f"Qwen3-4B evidence ladder ({source}; {args.anonymization}, {budget_label(args)}{prompt})"
     ax.set_title(title, pad=8, fontsize=11)
     fig.text(
         0.01,
@@ -660,9 +761,13 @@ def main() -> None:
     args = parse_args()
     graphs = resolve_graphs(args.graphs)
     conditions = CONDITION_ORDER_ANON if args.anonymization == "anon" else CONDITION_ORDER_REAL
-    selected = collect_best_files(args, graphs, conditions)
+    selected = (
+        collect_best_config_rows(args, graphs, conditions)
+        if args.best_configs_csv is not None
+        else collect_best_files(args, graphs, conditions)
+    )
     if not selected:
-        raise SystemExit("No matching fine-tuned response files found.")
+        raise SystemExit("No matching ladder rows found.")
     rows = summarize(selected, graphs, conditions)
     plot_ladder(rows, args, graphs, conditions)
     write_csvs(rows, selected, args)
