@@ -28,7 +28,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 GRAPH_ORDER = ["cancer", "earthquake", "asia", "sachs"]
@@ -53,6 +52,27 @@ MODEL_ORDER = [
 ]
 
 FAMILY_BOUNDARIES = [1.5, 3.5, 6.5]
+
+MICAD_SEMANTIC_CMAP_COLORS = [
+    (0.00, "#FCFAFF"),  # sembg!28: near-white low end
+    (0.20, "#F2EAFE"),  # sembg: semantic-only panel fill
+    (0.50, "#AD89D4"),  # semantic-only accent; separates Sachs mid values
+    (1.00, "#3C1858"),  # semantic-only ink for high F1
+]
+
+MODEL_AXIS_LABELS = {
+    "GPT-5.2 Pro": "GPT-5.2\nPro",
+    "GPT-5 Mini": "GPT-5\nMini",
+    "Qwen2.5-72B": "Qwen2.5\n72B",
+    "Qwen2.5-14B": "Qwen2.5\n14B",
+    "Qwen2.5-7B": "Qwen2.5\n7B",
+    "Qwen3-30B-A3B": "Qwen3\n30B-A3B",
+    "Qwen3-4B": "Qwen3\n4B",
+    "Llama-3.1-70B": "Llama-3.1\n70B",
+    "Llama-3.1-8B": "Llama-3.1\n8B",
+    "Llama-3.1-8B-Inst.": "Llama-3.1\n8B-Inst.",
+}
+
 
 MODEL_DISPLAY_BY_RAW = {
     "gpt-5-mini": "GPT-5 Mini",
@@ -157,6 +177,17 @@ def parse_args() -> argparse.Namespace:
         "--show-title",
         action="store_true",
         help="Add an in-figure title. Omit for paper-ready caption-driven figures.",
+    )
+    parser.add_argument(
+        "--size-preset",
+        choices=["full", "half"],
+        default="full",
+        help="Figure sizing preset. Use 'half' for a half-textwidth paper figure.",
+    )
+    parser.add_argument(
+        "--transpose",
+        action="store_true",
+        help="Transpose the heatmap so models are rows and graphs are columns.",
     )
     return parser.parse_args()
 
@@ -451,7 +482,13 @@ def build_matrices(grid: pd.DataFrame, graphs: list[str], models: list[str]) -> 
     return f1, valid, total
 
 
-def annotate_cells(ax: plt.Axes, f1: np.ndarray, valid: np.ndarray, total: np.ndarray) -> None:
+def annotate_cells(
+    ax: plt.Axes,
+    f1: np.ndarray,
+    valid: np.ndarray,
+    total: np.ndarray,
+    fontsize: float,
+) -> None:
     for i in range(f1.shape[0]):
         for j in range(f1.shape[1]):
             value = f1[i, j]
@@ -462,12 +499,12 @@ def annotate_cells(ax: plt.Axes, f1: np.ndarray, valid: np.ndarray, total: np.nd
                 if np.isfinite(v) and np.isfinite(n) and v < n:
                     label += f"\n{int(v)}/{int(n)}"
                 text_color = "white" if value >= 0.62 else "black"
-                ax.text(j, i, label, ha="center", va="center", color=text_color, fontsize=6.6)
+                ax.text(j, i, label, ha="center", va="center", color=text_color, fontsize=fontsize)
             else:
                 label = "--"
                 if np.isfinite(v) and np.isfinite(n):
                     label = f"{int(v)}/{int(n)}"
-                ax.text(j, i, label, ha="center", va="center", color="#555555", fontsize=6.6)
+                ax.text(j, i, label, ha="center", va="center", color="#555555", fontsize=fontsize)
 
 
 def plot_heatmap(
@@ -476,42 +513,88 @@ def plot_heatmap(
     models: list[str],
     show_title: bool,
     show_family_boundaries: bool,
+    transpose: bool,
+    size_preset: str,
 ) -> plt.Figure:
     f1, valid, total = build_matrices(grid, graphs, models)
+    if transpose:
+        f1 = f1.T
+        valid = valid.T
+        total = total.T
     masked = np.ma.masked_invalid(f1)
 
-    cmap = plt.get_cmap("YlGnBu").copy()
+    cmap = mpl.colors.LinearSegmentedColormap.from_list(
+        "micad_semantic",
+        MICAD_SEMANTIC_CMAP_COLORS,
+    )
     cmap.set_bad("#eeeeee")
 
-    fig, ax = plt.subplots(figsize=(7.15, 2.95))
+    if transpose:
+        fig_size = (3.35, 3.65 if show_title else 3.45)
+    elif size_preset == "half":
+        fig_size = (3.05, 1.95 if show_title else 1.75)
+    else:
+        fig_size = (7.15, 2.85 if show_title else 2.95)
+    fig, ax = plt.subplots(figsize=fig_size)
     image = ax.imshow(masked, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
 
-    ax.set_xticks(np.arange(len(models)))
-    ax.set_xticklabels(models, rotation=42, ha="right", rotation_mode="anchor")
-    ax.set_yticks(np.arange(len(graphs)))
-    ax.set_yticklabels([GRAPH_LABELS.get(graph, graph) for graph in graphs])
-    ax.set_ylabel("Graph")
+    if transpose:
+        ax.set_xticks(np.arange(len(graphs)))
+        ax.set_xticklabels([GRAPH_LABELS.get(graph, graph) for graph in graphs], rotation=25, ha="right")
+        ax.set_yticks(np.arange(len(models)))
+        ax.set_yticklabels(models)
+        ax.set_ylabel("Model")
+    else:
+        ax.set_xticks(np.arange(len(models)))
+        ax.set_xticklabels([MODEL_AXIS_LABELS.get(model, model) for model in models], rotation=0, ha="center")
+        ax.set_yticks(np.arange(len(graphs)))
+        ax.set_yticklabels([GRAPH_LABELS.get(graph, graph) for graph in graphs])
+        ax.set_ylabel("Graph")
 
-    ax.set_xticks(np.arange(-0.5, len(models), 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, len(graphs), 1), minor=True)
+    if size_preset == "half" and not transpose:
+        ax.tick_params(axis="x", labelsize=5.6, pad=1.5)
+        ax.tick_params(axis="y", labelsize=6.0, pad=1.8)
+        ax.yaxis.label.set_size(6.2)
+    else:
+        ax.tick_params(axis="x", labelsize=7)
+        ax.tick_params(axis="y", labelsize=8)
+
+    ax.set_xticks(np.arange(-0.5, f1.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, f1.shape[0], 1), minor=True)
     ax.grid(which="minor", color="white", linewidth=0.8)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    if show_family_boundaries:
+    if show_family_boundaries and not transpose:
         for boundary in FAMILY_BOUNDARIES:
             if boundary < len(models) - 0.5:
                 ax.axvline(boundary, color="#333333", linewidth=0.8)
 
     if show_title:
-        ax.set_title("Semantic-only graph recovery (names_only)")
+        fig.suptitle(
+            "Semantic-only recovery from variable names alone",
+            fontsize=7.4 if size_preset == "half" and not transpose else 11.2,
+            fontweight="bold",
+            y=0.92 if size_preset == "half" and not transpose else 0.905,
+        )
 
-    annotate_cells(ax, f1, valid, total)
+    annotate_cells(ax, f1, valid, total, fontsize=5.3 if size_preset == "half" and not transpose else 6.6)
 
     cbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
     cbar.set_label("Directed-edge F1")
     cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    if size_preset == "half" and not transpose:
+        cbar.ax.tick_params(labelsize=5.5, pad=1.5)
+        cbar.ax.yaxis.label.set_size(5.8)
 
-    fig.tight_layout()
+    if show_title:
+        if transpose:
+            fig.subplots_adjust(left=0.36, right=0.84, bottom=0.14, top=0.83)
+        elif size_preset == "half":
+            fig.subplots_adjust(left=0.12, right=0.89, bottom=0.25, top=0.82)
+        else:
+            fig.subplots_adjust(left=0.09, right=0.91, bottom=0.18, top=0.84)
+    else:
+        fig.tight_layout()
     return fig
 
 
@@ -569,6 +652,8 @@ def main() -> None:
         models,
         args.show_title,
         show_family_boundaries=args.model_set == "all" and args.model_order == "paper",
+        transpose=args.transpose,
+        size_preset=args.size_preset,
     )
     save_figure(fig, out_dir, args.stem, args.formats)
     plt.close(fig)
