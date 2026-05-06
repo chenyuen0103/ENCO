@@ -7,6 +7,10 @@ condition. By default it reads the selected best-valid-rate prompt configs from
 
   experiments/out/micad_paper/semantic_only_heatmap_data.csv
   experiments/out/micad_paper/figures/semantic_only_heatmap.{pdf,png}
+
+Use ``--model-set complete-valid-top5`` for the main-text variant that keeps
+the five models with complete valid names-only coverage across the plotted
+graphs, ranked by mean names-only F1.
 """
 
 from __future__ import annotations
@@ -121,6 +125,22 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=MODEL_ORDER,
         help="Model display names to include as heatmap columns.",
+    )
+    parser.add_argument(
+        "--model-set",
+        choices=["all", "complete-valid-top5"],
+        default="all",
+        help=(
+            "Model subset to plot. 'complete-valid-top5' keeps the five models "
+            "with valid_rows == num_rows > 0 on every plotted graph, ranked by "
+            "mean names-only F1."
+        ),
+    )
+    parser.add_argument(
+        "--model-order",
+        choices=["performance", "paper"],
+        default="performance",
+        help="Column order. 'performance' sorts by mean semantic-only F1 across plotted graphs.",
     )
     parser.add_argument(
         "--graphs",
@@ -336,6 +356,79 @@ def semantic_only_rows_from_best_configs(df: pd.DataFrame, graphs: list[str], mo
     return out.sort_values(["graph_order", "model_order"]).reset_index(drop=True)
 
 
+def order_models_by_performance(rows: pd.DataFrame, models: list[str]) -> list[str]:
+    if rows.empty:
+        return models
+    paper_order = {model: idx for idx, model in enumerate(models)}
+    index = pd.MultiIndex.from_product([rows["graph"].dropna().unique(), models], names=["graph", "method_display"])
+    complete = rows.set_index(["graph", "method_display"]).reindex(index).reset_index()
+    complete["mean_f1_for_order"] = pd.to_numeric(complete["mean_f1"], errors="coerce").fillna(0.0)
+    scores = (
+        complete
+        .groupby("method_display", dropna=False)
+        .agg(
+            model_mean_f1=("mean_f1_for_order", "mean"),
+            valid_cells=("mean_f1", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+        )
+        .reset_index()
+    )
+    scores["_paper_order"] = scores["method_display"].map(paper_order).fillna(10_000)
+    scores["_score_sort"] = scores["model_mean_f1"].fillna(-1.0)
+    ranked = scores.sort_values(
+        ["_score_sort", "valid_cells", "_paper_order", "method_display"],
+        ascending=[False, False, True, True],
+    )["method_display"].tolist()
+    missing = [model for model in models if model not in ranked]
+    return ranked + missing
+
+
+def select_complete_valid_top_models(rows: pd.DataFrame, graphs: list[str], models: list[str], top_k: int = 5) -> list[str]:
+    if rows.empty:
+        raise ValueError("No names-only rows are available for complete-valid model selection.")
+
+    paper_order = {model: idx for idx, model in enumerate(models)}
+    index = pd.MultiIndex.from_product([graphs, models], names=["graph", "method_display"])
+    complete = rows.set_index(["graph", "method_display"]).reindex(index).reset_index()
+
+    complete["mean_f1_for_order"] = pd.to_numeric(complete["mean_f1"], errors="coerce")
+    complete["valid_rows_for_filter"] = pd.to_numeric(complete["valid_rows"], errors="coerce")
+    complete["n_rows_for_filter"] = pd.to_numeric(complete["n_rows"], errors="coerce")
+    complete["complete_valid_cell"] = (
+        complete["valid_rows_for_filter"].notna()
+        & complete["n_rows_for_filter"].notna()
+        & complete["n_rows_for_filter"].gt(0)
+        & complete["valid_rows_for_filter"].eq(complete["n_rows_for_filter"])
+    )
+
+    scores = (
+        complete
+        .groupby("method_display", dropna=False)
+        .agg(
+            complete_valid_graphs=("complete_valid_cell", "sum"),
+            model_mean_f1=("mean_f1_for_order", "mean"),
+        )
+        .reset_index()
+    )
+    scores = scores[scores["complete_valid_graphs"].eq(len(graphs))].copy()
+    if scores.empty:
+        raise ValueError(
+            "No models have complete valid names-only coverage across "
+            f"{', '.join(graphs)}."
+        )
+
+    scores["_paper_order"] = scores["method_display"].map(paper_order).fillna(10_000)
+    ranked = scores.sort_values(
+        ["model_mean_f1", "_paper_order", "method_display"],
+        ascending=[False, True, True],
+    )["method_display"].head(top_k).tolist()
+    if len(ranked) < top_k:
+        print(
+            f"[warn] Only {len(ranked)} models have complete valid names-only coverage "
+            f"across {', '.join(graphs)}."
+        )
+    return ranked
+
+
 def complete_grid(rows: pd.DataFrame, graphs: list[str], models: list[str]) -> pd.DataFrame:
     index = pd.MultiIndex.from_product([graphs, models], names=["graph", "method_display"])
     grid = rows.set_index(["graph", "method_display"]).reindex(index).reset_index()
@@ -377,7 +470,13 @@ def annotate_cells(ax: plt.Axes, f1: np.ndarray, valid: np.ndarray, total: np.nd
                 ax.text(j, i, label, ha="center", va="center", color="#555555", fontsize=6.6)
 
 
-def plot_heatmap(grid: pd.DataFrame, graphs: list[str], models: list[str], show_title: bool) -> plt.Figure:
+def plot_heatmap(
+    grid: pd.DataFrame,
+    graphs: list[str],
+    models: list[str],
+    show_title: bool,
+    show_family_boundaries: bool,
+) -> plt.Figure:
     f1, valid, total = build_matrices(grid, graphs, models)
     masked = np.ma.masked_invalid(f1)
 
@@ -398,9 +497,10 @@ def plot_heatmap(grid: pd.DataFrame, graphs: list[str], models: list[str], show_
     ax.grid(which="minor", color="white", linewidth=0.8)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    for boundary in FAMILY_BOUNDARIES:
-        if boundary < len(models) - 0.5:
-            ax.axvline(boundary, color="#333333", linewidth=0.8)
+    if show_family_boundaries:
+        for boundary in FAMILY_BOUNDARIES:
+            if boundary < len(models) - 0.5:
+                ax.axvline(boundary, color="#333333", linewidth=0.8)
 
     if show_title:
         ax.set_title("Semantic-only graph recovery (names_only)")
@@ -444,7 +544,16 @@ def main() -> None:
     else:
         df = read_best_configs(best_configs_csv)
         rows = semantic_only_rows_from_best_configs(df, graphs, args.models)
-    grid = complete_grid(rows, graphs, args.models)
+
+    models = args.models
+    if args.model_set == "complete-valid-top5":
+        models = select_complete_valid_top_models(rows, graphs, args.models, top_k=5)
+        print("[info] Complete-valid top-5 model order by mean names-only F1: " + ", ".join(models))
+    elif args.model_order == "performance":
+        models = order_models_by_performance(rows, args.models)
+        print("[info] Model order by mean F1: " + ", ".join(models))
+
+    grid = complete_grid(rows, graphs, models)
 
     data_out.parent.mkdir(parents=True, exist_ok=True)
     grid.to_csv(data_out, index=False)
@@ -454,7 +563,13 @@ def main() -> None:
     if missing:
         print(f"[warn] {missing} graph/model cells have no valid F1 and are shown as gray cells.")
 
-    fig = plot_heatmap(grid, graphs, args.models, args.show_title)
+    fig = plot_heatmap(
+        grid,
+        graphs,
+        models,
+        args.show_title,
+        show_family_boundaries=args.model_set == "all" and args.model_order == "paper",
+    )
     save_figure(fig, out_dir, args.stem, args.formats)
     plt.close(fig)
 

@@ -31,6 +31,13 @@ from matplotlib.patches import Patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GRAPH_ORDER = ["cancer", "earthquake", "asia", "sachs"]
+ANONYMIZATION_STRESS_MODELS = [
+    "GPT-5.2 Pro",
+    "GPT-5 Mini",
+    "Qwen2.5-72B",
+    "Qwen2.5-14B",
+    "Qwen2.5-7B",
+]
 SEMANTIC_SCALING_GRAPHS = ["cancer", "asia", "sachs", "child", "alarm"]
 SEMANTIC_SCALING_LABELS = {
     "cancer": "Cancer",
@@ -772,6 +779,112 @@ def plot_graph_model_profiles(
     plt.close(fig)
 
 
+def _supported_pair(row: pd.Series, real_col: str, anon_col: str) -> tuple[float, str]:
+    real = finite_or_nan(row.get(real_col))
+    anon = finite_or_nan(row.get(anon_col))
+    real_valid = finite_or_nan(row.get(CONDITION_VALID_COLUMNS[real_col]))
+    anon_valid = finite_or_nan(row.get(CONDITION_VALID_COLUMNS[anon_col]))
+    supported = (
+        np.isfinite(real)
+        and np.isfinite(anon)
+        and np.isfinite(real_valid)
+        and np.isfinite(anon_valid)
+        and real_valid >= MIN_CONTRAST_VALID_RUNS
+        and anon_valid >= MIN_CONTRAST_VALID_RUNS
+    )
+    label = "" if supported else "low n"
+    return (anon - real if supported else np.nan), label
+
+
+def plot_anonymization_stress_test(
+    cross: pd.DataFrame,
+    out_dir: Path,
+    formats: list[str],
+    models: list[str] | None = None,
+    graphs: list[str] | None = None,
+) -> None:
+    """Plot anonymized minus real-name F1 at the primary budget."""
+    models = models or ANONYMIZATION_STRESS_MODELS
+    graphs = graphs or GRAPH_ORDER
+    sub = cross[cross["graph"].isin(graphs) & cross["model"].isin(models)].copy()
+    if sub.empty:
+        print("[warn] No rows available for anonymization stress-test plot; skipping.")
+        return
+
+    sub["model"] = pd.Categorical(sub["model"], categories=models, ordered=True)
+    sub["graph"] = pd.Categorical(sub["graph"], categories=graphs, ordered=True)
+    sub = sub.sort_values(["model", "graph"])
+
+    panels = [
+        ("Summary prompts", "real_summary_f1", "anon_summary_f1"),
+        ("Matrix prompts", "real_matrix_f1", "anon_matrix_f1"),
+    ]
+    matrices: list[np.ndarray] = []
+    labels: list[np.ndarray] = []
+    for _, real_col, anon_col in panels:
+        mat = np.full((len(models), len(graphs)), np.nan, dtype=float)
+        lab = np.full((len(models), len(graphs)), "", dtype=object)
+        for i, model in enumerate(models):
+            for j, graph in enumerate(graphs):
+                rows = sub[sub["model"].eq(model) & sub["graph"].eq(graph)]
+                if rows.empty:
+                    continue
+                val, label = _supported_pair(rows.iloc[0], real_col, anon_col)
+                mat[i, j] = val
+                lab[i, j] = label
+        matrices.append(mat)
+        labels.append(lab)
+
+    finite_values = np.concatenate([mat[np.isfinite(mat)] for mat in matrices if np.isfinite(mat).any()])
+    if finite_values.size == 0:
+        print("[warn] No supported anonymization contrasts available; skipping.")
+        return
+    lim = max(0.12, float(np.nanmax(np.abs(finite_values))))
+
+    cmap = plt.get_cmap("RdBu").copy()
+    cmap.set_bad("#eeeeee")
+    fig, axes = plt.subplots(1, 2, figsize=(7.25, 2.65), sharey=True, gridspec_kw={"wspace": 0.08})
+    for ax, (title, _, _), mat, lab in zip(axes, panels, matrices, labels):
+        image = ax.imshow(np.ma.masked_invalid(mat), cmap=cmap, vmin=-lim, vmax=lim, aspect="auto")
+        ax.set_title(title, fontsize=8.8, pad=5)
+        ax.set_xticks(np.arange(len(graphs)))
+        ax.set_xticklabels([graph.capitalize() for graph in graphs], rotation=25, ha="right", rotation_mode="anchor")
+        ax.set_yticks(np.arange(len(models)))
+        ax.set_yticklabels(models)
+        ax.set_xticks(np.arange(-0.5, len(graphs), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(models), 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.8)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        ax.tick_params(axis="both", length=0)
+        for i in range(len(models)):
+            for j in range(len(graphs)):
+                val = mat[i, j]
+                if np.isfinite(val):
+                    color = "white" if abs(val) > 0.55 * lim else "#1f1f1f"
+                    ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=7.0, color=color)
+                elif lab[i, j]:
+                    ax.text(j, i, lab[i, j], ha="center", va="center", fontsize=6.4, color="#555555")
+                else:
+                    ax.text(j, i, "--", ha="center", va="center", fontsize=6.8, color="#777777")
+
+    axes[0].set_ylabel("Model")
+    for ax in axes[1:]:
+        ax.tick_params(axis="y", labelleft=False)
+    cbar = fig.colorbar(image, ax=axes.ravel().tolist(), fraction=0.035, pad=0.02)
+    cbar.set_label(r"Anonymized $-$ real F1", fontsize=8.0)
+    cbar.ax.tick_params(labelsize=7.2, length=2.5)
+    fig.suptitle("Anonymization stress test at the primary budget", fontsize=9.4, y=0.985)
+    fig.supxlabel(
+        f"Negative values indicate drops under anonymization; gray cells lack paired >= {MIN_CONTRAST_VALID_RUNS}/5 valid runs",
+        fontsize=7.4,
+        y=0.010,
+    )
+    fig.subplots_adjust(left=0.18, right=0.90, bottom=0.24, top=0.80)
+
+    save_figure(fig, out_dir, "fig_anonymization_stress_test", formats)
+    plt.close(fig)
+
+
 def _node_count_from_bif(graph: str) -> float:
     bif_path = REPO_ROOT / "causal_graphs" / "real_data" / "small_graphs" / f"{graph}.bif"
     if not bif_path.exists():
@@ -999,6 +1112,13 @@ def write_latex_includes(out_dir: Path) -> None:
   \label{fig:information_use_contrasts}
 \end{figure*}
 
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig_anonymization_stress_test.pdf}
+  \caption{Anonymization stress test at the primary budget. Each cell reports anonymized minus real-name directed-edge F1 for the same graph, model, prompt format, and data budget. Negative values indicate performance drops under anonymization, revealing name-mediated support; gray cells lack paired valid source cells and are not interpreted as zero effects.}
+  \label{fig:anonymization_stress_test}
+\end{figure*}
+
 \begin{figure}[t]
   \centering
   \includegraphics[width=0.5\textwidth]{experiments/out/micad_paper/figures/fig_rq1_gpt52_name_only_scaling.pdf}
@@ -1095,6 +1215,7 @@ def main() -> None:
             anonymized=True,
         )
 
+    plot_anonymization_stress_test(cross, out_dir, args.formats)
     plot_gpt52_names_only_scaling(cross, out_dir, args.formats)
     write_latex_includes(out_dir)
 
