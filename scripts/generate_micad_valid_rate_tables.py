@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate MICAD valid-run coverage tables.
 
-Inputs are produced by scripts/collect_micad_paper_results.py.  The script
+Inputs are produced by scripts/collect_best_prompt_configs.py.  The script
 writes:
 
   experiments/out/micad_paper/paper_valid_rate_primary_budget.csv
@@ -57,7 +57,19 @@ def parse_args() -> argparse.Namespace:
         "--paper-dir",
         type=Path,
         default=Path("experiments/out/micad_paper"),
-        help="Directory containing canonical_condition_results.csv.",
+        help="Directory for paper table outputs.",
+    )
+    parser.add_argument(
+        "--results-csv",
+        type=Path,
+        default=Path("experiments/out/best_prompt_configs_by_valid_rate.csv"),
+        help="Best-config CSV from scripts/collect_best_prompt_configs.py.",
+    )
+    parser.add_argument(
+        "--canonical-csv",
+        type=Path,
+        default=None,
+        help="Legacy canonical_condition_results.csv input. Overrides --results-csv if provided.",
     )
     parser.add_argument("--obs", type=int, default=5000, help="Primary observational budget.")
     parser.add_argument("--inter", type=int, default=200, help="Primary interventional budget.")
@@ -80,13 +92,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_canonical(paper_dir: Path) -> pd.DataFrame:
-    path = paper_dir / "canonical_condition_results.csv"
+def read_legacy_canonical(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing required input: {path}")
     df = pd.read_csv(path)
     for col in ["obs", "inter", "valid_rows", "n_rows"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[~df["method"].isin(DATA_ONLY_METHODS)].copy()
+
+
+def condition_from_best_config(row: pd.Series) -> str | None:
+    style = "" if pd.isna(row.get("prompt_style")) else str(row.get("prompt_style")).strip()
+    if style == "names_only":
+        return "names_only"
+    if style not in {"summary", "matrix"}:
+        return None
+    anonymize = pd.to_numeric(row.get("anonymize"), errors="coerce")
+    prefix = "anon" if pd.notna(anonymize) and int(anonymize) == 1 else "real"
+    return f"{prefix}+{style}"
+
+
+def read_best_configs(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required input: {path}")
+    raw = pd.read_csv(path)
+    required = {"graph", "model", "obs_n", "int_n", "prompt_style", "anonymize", "valid_rows", "num_rows"}
+    missing = sorted(required - set(raw.columns))
+    if missing:
+        raise ValueError(f"{path} missing required columns: {missing}")
+
+    df = pd.DataFrame()
+    df["graph"] = raw["graph"].astype(str)
+    df["method"] = raw["model"].astype(str)
+    df["method_display"] = raw["model"].astype(str)
+    df["obs"] = pd.to_numeric(raw["obs_n"], errors="coerce")
+    df["inter"] = pd.to_numeric(raw["int_n"], errors="coerce")
+    df["condition"] = raw.apply(condition_from_best_config, axis=1)
+    df["valid_rows"] = pd.to_numeric(raw["valid_rows"], errors="coerce")
+    df["n_rows"] = pd.to_numeric(raw["num_rows"], errors="coerce")
+    df["path"] = raw["response_csv"] if "response_csv" in raw.columns else ""
+    df["source_kind"] = "best_prompt_configs_by_valid_rate"
+    df["selection_rule"] = raw["selection_rule"] if "selection_rule" in raw.columns else "top_valid_rate_then_best_f1"
+    df = df[df["condition"].isin(CONDITION_ORDER)].copy()
     return df[~df["method"].isin(DATA_ONLY_METHODS)].copy()
 
 
@@ -305,7 +352,7 @@ def write_primary_latex(df: pd.DataFrame, path: Path, obs: int, inter: int, incl
         r"% Requires \usepackage[table]{xcolor} or \usepackage{colortbl}",
         r"\begin{table*}[t]",
         r"\centering",
-        rf"\caption{{Valid responses ratio at $N={obs}$, $M={inter}$. Each graph cell reports {subheaders}, where entries are valid/total runs. ``--'' denotes the prompts exceed context-window error.}}",
+        rf"\caption{{Valid responses ratio after top-valid-rate prompt-config selection at $N={obs}$, $M={inter}$. Each graph cell reports {subheaders}, where entries are valid/total runs. ``--'' denotes the prompts exceed context-window error.}}",
         r"\label{tab:valid_rate_primary_budget}",
         r"\scriptsize",
         r"\setlength{\tabcolsep}{3pt}",
@@ -382,7 +429,10 @@ def write_csv(df: pd.DataFrame, path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    df = read_canonical(args.paper_dir)
+    if args.canonical_csv is not None:
+        df = read_legacy_canonical(args.canonical_csv)
+    else:
+        df = read_best_configs(args.results_csv)
 
     primary = build_primary_budget_table(df, args.obs, args.inter, args.include_anon, args.all_models)
     by_budget = build_by_budget_table(df)

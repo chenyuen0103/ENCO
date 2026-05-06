@@ -1213,7 +1213,7 @@ def main() -> None:
         default=(Path(__file__).resolve().parent / "responses"),
         help=(
             "Root directory to write response CSVs under. "
-            "Default: experiments/responses (relative to repo root)."
+            "Default: scripts/responses (relative to repo root)."
         ),
     )
 

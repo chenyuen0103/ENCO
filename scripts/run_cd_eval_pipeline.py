@@ -455,10 +455,11 @@ def _parse_response_meta(dataset: str, csv_path: Path) -> ResponseMeta:
 
 
 def _default_response_dirs(experiments_dir: Path, dataset: str) -> list[Path]:
-    # Responses may live either under experiments/responses/<dataset> (when run from experiments/)
-    # or under repo_root/responses/<dataset> (when run from repo root).
+    # scripts/responses is the canonical root. The remaining roots are legacy
+    # fallbacks retained while old experiment artifacts are being consolidated.
     repo_root = experiments_dir.parent
     return [
+        repo_root / "scripts" / "responses" / dataset,
         experiments_dir / "responses" / dataset,
         repo_root / "responses" / dataset,
     ]
@@ -1365,7 +1366,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--enco-responses-dir",
-        default="experiments/responses/sachs",
+        default="scripts/responses/sachs",
         help=(
             "Deprecated legacy option; prediction CSVs are discovered automatically. "
             "Default retained for backward compatibility."
@@ -1377,7 +1378,7 @@ def main() -> None:
         default=[],
         help=(
             "Directory to search for response CSVs during evaluate/analyze. Repeatable. "
-            "When omitted, searches experiments/responses/<dataset> and responses/<dataset>."
+            "When omitted, searches scripts/responses/<dataset> first, then legacy roots."
         ),
     )
 

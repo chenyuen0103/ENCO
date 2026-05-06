@@ -88,6 +88,8 @@ CONTRAST_LABELS = {
     "gap_to_data_only": "Gap to\nclassical",
 }
 
+MIN_CONTRAST_VALID_RUNS = 3
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -477,15 +479,68 @@ def _style_contrast_axis(ax: plt.Axes, y: np.ndarray, title: str, subtitle: str)
         ax.axhspan(ypos - 0.5, ypos + 0.5, color="#f6f6f4", zorder=-3)
     ax.axvline(0, color="#2c2c2c", linewidth=0.7, alpha=0.85, zorder=0)
     ax.grid(axis="x", alpha=0.20, linewidth=0.45, color="#777777")
-    ax.set_title(f"{title}\n{subtitle}", fontsize=8.0, pad=6, linespacing=1.15)
+    ax.set_title(f"{title}\n{subtitle}", fontsize=7.8, pad=6, linespacing=1.15)
     ax.tick_params(axis="x", labelsize=6.8, length=2.2, width=0.5, color="#5f5f5f")
     ax.tick_params(axis="y", labelsize=7.1, length=0)
     ax.spines["left"].set_visible(False)
     ax.spines["bottom"].set_linewidth(0.5)
 
 
+def _condition_key(semantic: str, fmt: str, obs: int, inter: int) -> tuple[str, str, int, int]:
+    return semantic, fmt, int(obs), int(inter)
+
+
+def _valid_condition_map(canonical: pd.DataFrame | None, graph: str) -> dict[tuple[str, tuple[str, str, int, int]], bool]:
+    if canonical is None or canonical.empty:
+        return {}
+    needed = {"graph", "method_display", "semantic", "format", "obs", "inter", "mean_f1", "valid_rows"}
+    if not needed.issubset(canonical.columns):
+        return {}
+    graph_rows = canonical[canonical["graph"].astype(str).eq(graph)].copy()
+    valid_map: dict[tuple[str, tuple[str, str, int, int]], bool] = {}
+    for _, row in graph_rows.iterrows():
+        model = str(row["method_display"])
+        key = _condition_key(str(row["semantic"]), str(row["format"]), int(row["obs"]), int(row["inter"]))
+        f1 = finite_or_nan(row.get("mean_f1"))
+        valid_rows = finite_or_nan(row.get("valid_rows"))
+        valid_map[(model, key)] = bool(np.isfinite(f1) and np.isfinite(valid_rows) and valid_rows >= MIN_CONTRAST_VALID_RUNS)
+    return valid_map
+
+
+def _contrast_is_supported(
+    valid_map: dict[tuple[str, tuple[str, str, int, int]], bool],
+    model: str,
+    metric: str,
+    obs: int,
+    inter: int,
+) -> bool:
+    if not valid_map:
+        return True
+    names = _condition_key("names_only", "names_only", 0, 0)
+    required = {
+        "observational_summary_gain": [names, _condition_key("real", "summary", obs, 0)],
+        "observational_matrix_gain": [names, _condition_key("real", "matrix", obs, 0)],
+        "interventional_summary_gain": [names, _condition_key("real", "summary", 0, inter)],
+        "interventional_matrix_gain": [names, _condition_key("real", "matrix", 0, inter)],
+        "format_gap_matrix_minus_summary": [
+            _condition_key("real", "summary", obs, inter),
+            _condition_key("real", "matrix", obs, inter),
+        ],
+        "anonymization_drop_summary": [
+            _condition_key("real", "summary", obs, inter),
+            _condition_key("anon", "summary", obs, inter),
+        ],
+        "anonymization_drop_matrix": [
+            _condition_key("real", "matrix", obs, inter),
+            _condition_key("anon", "matrix", obs, inter),
+        ],
+    }.get(metric, [])
+    return all(valid_map.get((model, key), False) for key in required)
+
+
 def plot_contrast_bars(
     contrasts: pd.DataFrame,
+    canonical: pd.DataFrame | None,
     out_dir: Path,
     formats: list[str],
     graph: str,
@@ -507,30 +562,64 @@ def plot_contrast_bars(
     sub = graph_contrasts[graph_contrasts.model.isin(selected_models) & graph_contrasts.metric.isin(metrics)].copy()
     pivot = sub.pivot_table(index="model", columns="metric", values="value", aggfunc="mean")
     pivot = pivot.reindex(index=selected_models, columns=metrics)
+    obs_budget = int(pd.to_numeric(graph_contrasts["obs"], errors="coerce").dropna().max()) if "obs" in graph_contrasts else 5000
+    int_budget = int(pd.to_numeric(graph_contrasts["inter"], errors="coerce").dropna().max()) if "inter" in graph_contrasts else 200
+    valid_map = _valid_condition_map(canonical, graph)
+    support = pd.DataFrame(False, index=pivot.index, columns=pivot.columns)
+    for model in pivot.index:
+        for metric in pivot.columns:
+            supported = _contrast_is_supported(valid_map, str(model), str(metric), obs_budget, int_budget)
+            support.loc[model, metric] = supported and np.isfinite(finite_or_nan(pivot.loc[model, metric]))
+    pivot = pivot.where(support)
     if not np.isfinite(pivot.to_numpy(dtype=float)).any():
         print(f"[warn] No contrast values available for graph={graph}; skipping.")
         return
 
-    models = [
-        model
-        for model in selected_models
-        if model in pivot.index and np.isfinite(pivot.loc[model].to_numpy(dtype=float)).any()
+    panel_metrics = [
+        ("observational_summary_gain", "observational_matrix_gain"),
+        ("interventional_summary_gain", "interventional_matrix_gain"),
+        ("format_gap_matrix_minus_summary",),
+        ("anonymization_drop_summary", "anonymization_drop_matrix"),
     ]
+    models = []
+    dropped_models = []
+    for model in selected_models:
+        if model not in pivot.index:
+            continue
+        has_panel_value = [
+            np.isfinite(pivot.loc[model, list(panel)].to_numpy(dtype=float)).any()
+            for panel in panel_metrics
+        ]
+        if all(has_panel_value):
+            models.append(model)
+        elif any(has_panel_value):
+            dropped_models.append(model)
+    if dropped_models:
+        print(
+            f"[info] Dropping {len(dropped_models)} model(s) from Figure 3 for graph={graph} "
+            f"because supported contrasts are incomplete across panels: "
+            + ", ".join(dropped_models)
+        )
+    if not models:
+        print(f"[warn] No Figure 3 rows have supported contrasts in every panel for graph={graph}; skipping.")
+        return
     y = np.arange(len(models))
-    fig_height = max(3.5, 0.34 * len(models) + 1.15)
-    fig, axes = plt.subplots(1, 4, figsize=(8.9, fig_height), sharey=True, gridspec_kw={"wspace": 0.16})
+    fig_height = max(2.7, 0.37 * len(models) + 1.35)
+    fig, axes = plt.subplots(1, 4, figsize=(8.9, fig_height), sharey=True, gridspec_kw={"wspace": 0.18})
 
     data = {
-        ("Obs. gain", r"$N:0\to5000,\ M=0$"): [
+        ("Observational data", rf"$F_1(N={obs_budget},M=0)-F_1$ names-only"): [
             ("observational_summary_gain", "Summary", CONDITION_COLORS["real_summary_f1"]),
             ("observational_matrix_gain", "Matrix", CONDITION_COLORS["real_matrix_f1"]),
         ],
-        ("Int. gain", r"$M:0\to200,\ N=0$"): [
+        ("Interventional data", rf"$F_1(N=0,M={int_budget})-F_1$ names-only"): [
             ("interventional_summary_gain", "Summary", CONDITION_COLORS["real_summary_f1"]),
             ("interventional_matrix_gain", "Matrix", CONDITION_COLORS["real_matrix_f1"]),
         ],
-        ("Format", "Matrix - summary"): [("format_gap_matrix_minus_summary", "Matrix - summary", "#686868")],
-        ("Name reliance", "Real - anonymized"): [
+        ("Representation", rf"Matrix $-$ summary at $N={obs_budget},M={int_budget}$"): [
+            ("format_gap_matrix_minus_summary", "Matrix - summary", "#686868")
+        ],
+        ("Name reliance", rf"Real $-$ anonymized at $N={obs_budget},M={int_budget}$"): [
             ("anonymization_drop_summary", "Summary", "#8cc084"),
             ("anonymization_drop_matrix", "Matrix", "#86a9cc"),
         ],
@@ -587,9 +676,13 @@ def plot_contrast_bars(
         columnspacing=1.4,
         handlelength=1.4,
     )
-    fig.suptitle(f"{graph.capitalize()}: information-use contrasts", fontsize=9.2, y=0.995)
-    fig.supxlabel("Matched directed-edge F1 difference", fontsize=8.0, y=0.035)
-    fig.subplots_adjust(left=0.19, right=0.995, bottom=0.17, top=0.80)
+    fig.suptitle(f"{graph.capitalize()}: matched information-use contrasts", fontsize=9.2, y=0.995)
+    fig.supxlabel(
+        f"Directed-edge F1 difference; rows require >= {MIN_CONTRAST_VALID_RUNS}/5 valid parsed runs in each matched source cell",
+        fontsize=7.4,
+        y=0.040,
+    )
+    fig.subplots_adjust(left=0.19, right=0.995, bottom=0.20, top=0.79)
     save_figure(fig, out_dir, _stem("fig3_information_use_contrasts", graph, legacy=legacy_stem), formats)
     plt.close(fig)
 
@@ -902,7 +995,7 @@ def write_latex_includes(out_dir: Path) -> None:
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig3_information_use_contrasts.pdf}
-  \caption{Contrastive information-use metrics. Bars are matched F1 differences grouped by the question they answer: whether observational data alone helps from $N=0$ to $N=5000$ at $M=0$, whether interventional data alone helps from $M=0$ to $M=200$ at $N=0$, whether matrix rows beat summaries, and whether real names matter.}
+  \caption{Matched information-use contrasts. Bars report directed-edge F1 differences: observational or interventional evidence versus names-only prompting, matrix rows versus summaries at the primary budget, and real versus anonymized variable names at the primary budget. Rows require enough valid parsed runs in each matched source cell.}
   \label{fig:information_use_contrasts}
 \end{figure*}
 
@@ -940,6 +1033,7 @@ def main() -> None:
     size_df = read_csv(args.paper_dir / "paper_model_size_ladder.csv")
     contrasts = read_csv(args.paper_dir / "paper_contrast_metrics.csv")
     cross = read_csv(args.paper_dir / "paper_cross_graph_evidence_ladder.csv")
+    canonical = read_csv(args.paper_dir / "canonical_condition_results.csv")
     graphs = resolve_graphs(args, cross["graph"].dropna().unique())
 
     # Prefer the all-graph ladder table for graph-specific plotting.  The
@@ -976,6 +1070,7 @@ def main() -> None:
         )
         plot_contrast_bars(
             contrasts,
+            canonical,
             out_dir,
             args.formats,
             graph,
