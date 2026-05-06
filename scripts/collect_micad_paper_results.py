@@ -32,6 +32,15 @@ import pandas as pd
 GRAPH_ORDER = ["cancer", "earthquake", "asia", "sachs"]
 CONDITION_ORDER = ["names_only", "real+summary", "anon+summary", "real+matrix", "anon+matrix"]
 DATA_ONLY_METHODS = ["PC", "GES", "ENCO"]
+MODEL_METHOD_ALIASES = {
+    "Qwen3-4B-Thinking-2507": "Qwen/Qwen3-4B-Thinking-2507",
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200": (
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged"
+    ),
+    "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100": (
+        "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,22 @@ MODEL_INFOS = [
     ModelInfo("gpt-5-mini", "GPT-5 Mini", "OpenAI", "mini", 1.0, "closed"),
     ModelInfo("gpt-5.2-pro", "GPT-5.2 Pro", "OpenAI", "pro", 2.0, "closed"),
     ModelInfo("Qwen/Qwen3-4B-Thinking-2507", "Qwen3-4B", "Qwen3", "4B", 4.0, "open"),
+    ModelInfo(
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged",
+        "Qwen3-4B-FT",
+        "Qwen3",
+        "4B FT",
+        4.10,
+        "open",
+    ),
+    ModelInfo(
+        "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged",
+        "CD v5 ckpt-100 merged",
+        "Qwen3",
+        "4B FT",
+        4.11,
+        "open",
+    ),
     ModelInfo("Qwen/Qwen3-30B-A3B-Thinking-2507", "Qwen3-30B-A3B", "Qwen3", "30B-A3B", 30.0, "open"),
     ModelInfo("Qwen/Qwen2.5-7B-Instruct-1M", "Qwen2.5-7B", "Qwen2.5", "7B", 7.0, "open"),
     ModelInfo("Qwen/Qwen2.5-14B-Instruct-1M", "Qwen2.5-14B", "Qwen2.5", "14B", 14.0, "open"),
@@ -59,6 +84,11 @@ MODEL_INFOS = [
 
 MODEL_INFO_BY_METHOD = {m.method: m for m in MODEL_INFOS}
 DISPLAY_BY_METHOD = {m.method: m.display for m in MODEL_INFOS} | {
+    "Qwen3-4B-Thinking-2507": "Qwen3-4B",
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200": (
+        "Qwen3-4B-FT"
+    ),
+    "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100": "CD v5 ckpt-100 merged",
     "PC": "PC",
     "GES": "GES",
     "ENCO": "ENCO",
@@ -133,6 +163,7 @@ def parse_args() -> argparse.Namespace:
 
 def normalize_model_name(model: object) -> str:
     name = "" if pd.isna(model) else str(model)
+    name = MODEL_METHOD_ALIASES.get(name, name)
     if name in MODEL_INFO_BY_METHOD:
         return name
     candidates = [

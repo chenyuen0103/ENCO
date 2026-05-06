@@ -480,6 +480,12 @@ def summarize(selected: list[FileScore], graphs: list[str], conditions: list[str
 def model_display_name(model: str) -> str:
     if model == BASE_MODEL:
         return "Base Qwen3-4B"
+    exact = {
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200": "Qwen3-4B-FT",
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged": "Qwen3-4B-FT",
+    }
+    if model in exact:
+        return exact[model]
     replacements = [
         ("grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_", "GRPO CD no-cancer "),
         ("grpo_from_qwen3_4b_sft_mix_guide_v2_lenfix_2gpu_", "GRPO SFT mix v2 "),

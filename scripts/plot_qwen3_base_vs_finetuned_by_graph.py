@@ -454,6 +454,8 @@ def model_display_name(model: str) -> str:
     exact = {
         "qwen3_4b_cd_format_v5_rerun_2gpu": "CD v5 2gpu",
         "qwen3_4b_cd_format_v5_then_sft_5way_v4_small": "CD to SFT small",
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200": "Qwen3-4B-FT",
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged": "Qwen3-4B-FT",
     }
     if model in exact:
         return exact[model]

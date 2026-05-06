@@ -6,9 +6,11 @@ paper-ready CSVs from experiments/out/micad_paper and creates a compact figure
 set aimed at a top-tier benchmark paper:
 
   1. Decisive evidence ladder: names_only vs summary vs matrix vs classical.
-  2. Model-size ladder: same-family scale comparison.
-  3. Contrast bars: what information each model uses.
-  4. Cross-graph profiles: matched controls across the real and anonymized reference graphs.
+  2. Contrast bars: what information each model uses.
+  3. Cross-graph profiles: matched controls across the real and anonymized reference graphs.
+
+Each comparison figure is emitted twice: pretrained models and Qwen3-4B vs
+Qwen3-4B-FT.
 """
 
 from __future__ import annotations
@@ -38,6 +40,45 @@ ANONYMIZATION_STRESS_MODELS = [
     "Qwen2.5-14B",
     "Qwen2.5-7B",
 ]
+PRETRAINED_MODELS = [
+    "GPT-5 Mini",
+    "GPT-5.2 Pro",
+    "Qwen3-4B",
+    "Qwen2.5-72B",
+    "Qwen2.5-14B",
+    "Qwen2.5-7B",
+]
+QWEN3_POSTTRAINING_MODELS = [
+    "Qwen3-4B",
+    "Qwen3-4B-FT",
+]
+DEFAULT_LEAD_MODELS = [
+    *PRETRAINED_MODELS,
+    "Qwen3-4B-FT",
+]
+COMPARISON_SETS = [
+    ("pretrained", PRETRAINED_MODELS),
+    ("qwen3_ft", QWEN3_POSTTRAINING_MODELS),
+]
+MODEL_DISPLAY_ALIASES = {
+    "gpt-5-mini": "GPT-5 Mini",
+    "gpt-5.2-pro": "GPT-5.2 Pro",
+    "Qwen/Qwen3-4B-Thinking-2507": "Qwen3-4B",
+    "Qwen3-4B-Thinking-2507": "Qwen3-4B",
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200": (
+        "Qwen3-4B-FT"
+    ),
+    "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged": (
+        "Qwen3-4B-FT"
+    ),
+    "GRPO CD no-cancer ckpt-1200 merged": "Qwen3-4B-FT",
+    "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100": "CD v5 ckpt-100 merged",
+    "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged": "CD v5 ckpt-100 merged",
+}
+ALWAYS_SHOW_MODELS = {"Qwen3-4B"}
+PLOT_EXCLUDED_MODELS = {"CD v5 ckpt-100 merged"}
+FIG1_SIZE = (7.2, 3.0)
+F1_YLIM = (0.0, 1.08)
 SEMANTIC_SCALING_GRAPHS = ["cancer", "asia", "sachs", "child", "alarm"]
 SEMANTIC_SCALING_LABELS = {
     "cancer": "Cancer",
@@ -124,16 +165,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lead-models",
         nargs="*",
-        default=None,
-        help="Display names to include in the decisive evidence ladder. Defaults to all available models.",
+        default=DEFAULT_LEAD_MODELS,
+        help=(
+            "Display names to include in the decisive evidence ladder. "
+            "Defaults to GPT-5 Mini, GPT-5.2 Pro, Qwen3-4B, and the selected fine-tuned checkpoints; "
+            "use --lead-models all for all models."
+        ),
     )
     parser.add_argument(
         "--contrast-models",
         "--heatmap-models",
         dest="contrast_models",
         nargs="*",
-        default=None,
-        help="Display names to include in the contrast bar plot. Defaults to all available models.",
+        default=QWEN3_POSTTRAINING_MODELS,
+        help=(
+            "Display names to include in the contrast bar plot. "
+            "Defaults to Qwen3-4B plus the selected fine-tuned checkpoints; use --contrast-models all for all models."
+        ),
     )
     parser.add_argument("--formats", nargs="*", default=["pdf", "png"], choices=["pdf", "png", "svg"])
     return parser.parse_args()
@@ -174,6 +222,15 @@ def configure_style() -> None:
             "xtick.labelsize": 8,
             "ytick.labelsize": 8,
             "legend.fontsize": 8,
+            "axes.linewidth": 0.8,
+            "xtick.major.width": 0.7,
+            "ytick.major.width": 0.7,
+            "xtick.major.size": 3.0,
+            "ytick.major.size": 3.0,
+            "legend.framealpha": 0.0,
+            "legend.edgecolor": "none",
+            "legend.borderpad": 0.3,
+            "legend.handlelength": 1.5,
             "figure.dpi": 300,
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
@@ -209,8 +266,20 @@ def finite_or_nan(value: object) -> float:
     return val if np.isfinite(val) else np.nan
 
 
+def fmt_value(value: float) -> str:
+    return "1" if np.isclose(value, 1.0, atol=1e-9) else f"{value:.2f}"
+
+
+def fmt_signed_value(value: float) -> str:
+    return "+1" if np.isclose(value, 1.0, atol=1e-9) else f"{value:+.2f}"
+
+
 def _stem(base: str, graph: str, *, legacy: bool) -> str:
     return base if legacy else f"{base}_{graph}"
+
+
+def _stem_with_suffix(stem: str, stem_suffix: str | None) -> str:
+    return f"{stem}_{stem_suffix}" if stem_suffix else stem
 
 
 def expand_model_patterns(models: list[str], requested: list[str]) -> list[str]:
@@ -219,6 +288,7 @@ def expand_model_patterns(models: list[str], requested: list[str]) -> list[str]:
     for token in requested:
         patterns = [part.strip() for part in str(token).split(",") if part.strip()]
         for pattern in patterns:
+            pattern = MODEL_DISPLAY_ALIASES.get(pattern, pattern)
             matches = [model for model in models if fnmatch.fnmatchcase(model, pattern)]
             if not matches:
                 unmatched.append(pattern)
@@ -235,7 +305,17 @@ def available_models(df: pd.DataFrame, requested: list[str] | None = None) -> li
     models = [str(model) for model in df["model"].dropna().unique()]
     if not requested:
         return models
+    if len(requested) == 1 and str(requested[0]).lower() == "all":
+        return models
     return expand_model_patterns(models, requested)
+
+
+def apply_model_display_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in ["model", "method_display"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace(MODEL_DISPLAY_ALIASES)
+    return df
 
 
 def drop_models_without_valid_responses(
@@ -245,6 +325,7 @@ def drop_models_without_valid_responses(
     *,
     graph: str,
     figure_label: str,
+    preserve_selected_models: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Drop models with fewer than half valid displayed bars."""
     validity_by_condition = []
@@ -265,6 +346,10 @@ def drop_models_without_valid_responses(
     else:
         min_valid_bars = 1
         keep = pd.Series(False, index=plot_df.index)
+
+    protected_models = set(selected_models) if preserve_selected_models else ALWAYS_SHOW_MODELS
+    protected = plot_df["model"].astype(str).isin(protected_models)
+    keep = keep | protected
 
     dropped = plot_df.loc[~keep, "model"].dropna().astype(str).tolist()
     if dropped:
@@ -289,6 +374,7 @@ def plot_decisive_evidence_ladder(
     *,
     legacy_stem: bool,
     anonymized: bool = False,
+    stem_suffix: str | None = None,
 ) -> None:
     graph_df = headline[headline["graph"].eq(graph)].copy() if "graph" in headline.columns else headline.copy()
     lead_models = available_models(graph_df, lead_models)
@@ -308,6 +394,7 @@ def plot_decisive_evidence_ladder(
         condition_columns,
         graph=graph,
         figure_label="Figure 1" + (" anonymized" if anonymized else ""),
+        preserve_selected_models=True,
     )
     plot_df["model"] = pd.Categorical(plot_df["model"], categories=lead_models, ordered=True)
     plot_df = plot_df.sort_values("model")
@@ -318,8 +405,7 @@ def plot_decisive_evidence_ladder(
 
     x = np.arange(len(plot_df))
     width = 0.26 if anonymized else 0.22
-    fig_width = max(7.2, 0.62 * len(plot_df) + 1.8)
-    fig, ax = plt.subplots(figsize=(fig_width, 3.0))
+    fig, ax = plt.subplots(figsize=FIG1_SIZE)
     any_low_valid = False
     for idx, cond in enumerate(condition_columns):
         offset = (idx - (len(condition_columns) - 1) / 2) * width
@@ -344,9 +430,10 @@ def plot_decisive_evidence_ladder(
         )
         low_valid = np.isfinite(vals) & np.isfinite(valid) & (valid < 3)
         any_low_valid = any_low_valid or bool(low_valid.any())
+        bar_vals = np.nan_to_num(vals, nan=0.0)
         bars = ax.bar(
             x + offset,
-            vals,
+            bar_vals,
             width=width,
             label=CONDITION_LABELS[cond],
             color=CONDITION_COLORS[cond],
@@ -375,7 +462,7 @@ def plot_decisive_evidence_ladder(
         for bar, val, err, is_low_valid, valid_count, total_count in zip(bars, vals, yerr, low_valid, valid, total):
             if np.isfinite(val):
                 label_y = val + max(float(err), 0.0) + 0.018
-                ax.text(bar.get_x() + bar.get_width() / 2, label_y, f"{val:.2f}", ha="center", va="bottom", fontsize=7)
+                ax.text(bar.get_x() + bar.get_width() / 2, label_y, fmt_value(val), ha="center", va="bottom", fontsize=7)
                 if is_low_valid:
                     total_text = f"/{int(total_count)}" if np.isfinite(total_count) else ""
                     # ax.text(
@@ -388,25 +475,41 @@ def plot_decisive_evidence_ladder(
                     #     color="white",
                     #     fontweight="semibold",
                     # )
+            else:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    0.032,
+                    "NA",
+                    ha="center",
+                    va="bottom",
+                    fontsize=6.7,
+                    color="#555555",
+                    rotation=45,
+                )
 
     classical_vals = plot_df["best_data_only_f1"].map(finite_or_nan)
     if classical_vals.notna().any():
         classical = float(classical_vals.dropna().iloc[0])
         method = str(plot_df["best_data_only_method"].dropna().iloc[0])
         ax.axhline(classical, color="#e15759", linewidth=1.2, linestyle="--", label=f"{method} classical")
-        ax.text(len(plot_df) - 0.45, classical + 0.018, f"{method} {classical:.2f}", color="#b23b3b", ha="right", va="bottom", fontsize=8)
+        ax.text(len(plot_df) - 0.45, classical + 0.018, f"{method} {fmt_value(classical)}", color="#b23b3b", ha="right", va="bottom", fontsize=8)
 
     ax.set_xticks(x, plot_df["model"])
-    ax.set_ylabel("Directed-edge F1")
-    ax.set_title(f"{graph.capitalize()} ({'anonymized' if anonymized else 'real names'})", fontsize=9, pad=4)
-    ax.set_ylim(0, 1.08)
+    ax.set_ylabel(r"Directed-edge $F_1$")
+    ax.set_title(
+        f"{graph.capitalize()} — {'anonymized' if anonymized else 'real node names'}",
+        fontsize=9, pad=4,
+    )
+    ax.set_ylim(*F1_YLIM)
+    ax.set_yticks(np.arange(0.0, 1.01, 0.2))
     ax.grid(axis="y", alpha=0.18, linewidth=0.6)
     handles, labels = ax.get_legend_handles_labels()
     if any_low_valid:
         handles.append(Patch(facecolor="white", edgecolor="#333333", hatch="///", label="<3 valid runs (60%)"))
         labels.append("<60% valid runs")
-    ax.legend(handles, labels, frameon=False, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 1.20))
+    ax.legend(handles, labels, frameon=False, ncol=len(labels), loc="upper center", bbox_to_anchor=(0.5, 1.13))
     stem = _stem("fig1_ladder", graph, legacy=legacy_stem)
+    stem = _stem_with_suffix(stem, stem_suffix)
     if anonymized:
         stem = f"{stem}_anonymized"
     save_figure(fig, out_dir, stem, formats)
@@ -422,7 +525,10 @@ def plot_model_size_ladder(
     legacy_stem: bool,
 ) -> None:
     graph_df = size_df[size_df["graph"].eq(graph)].copy() if "graph" in size_df.columns else size_df.copy()
-    rows = graph_df[graph_df["family"].isin(["Qwen2.5", "Qwen3", "Llama 3.1"])].copy()
+    rows = graph_df[
+        graph_df["family"].isin(["Qwen2.5", "Qwen3", "Llama 3.1"])
+        & ~graph_df["model"].astype(str).isin(PLOT_EXCLUDED_MODELS)
+    ].copy()
     rows = rows.dropna(subset=["size_value"], how="any")
     families = []
     # for family in ["Qwen2.5", "Qwen3", "Llama 3.1"]:
@@ -457,7 +563,7 @@ def plot_model_size_ladder(
         ax.set_title(graph.capitalize(), fontsize=9, pad=4)
         ax.set_ylim(0, 1.02)
         ax.grid(axis="y", alpha=0.18, linewidth=0.6)
-    axes[0].set_ylabel("Directed-edge F1")
+    axes[0].set_ylabel(r"Directed-edge $F_1$")
     axes[-1].legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.02))
     save_figure(fig, out_dir, _stem("fig2_model_size_ladders", graph, legacy=legacy_stem), formats)
     plt.close(fig)
@@ -478,7 +584,27 @@ def _annotate_barh(ax: plt.Axes, bars, values: np.ndarray, *, pad: float = 0.012
         x = bar.get_width()
         xpos = x + pad * span if x >= 0 else x - pad * span
         ha = "left" if x >= 0 else "right"
-        ax.text(xpos, bar.get_y() + bar.get_height() / 2, f"{val:+.2f}", ha=ha, va="center", fontsize=6.4)
+        ax.text(xpos, bar.get_y() + bar.get_height() / 2, fmt_signed_value(val), ha=ha, va="center", fontsize=6.4)
+
+
+def _annotate_na_barh(ax: plt.Axes, positions: np.ndarray, values: np.ndarray) -> None:
+    xmin, xmax = ax.get_xlim()
+    xpos = 0.018 * (xmax - xmin)
+    for ypos, val in zip(positions, values):
+        if np.isfinite(val):
+            continue
+        ax.text(
+            xpos,
+            ypos,
+            "NA",
+            ha="left",
+            va="center",
+            fontsize=6.3,
+            color="#555555",
+            fontstyle="italic",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 0.35},
+            zorder=5,
+        )
 
 
 def _style_contrast_axis(ax: plt.Axes, y: np.ndarray, title: str, subtitle: str) -> None:
@@ -554,6 +680,7 @@ def plot_contrast_bars(
     selected_models: list[str] | None,
     *,
     legacy_stem: bool,
+    stem_suffix: str | None = None,
 ) -> None:
     metrics = [
         "observational_summary_gain",
@@ -589,28 +716,28 @@ def plot_contrast_bars(
         ("anonymization_drop_summary", "anonymization_drop_matrix"),
     ]
     models = []
-    dropped_models = []
+    no_value_models = []
     for model in selected_models:
         if model not in pivot.index:
             continue
-        has_panel_value = [
-            np.isfinite(pivot.loc[model, list(panel)].to_numpy(dtype=float)).any()
-            for panel in panel_metrics
-        ]
-        if all(has_panel_value):
+        has_any_value = np.isfinite(pivot.loc[model, metrics].to_numpy(dtype=float)).any()
+        if has_any_value or model in ALWAYS_SHOW_MODELS:
             models.append(model)
-        elif any(has_panel_value):
-            dropped_models.append(model)
-    if dropped_models:
+        else:
+            no_value_models.append(model)
+    if no_value_models:
         print(
-            f"[info] Dropping {len(dropped_models)} model(s) from Figure 3 for graph={graph} "
-            f"because supported contrasts are incomplete across panels: "
-            + ", ".join(dropped_models)
+            f"[info] Dropping {len(no_value_models)} model(s) from Figure 3 for graph={graph} "
+            "because no supported contrasts are available: "
+            + ", ".join(no_value_models)
         )
     if not models:
         print(f"[warn] No Figure 3 rows have supported contrasts in every panel for graph={graph}; skipping.")
         return
     y = np.arange(len(models))
+    shared_values = pivot.loc[models, metrics].to_numpy(dtype=float)
+    finite_shared_values = shared_values[np.isfinite(shared_values)]
+    shared_lim = max(0.12, float(np.nanmax(np.abs(finite_shared_values))) if finite_shared_values.size else 0.12)
     fig_height = max(2.7, 0.37 * len(models) + 1.35)
     fig, axes = plt.subplots(1, 4, figsize=(8.9, fig_height), sharey=True, gridspec_kw={"wspace": 0.18})
 
@@ -636,22 +763,28 @@ def plot_contrast_bars(
         if len(series) == 1:
             metric, label, color = series[0]
             vals = np.array([_contrast_value(pivot, model, metric) for model in models], dtype=float)
-            bars = ax.barh(y, vals, height=0.58, color=color, edgecolor="#303030", linewidth=0.30, label=label, zorder=2)
-            finite = vals[np.isfinite(vals)]
-            lim = max(0.12, float(np.nanmax(np.abs(finite))) if finite.size else 0.12)
-            ax.set_xlim(-lim * 1.32, lim * 1.32)
+            bars = ax.barh(
+                y,
+                np.nan_to_num(vals, nan=0.0),
+                height=0.58,
+                color=color,
+                edgecolor="#303030",
+                linewidth=0.30,
+                label=label,
+                zorder=2,
+            )
+            ax.set_xlim(-shared_lim * 1.32, shared_lim * 1.32)
             _annotate_barh(ax, bars, vals)
+            _annotate_na_barh(ax, y, vals)
         else:
             height = 0.28
-            all_vals = []
             pending_annotations = []
             for idx, (metric, label, color) in enumerate(series):
                 vals = np.array([_contrast_value(pivot, model, metric) for model in models], dtype=float)
-                all_vals.extend(vals[np.isfinite(vals)])
                 ypos = y + (idx - 0.5) * height
                 bars = ax.barh(
                     ypos,
-                    vals,
+                    np.nan_to_num(vals, nan=0.0),
                     height=height,
                     color=color,
                     edgecolor="#303030",
@@ -659,11 +792,11 @@ def plot_contrast_bars(
                     label=label,
                     zorder=2,
                 )
-                pending_annotations.append((bars, vals))
-            lim = max(0.12, float(np.nanmax(np.abs(all_vals))) if all_vals else 0.12)
-            ax.set_xlim(-lim * 1.32, lim * 1.32)
-            for bars, vals in pending_annotations:
+                pending_annotations.append((bars, ypos, vals))
+            ax.set_xlim(-shared_lim * 1.32, shared_lim * 1.32)
+            for bars, ypos, vals in pending_annotations:
                 _annotate_barh(ax, bars, vals)
+                _annotate_na_barh(ax, ypos, vals)
         _style_contrast_axis(ax, y, title, subtitle)
 
     axes[0].set_yticks(y, models)
@@ -683,14 +816,15 @@ def plot_contrast_bars(
         columnspacing=1.4,
         handlelength=1.4,
     )
-    fig.suptitle(f"{graph.capitalize()}: matched information-use contrasts", fontsize=9.2, y=0.995)
+    fig.suptitle(f"{graph.capitalize()}: information-use contrasts", fontsize=9.2, y=0.995)
     fig.supxlabel(
-        f"Directed-edge F1 difference; rows require >= {MIN_CONTRAST_VALID_RUNS}/5 valid parsed runs in each matched source cell",
+        rf"$F_1$ difference; cells require $\geq${MIN_CONTRAST_VALID_RUNS}/5 valid runs per matched condition",
         fontsize=7.4,
         y=0.040,
     )
     fig.subplots_adjust(left=0.19, right=0.995, bottom=0.20, top=0.79)
-    save_figure(fig, out_dir, _stem("fig3_information_use_contrasts", graph, legacy=legacy_stem), formats)
+    stem = _stem_with_suffix(_stem("fig3_information_use_contrasts", graph, legacy=legacy_stem), stem_suffix)
+    save_figure(fig, out_dir, stem, formats)
     plt.close(fig)
 
 
@@ -703,6 +837,7 @@ def plot_graph_model_profiles(
     *,
     legacy_stem: bool,
     anonymized: bool = False,
+    stem_suffix: str | None = None,
 ) -> None:
     sub = cross[cross.graph.eq(graph)].copy()
     if sub.empty:
@@ -729,19 +864,38 @@ def plot_graph_model_profiles(
         return
     pivot = sub.set_index("model").reindex(selected_models)[cols]
     mat = pivot.to_numpy(dtype=float)
-    if not np.isfinite(mat).any():
+    if not np.isfinite(mat).any() and not any(model in ALWAYS_SHOW_MODELS for model in selected_models):
         suffix = " anonymized" if anonymized else ""
         print(f"[warn] No Figure 4{suffix} values available for graph={graph}; skipping.")
         return
 
-    models = [model for model in selected_models if model in pivot.index and np.isfinite(pivot.loc[model].to_numpy(dtype=float)).any()]
+    models = [
+        model
+        for model in selected_models
+        if model in pivot.index and (np.isfinite(pivot.loc[model].to_numpy(dtype=float)).any() or model in ALWAYS_SHOW_MODELS)
+    ]
     fig_height = 3.5 if len(models) <= 10 else 3.9
     fig, ax = plt.subplots(figsize=(6.7, fig_height))
     x = np.arange(len(cols))
-    palette = plt.get_cmap("tab10")
+    _profile_colors = [
+        "#4878d0", "#ee854a", "#6acc65", "#d65f5f",
+        "#956cb4", "#8c613c", "#dc7ec0", "#797979",
+        "#d5bb67", "#82c6e2",
+    ]
+    palette = lambda i: _profile_colors[i % len(_profile_colors)]  # noqa: E731
     for idx, model in enumerate(models):
         vals = pivot.loc[model].to_numpy(dtype=float)
         if not np.isfinite(vals).any():
+            ax.plot([], [], color=palette(idx % 10), label=f"{model} (NA)")
+            ax.text(
+                x[len(x) // 2],
+                0.035 + 0.035 * (idx % 3),
+                f"{model}: NA",
+                ha="center",
+                va="bottom",
+                fontsize=6.5,
+                color=palette(idx % 10),
+            )
             continue
         ax.plot(
             x,
@@ -756,8 +910,11 @@ def plot_graph_model_profiles(
 
     ax.set_xticks(x, labels)
     ax.set_ylim(0, 1.08)
-    ax.set_ylabel("Directed-edge F1")
-    ax.set_title(f"{graph.capitalize()}: model evidence-use profiles" + (" (anonymized)" if anonymized else ""), fontsize=9, pad=5)
+    ax.set_ylabel(r"Directed-edge $F_1$")
+    ax.set_title(
+        f"{graph.capitalize()}: evidence-use profiles" + (" — anonymized" if anonymized else ""),
+        fontsize=9, pad=5,
+    )
     ax.grid(axis="y", alpha=0.20, linewidth=0.55)
     ax.spines["left"].set_visible(False)
     ax.tick_params(axis="x", labelsize=8)
@@ -773,6 +930,7 @@ def plot_graph_model_profiles(
     )
     fig.subplots_adjust(left=0.10, right=0.66, bottom=0.16, top=0.88)
     stem = _stem("fig4_cross_graph_matched_controls", graph, legacy=legacy_stem)
+    stem = _stem_with_suffix(stem, stem_suffix)
     if anonymized:
         stem = f"{stem}_anonymized"
     save_figure(fig, out_dir, stem, formats)
@@ -802,6 +960,7 @@ def plot_anonymization_stress_test(
     formats: list[str],
     models: list[str] | None = None,
     graphs: list[str] | None = None,
+    stem_suffix: str | None = None,
 ) -> None:
     """Plot anonymized minus real-name F1 at the primary budget."""
     models = models or ANONYMIZATION_STRESS_MODELS
@@ -861,27 +1020,27 @@ def plot_anonymization_stress_test(
                 val = mat[i, j]
                 if np.isfinite(val):
                     color = "white" if abs(val) > 0.55 * lim else "#1f1f1f"
-                    ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=7.0, color=color)
+                    ax.text(j, i, fmt_signed_value(val), ha="center", va="center", fontsize=7.0, color=color)
                 elif lab[i, j]:
                     ax.text(j, i, lab[i, j], ha="center", va="center", fontsize=6.4, color="#555555")
                 else:
                     ax.text(j, i, "--", ha="center", va="center", fontsize=6.8, color="#777777")
 
-    axes[0].set_ylabel("Model")
     for ax in axes[1:]:
         ax.tick_params(axis="y", labelleft=False)
     cbar = fig.colorbar(image, ax=axes.ravel().tolist(), fraction=0.035, pad=0.02)
-    cbar.set_label(r"Anonymized $-$ real F1", fontsize=8.0)
+    cbar.set_label(r"Anon.$\,-\,$real $F_1$", fontsize=8.0)
     cbar.ax.tick_params(labelsize=7.2, length=2.5)
-    fig.suptitle("Anonymization stress test at the primary budget", fontsize=9.4, y=0.985)
+    fig.suptitle("Name-anonymization drop at the primary budget", fontsize=9.4, y=0.985)
     fig.supxlabel(
-        f"Negative values indicate drops under anonymization; gray cells lack paired >= {MIN_CONTRAST_VALID_RUNS}/5 valid runs",
+        rf"Anon.$\,-\,$real $F_1$; gray cells lack $\geq${MIN_CONTRAST_VALID_RUNS}/5 valid paired runs",
         fontsize=7.4,
         y=0.010,
     )
     fig.subplots_adjust(left=0.18, right=0.90, bottom=0.24, top=0.80)
 
-    save_figure(fig, out_dir, "fig_anonymization_stress_test", formats)
+    stem = _stem_with_suffix("fig_anonymization_stress_test", stem_suffix)
+    save_figure(fig, out_dir, stem, formats)
     plt.close(fig)
 
 
@@ -1050,7 +1209,7 @@ def plot_gpt52_names_only_scaling(
     for _, row in plot_df.iterrows():
         graph = str(row["graph"])
         dx, dy, va = label_offsets.get(graph, (0.0, 0.043, "bottom"))
-        label = f"{SEMANTIC_SCALING_LABELS.get(graph, graph.capitalize())}\n{row['f1']:.2f}"
+        label = f"{SEMANTIC_SCALING_LABELS.get(graph, graph.capitalize())}\n{fmt_value(row['f1'])}"
         if np.isfinite(row["valid"]) and np.isfinite(row["n"]) and row["valid"] < row["n"]:
             label += f"\n({int(row['valid'])}/{int(row['n'])})"
         ax.text(
@@ -1068,14 +1227,14 @@ def plot_gpt52_names_only_scaling(
     ax.set_ylim(0.43, 1.05)
     ax.set_xticks([int(v) for v in plot_df["nodes"].dropna().tolist()])
     ax.set_yticks([0.5, 0.7, 0.9, 1.0])
-    ax.set_xlabel("# nodes")
-    ax.set_ylabel("Name-only directed-edge F1")
+    ax.set_xlabel(r"Graph size ($|V|$)")
+    ax.set_ylabel(r"Names-only $F_1$")
     ax.grid(axis="y", color="#dddddd", linewidth=0.6, alpha=0.85)
     ax.grid(axis="x", color="#eeeeee", linewidth=0.5, alpha=0.5)
     ax.tick_params(width=0.8, length=2.5)
     for spine in ("left", "bottom"):
         ax.spines[spine].set_linewidth(0.8)
-    fig.tight_layout(pad=0.35)
+    fig.tight_layout(pad=0.25)
     save_figure(fig, out_dir, "fig_rq1_gpt52_name_only_scaling", formats)
     plt.close(fig)
 
@@ -1086,36 +1245,33 @@ def write_latex_includes(out_dir: Path) -> None:
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_ladder.pdf}
-  \caption{Matched evidence-use ladder on the primary graph and budget. Each model is evaluated on the same graph and data; only the exposed information changes from names-only to summary statistics to raw matrix rows. Error bars show standard errors over valid parsed runs; hatched bars mark conditions with fewer than three valid parsed runs (60\%). The dashed line shows the strongest classical causal discovery reference at the same data budget.}
-  \label{fig:decisive_evidence_ladder}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_sachs_pretrained.pdf}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_sachs_qwen3_ft.pdf}
+  \caption{Matched evidence-use ladders on Sachs. Left: pretrained models. Right: Qwen3-4B versus Qwen3-4B-FT. Each model is evaluated on the same graph and data; only the exposed information changes from names-only to summary statistics to raw matrix rows.}
+  \label{fig:decisive_evidence_ladder_sachs}
 \end{figure*}
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_anonymized.pdf}
-  \caption{Anonymized companion to the matched evidence-use ladder. The bars use anonymized summaries and matrices; the dashed line preserves the strongest classical reference at the same data budget.}
-  \label{fig:decisive_evidence_ladder_anonymized}
-\end{figure*}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.95\linewidth]{experiments/out/micad_paper/figures/fig2_model_size_ladders.pdf}
-  \caption{Within-family model-size ladders. Larger models sometimes use supplied data more effectively, but the trend is not monotonic across matched cells.}
-  \label{fig:model_size_ladders}
-\end{figure}
-
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig3_information_use_contrasts.pdf}
-  \caption{Matched information-use contrasts. Bars report directed-edge F1 differences: observational or interventional evidence versus names-only prompting, matrix rows versus summaries at the primary budget, and real versus anonymized variable names at the primary budget. Rows require enough valid parsed runs in each matched source cell. This display filter keeps the visualization uncluttered; incomplete model rows are omitted from the plot rather than interpreted as zero or negative effects.}
-  \label{fig:information_use_contrasts}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_sachs_pretrained_anonymized.pdf}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig1_ladder_sachs_qwen3_ft_anonymized.pdf}
+  \caption{Anonymized matched evidence-use ladders on Sachs. Left: pretrained models. Right: Qwen3-4B versus Qwen3-4B-FT.}
+  \label{fig:decisive_evidence_ladder_sachs_anonymized}
 \end{figure*}
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{experiments/out/micad_paper/figures/fig_anonymization_stress_test.pdf}
-  \caption{Anonymization stress test at the primary budget. Each cell reports anonymized minus real-name directed-edge F1 for the same graph, model, prompt format, and data budget. Negative values indicate performance drops under anonymization, revealing name-mediated support; gray cells lack paired valid source cells and are not interpreted as zero effects.}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig3_information_use_contrasts_sachs_pretrained.pdf}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig3_information_use_contrasts_sachs_qwen3_ft.pdf}
+  \caption{Matched information-use contrasts on Sachs. Left: pretrained models. Right: Qwen3-4B versus Qwen3-4B-FT. Bars report directed-edge F1 differences; NA marks unsupported matched cells.}
+  \label{fig:information_use_contrasts_sachs}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig_anonymization_stress_test_pretrained.pdf}
+  \includegraphics[width=0.49\textwidth]{experiments/out/micad_paper/figures/fig_anonymization_stress_test_qwen3_ft.pdf}
+  \caption{Anonymization stress tests at the primary budget. Left: pretrained models. Right: Qwen3-4B versus Qwen3-4B-FT. Each cell reports anonymized minus real-name directed-edge F1 for the same graph, model, prompt format, and data budget.}
   \label{fig:anonymization_stress_test}
 \end{figure*}
 
@@ -1124,20 +1280,6 @@ def write_latex_includes(out_dir: Path) -> None:
   \includegraphics[width=0.5\textwidth]{experiments/out/micad_paper/figures/fig_rq1_gpt52_name_only_scaling.pdf}
   \caption{GPT-5.2 Pro name-only recovery across graph sizes. Filled points mark fully valid parsed runs; the open point marks a condition with fewer than five valid parsed runs. Semantic priors solve the smallest graphs but are insufficient for reliable recovery on larger networks.}
   \label{fig:gpt52_name_only_scaling}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.95\linewidth]{experiments/out/micad_paper/figures/fig4_cross_graph_matched_controls.pdf}
-  \caption{Optional appendix evidence-use profile on one graph. Each line is a model, and the x-axis traces the exposed information from names-only to summary statistics to raw matrix rows. Sparse line segments indicate missing matched cells.}
-  \label{fig:cross_graph_matched_controls}
-\end{figure}
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.95\linewidth]{experiments/out/micad_paper/figures/fig4_cross_graph_matched_controls_anonymized.pdf}
-  \caption{Anonymized companion to the evidence-use profile. Each line is a model; the data-bearing points use anonymized summaries and matrices while preserving the names-only reference point.}
-  \label{fig:cross_graph_matched_controls_anonymized}
 \end{figure}
 """
     path = out_dir / "latex_includes.tex"
@@ -1154,68 +1296,52 @@ def main() -> None:
     contrasts = read_csv(args.paper_dir / "paper_contrast_metrics.csv")
     cross = read_csv(args.paper_dir / "paper_cross_graph_evidence_ladder.csv")
     canonical = read_csv(args.paper_dir / "canonical_condition_results.csv")
+    headline = apply_model_display_aliases(headline)
+    size_df = apply_model_display_aliases(size_df)
+    contrasts = apply_model_display_aliases(contrasts)
+    cross = apply_model_display_aliases(cross)
+    canonical = apply_model_display_aliases(canonical)
     graphs = resolve_graphs(args, cross["graph"].dropna().unique())
 
     # Prefer the all-graph ladder table for graph-specific plotting.  The
     # headline CSV is kept for backward compatibility with older collected
     # outputs that only contained one graph.
     ladder_source = cross if "graph" in cross.columns else headline
-    size_source = cross if "graph" in cross.columns else size_df
-    contrast_models = args.contrast_models
     for graph in graphs:
         legacy_stem = len(graphs) == 1 and graph == "sachs"
-        plot_decisive_evidence_ladder(
-            ladder_source,
-            out_dir,
-            args.formats,
-            args.lead_models,
-            graph,
-            legacy_stem=legacy_stem,
-        )
-        plot_decisive_evidence_ladder(
-            ladder_source,
-            out_dir,
-            args.formats,
-            args.lead_models,
-            graph,
-            legacy_stem=legacy_stem,
-            anonymized=True,
-        )
-        plot_model_size_ladder(
-            size_source,
-            out_dir,
-            args.formats,
-            graph,
-            legacy_stem=legacy_stem,
-        )
-        plot_contrast_bars(
-            contrasts,
-            canonical,
-            out_dir,
-            args.formats,
-            graph,
-            contrast_models,
-            legacy_stem=legacy_stem,
-        )
-        plot_graph_model_profiles(
-            cross,
-            out_dir,
-            args.formats,
-            graph,
-            args.lead_models,
-            legacy_stem=legacy_stem,
-        )
-        plot_graph_model_profiles(
-            cross,
-            out_dir,
-            args.formats,
-            graph,
-            args.lead_models,
-            legacy_stem=legacy_stem,
-            anonymized=True,
-        )
+        for stem_suffix, models in COMPARISON_SETS:
+            plot_decisive_evidence_ladder(
+                ladder_source,
+                out_dir,
+                args.formats,
+                models,
+                graph,
+                legacy_stem=legacy_stem,
+                stem_suffix=stem_suffix,
+            )
+            plot_decisive_evidence_ladder(
+                ladder_source,
+                out_dir,
+                args.formats,
+                models,
+                graph,
+                legacy_stem=legacy_stem,
+                anonymized=True,
+                stem_suffix=stem_suffix,
+            )
+            plot_contrast_bars(
+                contrasts,
+                canonical,
+                out_dir,
+                args.formats,
+                graph,
+                models,
+                legacy_stem=legacy_stem,
+                stem_suffix=stem_suffix,
+            )
 
-    plot_anonymization_stress_test(cross, out_dir, args.formats)
+    for stem_suffix, models in COMPARISON_SETS:
+        plot_anonymization_stress_test(cross, out_dir, args.formats, models=models, stem_suffix=stem_suffix)
     plot_gpt52_names_only_scaling(cross, out_dir, args.formats)
     write_latex_includes(out_dir)
 

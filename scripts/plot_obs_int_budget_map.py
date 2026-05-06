@@ -30,9 +30,9 @@ DEFAULT_OUT_DIR = REPO_ROOT / "experiments" / "out" / "qwen3_posttraining_mainte
 DEFAULT_GRAPHS = ["cancer", "earthquake", "asia", "sachs"]
 DEFAULT_MODELS = [
     "Qwen3-4B-Thinking-2507",
-    "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged",
+    # "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged",
     "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged",
-    "grpo_from_qwen3_4b_sft_mix_guide_v2_lenfix_2gpu_checkpoint-200",
+    # "grpo_from_qwen3_4b_sft_mix_guide_v2_lenfix_2gpu_checkpoint-200",
 ]
 
 
@@ -46,12 +46,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quantity", choices=["f1", "gain", "valid_rate"], default="f1")
     parser.add_argument("--min-coverage", type=int, default=0, help="Hide cells with fewer graph/model rows.")
     parser.add_argument("--fixed-marker-size", action="store_true", help="Use one marker size instead of scaling by coverage.")
-    parser.add_argument("--marker-size", type=float, default=10.0, help="Marker size used with --fixed-marker-size.")
+    parser.add_argument("--marker-size", type=float, default=120.0, help="Marker size used with --fixed-marker-size.")
     parser.add_argument("--no-marker-text", action="store_true", help="Do not write values/coverage labels inside marks.")
     parser.add_argument("--linear-axes", action="store_true", help="Use raw obs/int values instead of log10(value+1) axes.")
     parser.add_argument(
         "--cmap",
-        default=None,
+        default='PuBu',
         help="Matplotlib colormap. Defaults to RdBu_r for gain and YlOrRd otherwise.",
     )
     parser.add_argument(
@@ -77,16 +77,16 @@ def parse_args() -> argparse.Namespace:
 def configure_style() -> None:
     mpl.rcParams.update(
         {
-            "font.size": 9.5,
+            "font.size": 7.5,
             "font.family": "serif",
             "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-            "axes.labelsize": 10.5,
-            "xtick.labelsize": 8.5,
-            "ytick.labelsize": 8.5,
+            "axes.labelsize": 8.5,
+            "xtick.labelsize": 7,
+            "ytick.labelsize": 7,
             "figure.dpi": 300,
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.03,
+            "savefig.pad_inches": 0.02,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "pdf.fonttype": 42,
@@ -117,9 +117,12 @@ def axis_value(value: float, linear_axes: bool) -> float:
 
 def model_label(raw: str) -> str:
     labels = {
-        "Qwen3-4B-Thinking-2507": "Base",
+        "gpt-5.2-pro": "GPT-5.2-Pro",
+        "gpt-5-mini": "GPT-5-Mini",
+        "Qwen/Qwen3-4B-Thinking-2507": "Qwen3-4B",
+        "Qwen3-4B-Thinking-2507": "Qwen3-4B",
         "qwen3_4b_cd_format_v5_rerun_2gpu_checkpoint-100_merged": "CD v5 ckpt-100",
-        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged": "GRPO no-cancer ckpt-1200",
+        "grpo_from_qwen3_4b_cd_format_v5_rerun_no_cancer_full_checkpoint-1200_merged": "Qwen3-4B-FT",
         "grpo_from_qwen3_4b_sft_mix_guide_v2_lenfix_2gpu_checkpoint-200": "GRPO mix v2 ckpt-200",
     }
     return labels.get(raw, raw)
@@ -238,63 +241,69 @@ def plot(cells: pd.DataFrame, args: argparse.Namespace) -> None:
     if cells.empty:
         raise SystemExit("No matching obs/int budget cells found.")
     configure_style()
-    x = axis_budget(cells["obs_n"], args.linear_axes)
-    y = axis_budget(cells["int_n"], args.linear_axes)
+
+    # Map discrete budget values to evenly-spaced categorical positions so
+    # non-uniform grids (e.g. N ∈ {0,500,1000,5000}) don't leave dead space.
+    obs_vals = sorted(cells["obs_n"].astype(int).unique())
+    int_vals = sorted(cells["int_n"].astype(int).unique())
+    obs_pos = {v: i for i, v in enumerate(obs_vals)}
+    int_pos = {v: i for i, v in enumerate(int_vals)}
+    x = cells["obs_n"].astype(int).map(obs_pos).to_numpy(dtype=float)
+    y = cells["int_n"].astype(int).map(int_pos).to_numpy(dtype=float)
+
     values = cells["value"].astype(float).to_numpy()
     coverage = cells["coverage"].astype(float).to_numpy()
     sizes = np.full_like(coverage, args.marker_size, dtype=float) if args.fixed_marker_size else 95 + 34 * coverage
 
-    cmap = args.cmap or ("RdBu_r" if args.quantity == "gain" else "YlOrRd")
+    cmap = args.cmap or ("RdBu_r" if args.quantity == "gain" else "viridis")
     norm = color_norm(values, args)
 
-    fig, ax = plt.subplots(figsize=(6.8, 4.9))
-    ax.grid(color="#d8d8d8", linewidth=0.7, alpha=0.45)
+    # Half-textwidth figure (~3.5" wide at NeurIPS column width)
+    fig, ax = plt.subplots(figsize=(3.5, 2.8))
+    ax.grid(color="#cccccc", linewidth=0.4, alpha=0.5)
     ax.set_axisbelow(True)
-    scatter = ax.scatter(x, y, c=values, s=sizes, cmap=cmap, norm=norm, edgecolor="#333333", linewidth=0.7, zorder=3)
+    scatter = ax.scatter(
+        x, y, c=values, s=sizes, cmap=cmap, norm=norm,
+        marker="s", edgecolor="#222222", linewidth=0.4, zorder=3,
+    )
 
     if not args.no_marker_text:
         for _, row in cells.iterrows():
+            xi = obs_pos[int(row["obs_n"])]
+            yi = int_pos[int(row["int_n"])]
             label = f"{row['value']:.2f}\nn={int(row['coverage'])}"
             ax.text(
-                axis_value(float(row["obs_n"]), args.linear_axes),
-                axis_value(float(row["int_n"]), args.linear_axes),
-                label,
-                ha="center",
-                va="center",
-                fontsize=6.6,
+                xi, yi, label,
+                ha="center", va="center",
+                fontsize=5.5,
                 color="white" if row["value"] > cells["value"].median() else "#111111",
-                linespacing=0.84,
-                zorder=4,
+                linespacing=0.84, zorder=4,
             )
 
-    obs_ticks = sorted(cells["obs_n"].astype(int).unique())
-    int_ticks = sorted(cells["int_n"].astype(int).unique())
-    ax.set_xticks([axis_value(v, args.linear_axes) for v in obs_ticks])
-    ax.set_xticklabels([str(v) for v in obs_ticks], rotation=35, ha="right")
-    ax.set_yticks([axis_value(v, args.linear_axes) for v in int_ticks])
-    ax.set_yticklabels([str(v) for v in int_ticks])
-    scale = "" if args.linear_axes else ", log10(N+1)"
-    inter_scale = "" if args.linear_axes else ", log10(M+1)"
-    ax.set_xlabel(f"Observational samples N{scale}")
-    ax.set_ylabel(f"Interventions per target M{inter_scale}")
+    def _fmt_budget(v: int) -> str:
+        return f"{v // 1000}k" if v >= 1000 else str(v)
+
+    ax.set_xticks(range(len(obs_vals)))
+    ax.set_xticklabels([_fmt_budget(v) for v in obs_vals], rotation=0, ha="center")
+    ax.set_yticks(range(len(int_vals)))
+    ax.set_yticklabels([str(v) for v in int_vals])
+    ax.set_xlim(-0.6, len(obs_vals) - 0.4)
+    ax.set_ylim(-0.7, len(int_vals) - 0.3)
+    ax.set_xlabel(r"Observational budget $N$")
+    ax.set_ylabel(r"Interventions $M$")
 
     quantity_label = {
-        "f1": "Mean best data F1",
-        "gain": "Mean data gain over names-only",
-        "valid_rate": "Mean valid rate",
+        "f1": "Mean F1",
+        "gain": "F1 gain over names-only",
+        "valid_rate": "Valid rate",
     }[args.quantity]
-    ax.set_title(f"{quantity_label} by data budget ({args.anonymization})", fontsize=11, pad=8)
-    cbar = fig.colorbar(scatter, ax=ax, fraction=0.045, pad=0.025)
-    cbar.set_label(quantity_label)
-    fig.text(
-        0.01,
-        0.01,
-        "Each cell chooses the better of summary/matrix per graph and model; n is graph-model coverage.",
-        ha="left",
-        va="bottom",
-        fontsize=7.2,
-    )
-    fig.subplots_adjust(left=0.12, right=0.96, top=0.90, bottom=0.20)
+    cbar = fig.colorbar(scatter, ax=ax, fraction=0.05, pad=0.02, shrink=0.85, aspect=18)
+    cbar.set_label(quantity_label, fontsize=7.5)
+    cbar.ax.tick_params(labelsize=6.5)
+
+    graph_str = ", ".join(g.capitalize() for g in args.graphs)
+    model_str = ", ".join(model_label(m) for m in args.models)
+    ax.set_title(f"{model_str} on {graph_str}: F1 by data budget", fontsize=7.5, pad=4)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     stem = output_stem(args)
